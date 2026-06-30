@@ -1,0 +1,26 @@
+# name: test/sql/login.test
+# description: Brute-force then breach — FAIL{3,} OK, ALL ROWS PER MATCH.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+query TI
+SELECT classifier, n_fails
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES ('u',1,'fail'),('u',2,'fail'),('u',3,'fail'),('u',4,'success'))
+          AS t(uid, ts, outcome)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'FAIL{3,} OK',
+       define       := '{"FAIL":"outcome = ''fail''","OK":"outcome = ''success''"}',
+       measures     := '{"n_fails":"FINAL COUNT(FAIL.*)"}',
+       rows         := 'all')
+ORDER BY ts;
+----
+FAIL	3
+FAIL	3
+FAIL	3
+OK	3

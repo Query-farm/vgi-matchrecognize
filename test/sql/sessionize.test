@@ -1,0 +1,22 @@
+# name: test/sql/sessionize.test
+# description: Sessionization — split a stream where the inter-event gap > 1800s.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+query IIII
+SELECT session_no, session_start, session_end, n_events
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,1),(1,2),(1,3),(1,5000),(1,5001)) AS t(uid, ts)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A B*',
+       define       := '{"B":"ts <= PREV(ts) + 1800"}',
+       measures     := '{"session_no":"MATCH_NUMBER()","session_start":"FIRST(ts)","session_end":"LAST(ts)","n_events":"COUNT(*)"}')
+ORDER BY session_no;
+----
+1	1	3	3
+2	5000	5001	2

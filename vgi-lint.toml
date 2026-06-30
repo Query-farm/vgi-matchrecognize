@@ -1,0 +1,7 @@
+# vgi-lint-check configuration for vgi-matchrecognize.
+#
+# The worker is a pure local-compute connector (no external backend, no
+# secrets, no egress), so every rule — including the execution rules that run
+# example queries — applies and is expected to pass at the strictest level.
+[tool.vgi-lint-check]
+fail-on = "info"

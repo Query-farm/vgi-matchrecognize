@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    name: fmt · clippy · doc · unit + proptest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Rustdoc (deny warnings)
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Unit tests + property-based fuzzing
+        run: cargo test --workspace --all-features
+
+  e2e:
+    name: SQLLogic e2e (haybarn)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install the haybarn unittest runner
+        run: |
+          uv tool install haybarn-unittest
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install the vgi community extension
+        run: echo "INSTALL vgi FROM community;" | uvx haybarn-cli
+
+      - name: Run SQLLogic suite against the built worker
+        run: ./run_tests.sh
+
+  metadata-quality:
+    name: metadata quality (vgi-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build worker (release)
+        run: cargo build --release --bin vgi-matchrecognize-worker
+
+      - name: vgi-lint
+        uses: Query-farm/vgi-lint-check@v1
+        with:
+          version: "0.37.0"
+          location: "${{ github.workspace }}/target/release/vgi-matchrecognize-worker"
+          fail-on: info
+
+  audit:
+    name: supply-chain audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  msrv:
+    name: MSRV check (rust 1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (pinned MSRV)
+        uses: dtolnay/rust-toolchain@1.90
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo check (workspace, all features)
+        run: cargo check --workspace --all-features

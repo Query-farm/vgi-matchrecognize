@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/mr-core", "crates/mr-worker"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT"
+authors = ["Query Farm LLC <hello@query.farm>"]
+repository = "https://github.com/Query-farm/vgi-matchrecognize"
+
+[workspace.dependencies]
+# VGI Rust SDK (worker side), published on crates.io. Keep arrow / vgi-rpc in
+# lockstep with vgi's own pins so a single arrow / vgi-rpc version resolves.
+vgi = "0.9.5"
+vgi-rpc = { version = "0.7.0", default-features = false, features = ["macros", "http"] }
+arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-data = "59"
+arrow-schema = "59"
+arrow-select = "59"
+arrow-cast = "59"
+
+mr-core = { path = "crates/mr-core" }
+
+[profile.release]
+opt-level = 2
+strip = true

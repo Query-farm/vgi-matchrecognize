@@ -1,0 +1,40 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Build the `vgi-matchrecognize-worker` binary for every supported platform and
+# attach the archives (+ SHA256 + cosign signature + SLSA provenance) to the
+# GitHub Release for a vX.Y.Z tag, via the shared reusable workflow.
+#
+# Assets: vgi-matchrecognize-<tag>-<duckdb_platform>.tar.gz. The executable
+# inside each archive is `vgi-matchrecognize-worker`, used as a DuckDB vgi
+# LOCATION:
+#   ATTACH 'mr' (TYPE vgi, COMMAND '/path/to/vgi-matchrecognize-worker');
+#
+# Release flow:
+#   1. Bump [workspace.package] version in Cargo.toml; sync Cargo.lock.
+#   2. git tag vX.Y.Z && git push origin vX.Y.Z
+name: Release binaries
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [ci]
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: Query-farm/vgi-actions/.github/workflows/rust-release.yml@v1
+    secrets: inherit
+    with:
+      bin: vgi-matchrecognize-worker
+      asset_prefix: vgi-matchrecognize
+      version_check_cmd: ci/check-version.sh

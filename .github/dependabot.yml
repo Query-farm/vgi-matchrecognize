@@ -1,0 +1,31 @@
+version: 2
+updates:
+  # Rust crate dependencies (Cargo.toml / Cargo.lock).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Arrow crates move in lockstep — bump them together.
+      arrow:
+        patterns:
+          - "arrow*"
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "ci"

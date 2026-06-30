@@ -1,0 +1,20 @@
+[package]
+name = "mr-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Pure-compute SQL:2016 MATCH_RECOGNIZE engine (pattern parser, expression Pratt parser, bind-time type inference, backtracking matcher) for the matchrecognize VGI worker (no Arrow/VGI deps)"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+# `preserve_order` keeps the MEASURES object's declaration order = output column
+# order (the SDK contract: "order of the array/object is the output column order").
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

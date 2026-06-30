@@ -1,0 +1,26 @@
+[package]
+name = "mr-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "VGI worker bringing SQL:2016 MATCH_RECOGNIZE row pattern matching to DuckDB over Apache Arrow"
+
+[[bin]]
+name = "vgi-matchrecognize-worker"
+path = "src/main.rs"
+
+[dependencies]
+vgi.workspace = true
+vgi-rpc.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+arrow-cast.workspace = true
+mr-core.workspace = true
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"

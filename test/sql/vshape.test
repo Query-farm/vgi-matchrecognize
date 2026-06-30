@@ -1,0 +1,22 @@
+# name: test/sql/vshape.test
+# description: V-shape stock dip — START DOWN+ UP+, ONE ROW PER MATCH.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+query III
+SELECT match_no, bottom_price, drawdown
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11))
+          AS t(symbol, ts, price)),
+       partition_by := ['symbol'],
+       order_by     := ['ts'],
+       pattern      := 'START DOWN+ UP+',
+       define       := '{"DOWN":"price < PREV(price)","UP":"price > PREV(price)"}',
+       measures     := '{"match_no":"MATCH_NUMBER()","bottom_price":"LAST(DOWN.price)","drawdown":"FIRST(START.price) - LAST(DOWN.price)"}')
+ORDER BY match_no;
+----
+1	6	4

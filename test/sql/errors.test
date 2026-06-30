@@ -1,0 +1,31 @@
+# name: test/sql/errors.test
+# description: Clean bind errors for malformed pattern / unknown column.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# Malformed quantifier -> bind error.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1)) AS t(ts)),
+       order_by := ['ts'], pattern := 'A{5,2}', define := '{}');
+----
+pattern
+
+# Unknown column in a measure -> bind error.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1)) AS t(ts)),
+       order_by := ['ts'], pattern := 'A', define := '{}',
+       measures := '{"x":"nosuch + 1"}');
+----
+unknown column
+
+# explain_pattern surfaces a parse error.
+statement error
+SELECT mr.main.explain_pattern('(A');
+----
+pattern

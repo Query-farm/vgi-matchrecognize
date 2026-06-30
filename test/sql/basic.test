@@ -1,0 +1,23 @@
+# name: test/sql/basic.test
+# description: Worker version, explain_pattern, and a minimal match.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+query T
+SELECT mr.main.mr_version();
+----
+0.1.0
+
+query T
+SELECT mr.main.explain_pattern('START DOWN+ UP+');
+----
+START · (DOWN)+greedy · (UP)+greedy
+
+query T
+SELECT mr.main.explain_pattern('A+? (B | C)');
+----
+(A)+reluctant · (B | C)

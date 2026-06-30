@@ -1,0 +1,9 @@
+/target
+/build
+**/*.rs.bk
+.DS_Store
+# vgi-lint review cache
+.vgi-review-cache.json
+# Claude Code session/worktree scratch
+/.claude
+duckdb_unittest_tempdir/
