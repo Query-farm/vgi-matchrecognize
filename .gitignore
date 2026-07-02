@@ -2,8 +2,9 @@
 /build
 **/*.rs.bk
 .DS_Store
-# vgi-lint review cache
+# vgi-lint review + simulate caches
 .vgi-review-cache.json
+.vgi-sim-cache.json
 # Claude Code session/worktree scratch
 /.claude
 duckdb_unittest_tempdir/

@@ -48,6 +48,7 @@ impl ScalarFunction for ExplainPattern {
 ]"#
             .into(),
         ));
+        tags.push(("vgi.category".into(), "Diagnostics".into()));
         FunctionMetadata {
             description: "Pretty-print the compiled form of a row pattern (no data access)".into(),
             return_type: Some(DataType::Utf8),

@@ -20,6 +20,45 @@ const EXEC_EXAMPLES: &str = r#"[
   }
 ]"#;
 
+/// Analyst tasks the `vgi-lint simulate` agent-check pass runs against the
+/// worker (VGI152/VGI920). Each `reference_sql` is a known-good query over
+/// inline `VALUES`, so it executes cleanly in the sandbox with no external data.
+const AGENT_TEST_TASKS: &str = r#"[
+  {
+    "name": "detect_v_shape",
+    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)). Partition by symbol, order by ts, and match the pattern 'START DOWN+ UP+' where variable DOWN means price < PREV(price) and UP means price > PREV(price) (START is unconstrained). Use ONE ROW PER MATCH and project two measures: match_no as MATCH_NUMBER() and bottom as LAST(DOWN.price). Select just match_no and bottom.",
+    "reference_sql": "SELECT match_no, bottom FROM mr.main.match_recognize((SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)), partition_by := ['symbol'], order_by := ['ts'], pattern := 'START DOWN+ UP+', define := '{\"DOWN\":\"price < PREV(price)\",\"UP\":\"price > PREV(price)\"}', measures := '{\"match_no\":\"MATCH_NUMBER()\",\"bottom\":\"LAST(DOWN.price)\"}')"
+  },
+  {
+    "name": "brute_force_then_success",
+    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('u',1,'fail'),('u',2,'fail'),('u',3,'fail'),('u',4,'success')) AS t(uid,ts,outcome)). Partition by uid, order by ts, and match the pattern 'FAIL{3,} OK' where variable FAIL means outcome = 'fail' and OK means outcome = 'success'. Use ALL ROWS PER MATCH (rows := 'all') and project one measure n_fails as FINAL COUNT(FAIL.*). Select just classifier and n_fails.",
+    "reference_sql": "SELECT classifier, n_fails FROM mr.main.match_recognize((SELECT * FROM (VALUES ('u',1,'fail'),('u',2,'fail'),('u',3,'fail'),('u',4,'success')) AS t(uid,ts,outcome)), partition_by := ['uid'], order_by := ['ts'], pattern := 'FAIL{3,} OK', define := '{\"FAIL\":\"outcome = ''fail''\",\"OK\":\"outcome = ''success''\"}', measures := '{\"n_fails\":\"FINAL COUNT(FAIL.*)\"}', rows := 'all')"
+  },
+  {
+    "name": "explain_pattern_structure",
+    "prompt": "Call the mr.main.explain_pattern scalar function on the row pattern string 'START DOWN+ UP+' to render its compiled structure and return that single string value. Do not query any table.",
+    "reference_sql": "SELECT mr.main.explain_pattern('START DOWN+ UP+') AS compiled",
+    "ignore_column_names": true
+  },
+  {
+    "name": "worker_version",
+    "prompt": "Call the mr.main.mr_version scalar function to report the running worker's version string and return that single string value. Do not query any table.",
+    "reference_sql": "SELECT mr.main.mr_version() AS version",
+    "ignore_column_names": true
+  },
+  {
+    "name": "match_number_one_row",
+    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)). Partition by symbol, order by ts, and match the pattern 'START DOWN+ UP+' where DOWN means price < PREV(price) and UP means price > PREV(price). Use ONE ROW PER MATCH (rows := 'one', the default). Project a single measure n as MATCH_NUMBER(). Select symbol and n.",
+    "reference_sql": "SELECT symbol, n FROM mr.main.match_recognize((SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)), partition_by := ['symbol'], order_by := ['ts'], pattern := 'START DOWN+ UP+', define := '{\"DOWN\":\"price < PREV(price)\",\"UP\":\"price > PREV(price)\"}', measures := '{\"n\":\"MATCH_NUMBER()\"}')"
+  },
+  {
+    "name": "explain_alternation",
+    "prompt": "Call the mr.main.explain_pattern scalar function on the row pattern string 'A+? (B | C) D' (a reluctant one-or-more quantifier followed by an alternation group) to render its compiled structure and return that single string value. Do not query any table.",
+    "reference_sql": "SELECT mr.main.explain_pattern('A+? (B | C) D') AS compiled",
+    "ignore_column_names": true
+  }
+]"#;
+
 /// Metadata for the `match_recognize` table-buffering function.
 pub fn match_recognize_metadata() -> FunctionMetadata {
     let mut tags = crate::meta::object_tags(
@@ -63,6 +102,7 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
             .into(),
     ));
     tags.push(("vgi.example_queries".into(), EXEC_EXAMPLES.into()));
+    tags.push(("vgi.category".into(), "Row Pattern Matching".into()));
     FunctionMetadata {
         description: "SQL:2016 MATCH_RECOGNIZE row pattern matching over a buffered relation"
             .into(),
@@ -150,6 +190,10 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                 "vgi.support_policy_url".to_string(),
                 format!("{REPO}/blob/main/README.md"),
             ),
+            (
+                "vgi.agent_test_tasks".to_string(),
+                AGENT_TEST_TASKS.to_string(),
+            ),
         ],
         source_url: Some(REPO.to_string()),
         schemas: vec![CatSchema {
@@ -171,6 +215,18 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                 ("domain".to_string(), "data-analytics".to_string()),
                 ("category".to_string(), "pattern-matching".to_string()),
                 ("topic".to_string(), "row-pattern-recognition".to_string()),
+                // VGI413 category registry; each object declares a `vgi.category`
+                // naming one of these.
+                (
+                    "vgi.categories".to_string(),
+                    "[{\"name\":\"Row Pattern Matching\",\"description\":\"The core SQL:2016 \
+                     MATCH_RECOGNIZE table function that runs a regular-expression-over-rows \
+                     matcher for funnel analysis, sessionization, and sequence/anomaly \
+                     detection.\"},{\"name\":\"Diagnostics\",\"description\":\"Helper scalars for \
+                     inspecting the worker and pattern compilation — the worker version and a \
+                     pattern pretty-printer — that touch no data.\"}]"
+                        .to_string(),
+                ),
                 (
                     "vgi.doc_llm".to_string(),
                     "The single schema for the `mr` worker (the catalog name matches the ATTACH \

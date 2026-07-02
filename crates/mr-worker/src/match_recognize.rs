@@ -145,16 +145,16 @@ impl TableBufferingFunction for MatchRecognize {
                 "partition_by",
                 -1,
                 varchar_list.clone(),
-                "Column names to partition by (like SQL `PARTITION BY`), as a VARCHAR list. Each \
-                 partition is matched independently. Omit for a single global partition.",
+                "Column names to partition by (like SQL `PARTITION BY`). Each partition is matched \
+                 independently. Omit for a single global partition.",
             ),
             ArgSpec::const_typed(
                 "order_by",
                 -1,
                 varchar_list,
-                "Column names defining the intra-partition row order (like SQL `ORDER BY`), as a \
-                 VARCHAR list. Required. An element may carry a ' DESC' and/or ' NULLS FIRST/LAST' \
-                 suffix, e.g. 'ts DESC'.",
+                "Column names defining the intra-partition row order (like SQL `ORDER BY`). \
+                 Required. An element may carry a ' DESC' and/or ' NULLS FIRST/LAST' suffix, e.g. \
+                 'ts DESC'.",
             ),
             ArgSpec::const_arg(
                 "pattern",
@@ -169,10 +169,11 @@ impl TableBufferingFunction for MatchRecognize {
                 "define",
                 -1,
                 "varchar",
-                "A JSON object mapping each pattern variable to a boolean predicate over the \
-                 current row, e.g. '{\"DOWN\":\"price < PREV(price)\"}'. Variables not listed \
-                 default to always-true. Predicates may use column refs, PREV/NEXT/FIRST/LAST, \
-                 running aggregates, and arithmetic/comparison/logical operators.",
+                "A JSON object mapping each pattern variable to a predicate over the current row \
+                 that decides whether the row can match that variable, e.g. '{\"DOWN\":\"price < \
+                 PREV(price)\"}'. Variables not listed default to always-match. Predicates may use \
+                 column refs, PREV/NEXT/FIRST/LAST, running aggregates, and \
+                 arithmetic/comparison/logical operators.",
             ),
             ArgSpec::const_arg(
                 "measures",
@@ -188,9 +189,11 @@ impl TableBufferingFunction for MatchRecognize {
                 "rows",
                 -1,
                 "varchar",
-                "Output cardinality: 'one' for ONE ROW PER MATCH (one summary row per match; the \
-                 default) or 'all' for ALL ROWS PER MATCH (one row per matched row, tagged with \
-                 its match_number and classifier).",
+                "Output cardinality. Accepts exactly two lowercase string values: 'one' (the \
+                 default) for one summary row per match (SQL:2016 ONE ROW PER MATCH), or 'all' for \
+                 one row per matched row, each tagged with its match_number and classifier \
+                 (SQL:2016 ALL ROWS PER MATCH). The SQL:2016 phrases themselves are not accepted — \
+                 pass 'one' or 'all'.",
             ),
             ArgSpec::const_arg(
                 "after",

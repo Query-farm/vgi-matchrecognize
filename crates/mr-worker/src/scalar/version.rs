@@ -44,6 +44,7 @@ impl ScalarFunction for MrVersion {
 ]"#
             .into(),
         ));
+        tags.push(("vgi.category".into(), "Diagnostics".into()));
         FunctionMetadata {
             description: "Returns the matchrecognize worker version string".into(),
             return_type: Some(DataType::Utf8),
