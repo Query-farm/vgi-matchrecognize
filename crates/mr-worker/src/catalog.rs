@@ -238,9 +238,17 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                 ),
                 (
                     "vgi.doc_md".to_string(),
-                    "The only schema of the `mr` worker. Qualify calls as `mr.main.<fn>(...)`. \
-                     Contains the `match_recognize` table function plus the `mr_version()` and \
-                     `explain_pattern()` scalars."
+                    "## `mr.main` — row pattern matching\n\nThe single schema of the `mr` worker, \
+                     bringing SQL:2016 `MATCH_RECOGNIZE` to DuckDB. Qualify every call as \
+                     `mr.main.<fn>(...)`, matching the catalog's `ATTACH` name.\n\n**Key \
+                     concepts.** You describe a sequence as a regular expression over *pattern \
+                     variables*; a `define` predicate constrains each variable, and `measures` \
+                     projects the matched runs into output columns whose types are inferred at \
+                     bind time.\n\n**When to use it.** Reach for this schema whenever a question \
+                     is really \"find rows that occur in this order\" — funnel and conversion \
+                     analysis, sessionization, and sequence or anomaly detection over event and \
+                     time-series data — instead of hand-rolling fragile `LAG`/`LEAD` plus \
+                     self-join workarounds."
                         .to_string(),
                 ),
                 (
