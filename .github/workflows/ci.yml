@@ -100,6 +100,12 @@ jobs:
   audit:
     name: supply-chain audit (cargo-audit)
     runs-on: ubuntu-latest
+    # rustsec/audit-check posts a check-run, which needs checks:write; the
+    # top-level `permissions: contents: read` alone yields
+    # "Resource not accessible by integration - create-a-check-run".
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - name: cargo audit
