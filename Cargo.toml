@@ -13,7 +13,7 @@ repository = "https://github.com/Query-farm/vgi-matchrecognize"
 [workspace.dependencies]
 # VGI Rust SDK (worker side), published on crates.io. Keep arrow / vgi-rpc in
 # lockstep with vgi's own pins so a single arrow / vgi-rpc version resolves.
-vgi = "0.11.0"
+vgi = "0.14.0"
 vgi-rpc = { version = "0.8.0", default-features = false, features = ["macros", "http"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"

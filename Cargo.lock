@@ -2109,9 +2109,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi"
-version = "0.11.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79157be842204e4dd874a2e356df73ee7b0ce678617b1797da20a27e717bd636"
+checksum = "99ee79be812cf08e47025155bef152e979202a68fb68657410b42777ca6afdaa"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -2126,6 +2126,7 @@ dependencies = [
  "ctrlc",
  "libc",
  "log",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
