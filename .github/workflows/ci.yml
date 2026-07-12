@@ -93,7 +93,6 @@ jobs:
       - name: vgi-lint
         uses: Query-farm/vgi-lint-check@v1
         with:
-          version: "0.37.0"
           location: "${{ github.workspace }}/target/release/vgi-matchrecognize-worker"
           fail-on: info
 

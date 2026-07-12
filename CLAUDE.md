@@ -9,7 +9,7 @@ talks to over Apache Arrow IPC, `ATTACH 'mr' (TYPE vgi, COMMAND '…')`) that
 brings **SQL:2016 `MATCH_RECOGNIZE` row pattern matching** to DuckDB, which has
 no native support for it. Functions live under catalog `mr`, schema `main`.
 
-Built on the published VGI Rust SDK (`vgi = "0.9.5"` from crates.io), arrow 59.
+Built on the published VGI Rust SDK (`vgi = "0.17.0"` from crates.io), arrow 59.
 The repo builds standalone — no local SDK checkout, no path deps except the
 intra-workspace `mr-core`. License **MIT**.
 
@@ -106,5 +106,5 @@ echo "INSTALL vgi FROM community;" | uvx haybarn-cli
 `run_tests.sh` builds the worker and runs `haybarn-unittest` with
 `VGI_MATCHRECOGNIZE_WORKER` pointed at the binary.
 
-Metadata gate: `uvx --from vgi-lint-check@0.37.0 vgi-lint lint
+Metadata gate: `uvx --from vgi-lint-check vgi-lint lint
 "$PWD/target/release/vgi-matchrecognize-worker" --fail-on info` → 100/100.

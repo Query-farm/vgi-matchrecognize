@@ -179,11 +179,12 @@ impl TableBufferingFunction for MatchRecognize {
                 "measures",
                 -1,
                 "varchar",
-                "A JSON object (or array, for explicit type overrides) defining the output \
-                 measure columns, e.g. '{\"n\":\"COUNT(*)\",\"first_ts\":\"FIRST(A.ts)\"}'. The \
-                 array form '[{\"as\":\"r\",\"expr\":\"…\",\"type\":\"DOUBLE\"}]' overrides the \
-                 inferred output type. Measure types are inferred from the input schema at bind \
-                 time.",
+                "A JSON object mapping each output column name to a measure expression over the \
+                 match — for example a single-key object like {\"n\": \"COUNT(*)\"}. An \
+                 alternative array form lets each measure additionally pin an explicit output \
+                 type via an object carrying as / expr / type keys. Expression output types are \
+                 otherwise inferred from the input schema at bind time. This argument is \
+                 free-form JSON, not a fixed vocabulary of keywords.",
             ),
             ArgSpec::const_arg(
                 "rows",
@@ -199,8 +200,12 @@ impl TableBufferingFunction for MatchRecognize {
                 "after",
                 -1,
                 "varchar",
-                "AFTER MATCH SKIP mode controlling where the next match search resumes: 'past last \
-                 row' (default), 'to next row', 'to first <VAR>', or 'to last <VAR>'.",
+                "AFTER MATCH SKIP mode: chooses where the search for the next match resumes after \
+                 a successful match. It defaults to skipping past the last row of the matched \
+                 span. It may instead resume at the row after the match start; or at the first / \
+                 last row that was bound to a named pattern variable (naming any variable from \
+                 define). Browse the mr.main.after_match_skip_modes view for the full set. This \
+                 is free-form text, not a fixed vocabulary of keywords.",
             ),
             ArgSpec::const_arg(
                 "step_budget",
