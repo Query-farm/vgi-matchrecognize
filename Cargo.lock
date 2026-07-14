@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -545,6 +551,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -709,6 +724,16 @@ checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
 dependencies = [
  "bitflags 2.13.0",
  "rustc_version",
+]
+
+[[package]]
+name = "flate2"
+version = "1.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
+dependencies = [
+ "crc32fast",
+ "miniz_oxide",
 ]
 
 [[package]]
@@ -1258,6 +1283,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+ "simd-adler32",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1292,7 +1327,7 @@ dependencies = [
  "mr-core",
  "serde_json",
  "vgi",
- "vgi-rpc",
+ "vgi-rpc 0.12.0",
 ]
 
 [[package]]
@@ -1823,6 +1858,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "simd-adler32"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2131,7 +2172,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "vgi-rpc",
+ "vgi-rpc 0.11.0",
 ]
 
 [[package]]
@@ -2166,8 +2207,44 @@ dependencies = [
  "tower-http",
  "tracing",
  "url",
- "vgi-rpc-macros",
+ "vgi-rpc-macros 0.11.0",
  "windows-sys 0.59.0",
+ "zstd",
+]
+
+[[package]]
+name = "vgi-rpc"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "914f80427c457653e65d3852bea370e76ae5bc6e6d143702539cecf8febba336"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-data",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow-select",
+ "axum",
+ "base64",
+ "bincode",
+ "bytes",
+ "chacha20poly1305",
+ "chrono",
+ "flatbuffers",
+ "flate2",
+ "hmac",
+ "rand 0.8.6",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "url",
+ "vgi-rpc-macros 0.12.0",
  "zstd",
 ]
 
@@ -2176,6 +2253,17 @@ name = "vgi-rpc-macros"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "404c27b33e69c9f6f8af9143a3f60d59b6d14b8c317aa5356aea1dfb696cc03f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "vgi-rpc-macros"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c14d83ef5fe336f4c2f588b2ca9d0798fff24f308d8e051c1efb5cfdf16fd51"
 dependencies = [
  "proc-macro2",
  "quote",
