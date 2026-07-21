@@ -6,10 +6,7 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::DataType;
-use vgi::{
-    ArgSpec, BindParams, BindResponse, FunctionExample, FunctionMetadata, ProcessParams,
-    ScalarFunction,
-};
+use vgi::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction};
 use vgi_rpc::{Result, RpcError};
 
 pub struct ExplainPattern;
@@ -26,37 +23,35 @@ impl ScalarFunction for ExplainPattern {
              compiled form — the variable references, concatenation, alternation, grouping, \
              quantifiers (with their greedy/reluctant disposition), and partition-edge anchors — \
              without touching any data. A development aid for checking that a pattern parses the \
-             way you expect before running it over a relation. Returns one VARCHAR per input \
+             way you expect before running it over a relation. Returns one `VARCHAR` per input \
              pattern; a malformed pattern raises a clean parse error.",
             "Pretty-print the compiled form of a row pattern (variables, quantifier tree, \
              anchors) for debugging, e.g. `explain_pattern('A B+ C?')`. Pure: no data access. \
-             Returns VARCHAR.",
+             Returns `VARCHAR`.",
             "explain pattern, debug, parse, row pattern, quantifier, alternation, anchor, \
              match_recognize, dev aid",
         );
-        tags.push((
-            "vgi.executable_examples".into(),
-            r#"[
+        // VGI509 wants at least one guaranteed-runnable example worker-wide;
+        // these two run with no data. Descriptions satisfy VGI515. The same JSON
+        // is mirrored into vgi.example_queries (VGI306) — the native
+        // duckdb_functions().examples carrier drops descriptions, so we do not
+        // populate FunctionMetadata.examples.
+        const EXPLAIN_EXAMPLES: &str = r#"[
   {
-    "description": "Render the compiled form of a V-shape pattern.",
+    "description": "Render the compiled form of a V-shape pattern (a falling run then a rising run).",
     "sql": "SELECT mr.main.explain_pattern('START DOWN+ UP+') AS compiled"
   },
   {
-    "description": "Show how a reluctant quantifier and an alternation parse.",
+    "description": "Show how a reluctant quantifier and an alternation group parse.",
     "sql": "SELECT mr.main.explain_pattern('A+? (B | C) D') AS compiled"
   }
-]"#
-            .into(),
-        ));
+]"#;
+        tags.push(("vgi.executable_examples".into(), EXPLAIN_EXAMPLES.into()));
+        tags.push(("vgi.example_queries".into(), EXPLAIN_EXAMPLES.into()));
         tags.push(("vgi.category".into(), "Diagnostics".into()));
         FunctionMetadata {
             description: "Pretty-print the compiled form of a row pattern (no data access)".into(),
             return_type: Some(DataType::Utf8),
-            examples: vec![FunctionExample {
-                sql: "SELECT mr.main.explain_pattern('START DOWN+ UP+');".into(),
-                description: "Render the compiled form of a V-shape pattern.".into(),
-                expected_output: None,
-            }],
             tags,
             ..Default::default()
         }

@@ -42,8 +42,10 @@ mr.match_recognize(
 ) -> TABLE
 ```
 
-Plus `mr.mr_version() -> VARCHAR` and `mr.explain_pattern(p) -> VARCHAR`
-(pretty-print a compiled pattern; no data access).
+Plus `mr.explain_pattern(p) -> VARCHAR` (pretty-print a compiled pattern; no
+data access) and the `mr.main.after_match_skip_modes` reference view. The worker
+build version is published as the catalog's `implementation_version` (read it
+from `vgi_catalogs()`), not a scalar function.
 
 ## Examples
 
@@ -187,7 +189,7 @@ partitioning keeps each working set small.
 
 ## Scope
 
-**v1 (this release):** one `match_recognize` table function + `mr_version` +
+**v1 (this release):** one `match_recognize` table function +
 `explain_pattern`; the pattern grammar, expression language, inference, `rows`,
 and AFTER MATCH SKIP above.
 

@@ -44,6 +44,25 @@ const EXEC_EXAMPLES: &str = r#"[
   }
 ]"#;
 
+/// Schema-level example queries. A JSON array of `{description, sql}` (VGI515),
+/// each fully catalog-qualified and projecting real columns rather than a bare
+/// `SELECT *` (VGI514); every query runs against inline `VALUES`, so it executes
+/// cleanly in the `vgi-lint` sandbox with no external data.
+const SCHEMA_EXAMPLES: &str = r#"[
+  {
+    "description": "Inspect how a pattern compiles before running it: a leading unconstrained variable then a greedy one-or-more run.",
+    "sql": "SELECT mr.main.explain_pattern('START DOWN+ UP+') AS compiled"
+  },
+  {
+    "description": "V-shape detection: one summary row per match giving the match ordinal and the price at the bottom of the dip.",
+    "sql": "SELECT match_no, bottom FROM mr.main.match_recognize((SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)), partition_by := ['symbol'], order_by := ['ts'], pattern := 'START DOWN+ UP+', define := '{\"DOWN\":\"price < PREV(price)\",\"UP\":\"price > PREV(price)\"}', measures := '{\"match_no\":\"MATCH_NUMBER()\",\"bottom\":\"LAST(DOWN.price)\"}')"
+  },
+  {
+    "description": "Discover the valid `after` argument values without trial and error by querying the reference view.",
+    "sql": "SELECT mode, resumes_at FROM mr.main.after_match_skip_modes WHERE needs_variable = FALSE ORDER BY mode"
+  }
+]"#;
+
 /// Analyst tasks the `vgi-lint simulate` agent-check pass runs against the
 /// worker (VGI152/VGI920). Each `reference_sql` is a known-good query over
 /// inline `VALUES`, so it executes cleanly in the sandbox with no external data.
@@ -62,12 +81,6 @@ const AGENT_TEST_TASKS: &str = r#"[
     "name": "explain_pattern_structure",
     "prompt": "Call the mr.main.explain_pattern scalar function on the row pattern string 'START DOWN+ UP+' to render its compiled structure and return that single string value. Do not query any table.",
     "reference_sql": "SELECT mr.main.explain_pattern('START DOWN+ UP+') AS compiled",
-    "ignore_column_names": true
-  },
-  {
-    "name": "worker_version",
-    "prompt": "Call the mr.main.mr_version scalar function to report the running worker's version string and return that single string value. Do not query any table.",
-    "reference_sql": "SELECT mr.main.mr_version() AS version",
     "ignore_column_names": true
   },
   {
@@ -152,6 +165,10 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
             .into(),
     ));
     tags.push(("vgi.example_queries".into(), EXEC_EXAMPLES.into()));
+    // Mirror the same verified, data-free examples as guaranteed-runnable ones
+    // (VGI509) so agents have a runnable template for the primary function, not
+    // just the diagnostic helper.
+    tags.push(("vgi.executable_examples".into(), EXEC_EXAMPLES.into()));
     tags.push(("vgi.category".into(), "Row Pattern Matching".into()));
     FunctionMetadata {
         description: "SQL:2016 MATCH_RECOGNIZE row pattern matching over a buffered relation"
@@ -198,8 +215,9 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                  PREV/NEXT/FIRST/LAST navigation, running aggregates, CLASSIFIER()/MATCH_NUMBER(), \
                  RUNNING/FINAL, and arithmetic/comparison/logical/BETWEEN/IN/`||` operators. \
                  Measure output types are inferred at bind time with an explicit type-override \
-                 escape hatch. Also provides `mr_version()` and `explain_pattern()`. Pure local \
-                 compute: no network, no secrets, nothing on disk."
+                 escape hatch. Also provides `explain_pattern()` (pretty-print a compiled pattern) \
+                 and a browsable `after_match_skip_modes` reference view. Pure local compute: no \
+                 network, no secrets, nothing on disk."
                     .to_string(),
             ),
             (
@@ -214,7 +232,7 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                  := 'one'|'all', after := '...')`. The pattern is a regex over **pattern \
                  variables**; `define` constrains each variable with a boolean predicate; \
                  `measures` projects the output (types inferred at bind, override via the array \
-                 form). Helpers: `mr_version()` and `explain_pattern(p)`."
+                 form). Helper: `explain_pattern(p)`."
                     .to_string(),
             ),
             (
@@ -246,10 +264,15 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
             ),
         ],
         source_url: Some(REPO.to_string()),
+        // VGI328: publish the build version as catalog metadata (readable from
+        // vgi_catalogs() without spending a query) instead of a parameterless
+        // version() scalar. This is the worker binary's own Cargo version.
+        implementation_version: Some(mr_core::version().to_string()),
         schemas: vec![CatSchema {
             name: "main".to_string(),
             comment: Some(
-                "Row pattern matching functions: match_recognize, mr_version, explain_pattern."
+                "Row pattern matching functions: match_recognize, explain_pattern, and the \
+                 after_match_skip_modes reference view."
                     .to_string(),
             ),
             tags: vec![
@@ -257,8 +280,9 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                 (
                     "vgi.keywords".to_string(),
                     crate::meta::keywords_json(
-                        "match_recognize, mr_version, explain_pattern, row pattern matching, \
-                         funnel, sessionization, sequence detection, pattern, define, measures",
+                        "match_recognize, explain_pattern, after_match_skip_modes, row pattern \
+                         matching, funnel, sessionization, sequence detection, pattern, define, \
+                         measures",
                     ),
                 ),
                 // VGI123 bare-key classifiers for faceting.
@@ -272,18 +296,19 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                     "[{\"name\":\"Row Pattern Matching\",\"description\":\"The core SQL:2016 \
                      MATCH_RECOGNIZE table function that runs a regular-expression-over-rows \
                      matcher for funnel analysis, sessionization, and sequence/anomaly \
-                     detection.\"},{\"name\":\"Diagnostics\",\"description\":\"Helper scalars for \
-                     inspecting the worker and pattern compilation — the worker version and a \
-                     pattern pretty-printer — that touch no data.\"}]"
+                     detection.\"},{\"name\":\"Diagnostics\",\"description\":\"Helpers for \
+                     inspecting pattern compilation and the accepted argument values — a pattern \
+                     pretty-printer and the AFTER MATCH SKIP mode reference — that touch no user \
+                     data.\"}]"
                         .to_string(),
                 ),
                 (
                     "vgi.doc_llm".to_string(),
                     "The single schema for the `mr` worker (the catalog name matches the ATTACH \
                      name, so qualify calls as `mr.main.<fn>(...)`). It holds `match_recognize` \
-                     (the table-in/table-out row pattern matcher), `mr_version()` (the worker \
-                     version), and `explain_pattern(p)` (pretty-print a compiled pattern, no \
-                     data)."
+                     (the table-in/table-out row pattern matcher), `explain_pattern(p)` \
+                     (pretty-print a compiled pattern, no data), and the \
+                     `after_match_skip_modes` reference view."
                         .to_string(),
                 ),
                 (
@@ -301,17 +326,7 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                      self-join workarounds."
                         .to_string(),
                 ),
-                (
-                    "vgi.example_queries".to_string(),
-                    "SELECT mr.main.mr_version();\n\
-                     SELECT mr.main.explain_pattern('START DOWN+ UP+');\n\
-                     SELECT * FROM mr.main.match_recognize((SELECT * FROM (VALUES \
-                     ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS \
-                     t(symbol,ts,price)), partition_by := ['symbol'], order_by := ['ts'], pattern \
-                     := 'START DOWN+ UP+', define := '{\"DOWN\":\"price < PREV(price)\",\"UP\":\
-                     \"price > PREV(price)\"}', measures := '{\"n\":\"MATCH_NUMBER()\"}');"
-                        .to_string(),
-                ),
+                ("vgi.example_queries".to_string(), SCHEMA_EXAMPLES.to_string()),
             ],
             views: vec![CatView {
                 name: "after_match_skip_modes".to_string(),

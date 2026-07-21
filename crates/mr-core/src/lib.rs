@@ -32,7 +32,8 @@ pub mod value;
 pub use error::{MrError, Result};
 pub use plan::{Plan, PlanConfig};
 
-/// The crate (worker) version string, surfaced by `mr_version()`.
+/// The crate (worker) build version string, published as the catalog's
+/// `implementation_version`.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

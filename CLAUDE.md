@@ -21,8 +21,12 @@ intra-workspace `mr-core`. License **MIT**.
   subquery (NOT a correlated `LATERAL`); everything else is a scalar `const_arg`
   (named). `partition_by`/`order_by` are `VARCHAR[]`; `pattern`/`rows`/`after`
   are `VARCHAR`; `define`/`measures` are JSON strings.
-- `mr.main.mr_version()` — the worker version (fleet convention).
 - `mr.main.explain_pattern(p)` — pretty-print a compiled pattern; no data.
+- `mr.main.after_match_skip_modes` — a browsable reference view of the AFTER
+  MATCH SKIP modes the `after` argument accepts (inline `VALUES`, no data access).
+
+The worker build version is published as the catalog's `implementation_version`
+(readable from `vgi_catalogs()`), per VGI328 — there is no `*_version()` scalar.
 
 ## Architecture — two crates
 
@@ -52,7 +56,7 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
   - `arrow_in.rs` — a `RowStore` over a concatenated `RecordBatch`.
   - `arrow_out.rs` — `Vec<Vec<Value>>` + output `Ty`s → a `RecordBatch`.
   - `schema.rs` — `Ty` ↔ Arrow `DataType` + the `ArrowBindSchema` for inference.
-  - `scalar/` — `mr_version`, `explain_pattern`.
+  - `scalar/` — `explain_pattern`.
   - `catalog.rs` / `meta.rs` — catalog/schema/function metadata for `vgi-lint`.
   - `main.rs` registers everything and calls `Worker::run()`.
 

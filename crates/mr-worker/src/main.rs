@@ -6,8 +6,10 @@
 //!
 //! - `mr.main.match_recognize((<rel>), partition_by:=, order_by:=, pattern:=,
 //!   define:=, measures:=, rows:=, after:=)` — row pattern matching (table-in/out)
-//! - `mr.main.mr_version()` — the worker version string
 //! - `mr.main.explain_pattern(p)` — pretty-print a compiled pattern (no data)
+//!
+//! The worker build version is published as the catalog's
+//! `implementation_version` (readable from `vgi_catalogs()`), not a scalar.
 
 mod arrow_in;
 mod arrow_out;

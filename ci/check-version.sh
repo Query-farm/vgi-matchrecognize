@@ -2,9 +2,9 @@
 # Copyright 2026 Query Farm LLC - https://query.farm
 #
 # Verify the workspace package version matches a GitHub Release / git tag, so the
-# version the worker advertises over VGI (`mr_version()`) and the uploaded
-# release binaries all equal the release. Run on a version-tag push before
-# building/publishing anything.
+# version the worker advertises over VGI (the catalog `implementation_version`)
+# and the uploaded release binaries all equal the release. Run on a version-tag
+# push before building/publishing anything.
 #
 # Usage: ci/check-version.sh <release-tag>      # e.g. v0.1.0 or 0.1.0
 set -euo pipefail
