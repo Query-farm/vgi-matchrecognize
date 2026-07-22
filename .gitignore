@@ -1,5 +1,7 @@
 /target
 /build
+# Browser build output (wasm/build.sh)
+/wasm/dist
 **/*.rs.bk
 .DS_Store
 # vgi-lint review + simulate caches

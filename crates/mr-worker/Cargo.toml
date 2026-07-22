@@ -7,13 +7,15 @@ license.workspace = true
 authors.workspace = true
 description = "VGI worker bringing SQL:2016 MATCH_RECOGNIZE row pattern matching to DuckDB over Apache Arrow"
 
+[lib]
+name = "mr_worker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vgi-matchrecognize-worker"
 path = "src/main.rs"
 
 [dependencies]
-vgi.workspace = true
-vgi-rpc.workspace = true
 arrow.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
@@ -23,4 +25,17 @@ arrow-cast.workspace = true
 mr-core.workspace = true
 serde_json = "1.0"
 log = "0.4"
+
+# --- Native ---------------------------------------------------------------
+# The SDK's real default features — the native binary serves over stdio/HTTP.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+vgi = { workspace = true, features = ["sqlite", "transport-http"] }
+vgi-rpc = { workspace = true, features = ["http"] }
 env_logger = "0.11"
+
+# --- wasm32 ---------------------------------------------------------------
+# No sqlite (C) and no HTTP transport (tokio/mio/axum); the browser build serves
+# over a SharedArrayBuffer byte channel, which the bincode stream codec drives.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+vgi = { workspace = true }
+vgi-rpc = { workspace = true, features = ["stream-codec"] }

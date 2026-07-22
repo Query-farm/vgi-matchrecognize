@@ -1,20 +1,29 @@
 [workspace]
 resolver = "2"
-members = ["crates/mr-core", "crates/mr-worker"]
+members = ["crates/mr-core", "crates/mr-worker", "crates/mr-wasm"]
+# mr-wasm only makes sense for wasm32-unknown-emscripten (it is a staticlib whose
+# ring ops are supplied by emcc's --js-library), so keep it out of the default
+# set: bare `cargo build` / `test` / `clippy` stay native-only and unchanged.
+# Build it explicitly with `wasm/build.sh` or `-p mr-wasm`.
+default-members = ["crates/mr-core", "crates/mr-worker"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.97"
 license = "MIT"
 authors = ["Query Farm LLC <hello@query.farm>"]
 repository = "https://github.com/Query-farm/vgi-matchrecognize"
 
 [workspace.dependencies]
-# VGI Rust SDK (worker side), published on crates.io. Keep arrow / vgi-rpc in
-# lockstep with vgi's own pins so a single arrow / vgi-rpc version resolves.
-vgi = "0"
-vgi-rpc = { version = "0", default-features = false, features = ["macros", "http"] }
+# VGI Rust SDK (worker side), published on crates.io. 0.24 provides the wasm
+# `vgi::wasm_worker!` macro used by mr-wasm; requires rustc 1.97 (see
+# rust-version above). Base (feature-less) so each target can opt in: the native
+# build takes the SDK's real defaults (`sqlite` + `transport-http`), while the
+# wasm build must NOT — tokio/mio/axum and bundled SQLite do not compile for
+# wasm32, and the browser transport serves over a byte channel rather than HTTP.
+vgi = { version = "0.24", default-features = false }
+vgi-rpc = { version = "0.16", default-features = false, features = ["macros"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 arrow-array = "59"
 arrow-buffer = "59"
