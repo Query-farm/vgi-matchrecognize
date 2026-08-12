@@ -334,8 +334,14 @@ impl TableBufferingFunction for MatchRecognize {
         Ok(params.execution_id.clone())
     }
 
-    fn combine(&self, params: &BufferingParams, _state_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
-        Ok(vec![params.execution_id.clone()])
+    fn combine(&self, params: &BufferingParams, state_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        // Carry the sink count to finalize outside the store, so finalize can tell
+        // "no input rows" (legitimately empty) from "cannot see the sinks' state".
+        let count = u32::try_from(state_ids.len()).unwrap_or(u32::MAX);
+        Ok(vec![crate::buffer::FinalizeState::encode(
+            &params.execution_id,
+            count,
+        )])
     }
 
     fn finalize_producer(
@@ -350,7 +356,8 @@ impl TableBufferingFunction for MatchRecognize {
         let plan = build_plan(&params.arguments, &input_schema)?;
 
         // Read the buffered relation back, verifying nothing was lost in transit.
-        let batches = crate::buffer::read_batches(&params.storage, &finalize_state_id)?;
+        let state = crate::buffer::FinalizeState::decode(&finalize_state_id)?;
+        let batches = crate::buffer::read_batches(&params.storage, &state)?;
 
         // The store is built over the *projected* schema, matching what `process`
         // wrote; the batches are kept as they arrived rather than concatenated,

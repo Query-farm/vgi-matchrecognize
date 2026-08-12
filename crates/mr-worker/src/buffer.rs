@@ -45,6 +45,40 @@ fn re(e: impl std::fmt::Display) -> RpcError {
     RpcError::runtime_error(e.to_string())
 }
 
+/// A finalize state id: the buffering scope, plus how many sink states fed it.
+///
+/// The count travels *outside* the store, so it stays trustworthy even when the
+/// store does not. If sinks buffered batches and the finalize phase reads none
+/// back, the two phases are not seeing the same state — which is what an
+/// in-process storage backend looks like when the phases land in different worker
+/// processes — and that must be an error, not an empty answer.
+///
+/// The SDK treats a finalize state id as opaque (`combine`'s return value is handed
+/// straight to `finalize_producer`), so a fixed-width prefix is safe to add.
+pub struct FinalizeState {
+    pub scope: Vec<u8>,
+    pub sink_count: u32,
+}
+
+impl FinalizeState {
+    pub fn encode(scope: &[u8], sink_count: u32) -> Vec<u8> {
+        let mut out = sink_count.to_le_bytes().to_vec();
+        out.extend_from_slice(scope);
+        out
+    }
+
+    pub fn decode(id: &[u8]) -> Result<Self> {
+        if id.len() < 4 {
+            return Err(re("match_recognize: malformed finalize state id"));
+        }
+        let (count, scope) = id.split_at(4);
+        Ok(FinalizeState {
+            scope: scope.to_vec(),
+            sink_count: u32::from_le_bytes(count.try_into().expect("4 bytes")),
+        })
+    }
+}
+
 /// Read every entry of `ns` under `scope`, in id order.
 ///
 /// Public so the storage-backend probe can exercise the worker's real paging
@@ -88,8 +122,18 @@ pub fn append_batch(storage: &SharedStorage, scope: &[u8], batch: &RecordBatch) 
     Ok(())
 }
 
-/// Read back every buffered batch, verifying the row-count tally.
-pub fn read_batches(storage: &SharedStorage, scope: &[u8]) -> Result<Vec<RecordBatch>> {
+/// Read back every buffered batch, verifying that the relation arrived intact.
+///
+/// Two independent checks, because a short read here would surface as a confidently
+/// wrong answer rather than an error:
+///
+/// 1. `state.sink_count` sinks ran, so reading back *nothing* means the sink and
+///    source phases are not sharing state. Carried outside the store, so it holds
+///    even if the store is the thing that is broken.
+/// 2. Every batch was written with a separate row-count record; the two totals must
+///    agree, or the store dropped or duplicated something.
+pub fn read_batches(storage: &SharedStorage, state: &FinalizeState) -> Result<Vec<RecordBatch>> {
+    let scope = &state.scope;
     let mut batches = Vec::new();
     let mut buffered_rows = 0usize;
     for bytes in scan_log(storage, scope, NS_BATCHES) {
@@ -107,6 +151,15 @@ pub fn read_batches(storage: &SharedStorage, scope: &[u8]) -> Result<Vec<RecordB
         expected_rows += u64::from_le_bytes(n) as usize;
     }
 
+    if batches.is_empty() && state.sink_count > 0 {
+        return Err(re(format!(
+            "match_recognize: {} buffering sink(s) ran but the finalize phase read back no \
+             buffered rows, so the two phases are not sharing state. This normally means the \
+             shared storage backend cannot outlive a single worker process; unset \
+             VGI_WORKER_SHARED_STORAGE to use the default durable store.",
+            state.sink_count
+        )));
+    }
     if expected_rows != buffered_rows {
         return Err(re(format!(
             "match_recognize: read back {buffered_rows} buffered rows but {expected_rows} were \

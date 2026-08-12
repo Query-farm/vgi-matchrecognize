@@ -134,6 +134,12 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
   compiled in.
 - `append` reports failure by returning a negative id (SQLite returns -1 without
   storing), so `buffer::append_batch` checks it rather than discarding it.
+- `combine` encodes the sink count into the finalize state id (`FinalizeState`,
+  a 4-byte LE prefix before the scope). The SDK treats that id as opaque, so this
+  carries the count *outside* the store: if sinks ran and finalize reads back no
+  batches, the phases are not sharing state and we error instead of returning an
+  empty result. That backstops the `VGI_WORKER_SHARED_STORAGE=memory` bind check
+  without depending on a backend name.
 - Empty matches (zero bound rows) ARE reported and DO consume a match number, per
   SQL:2016 — one row positioned on the row the match sits on, with every measure
   evaluated over an empty frame (`CLASSIFIER()`/navigation NULL, `COUNT(*)` 0).

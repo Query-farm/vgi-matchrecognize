@@ -308,23 +308,33 @@ process memory.
   rest are projected away first. This matters more than it sounds: buffering
   volume dominates runtime, and on 2M rows a single unused 200-byte column cost
   1.02s → **2.83s** before this was added.
-- **Output streams** one partition at a time, coalesced into ~8k-row batches, so
-  the whole result set is never live at once.
+- **Output streams.** Matching runs one partition at a time and emits ~8k-row
+  batches, so the result set is never fully live: 5M *output* rows peak at **349 MB**
+  of worker RSS, less than a 1.3M-match query over a wider input. DuckDB can also
+  stop pulling — adding `LIMIT 5` to that 5M-row query cut it from 2.85s to
+  **1.34s**, the remainder being the input buffering it cannot skip.
 - **Input does not stream.** At finalize the buffered relation is read back into
   memory, plus one `usize` per row for the partition tapes. Measured: 5M rows × 4
-  columns → about **0.6 GB** peak worker RSS producing 1.33M matches. Filter or
-  aggregate before the function on inputs far larger than RAM; per-partition
-  spilling is the next step.
+  columns → about **0.6 GB** peak worker RSS producing 1.33M matches. So memory
+  tracks the *input*, not the output: filter or aggregate before the function on
+  inputs far larger than RAM. Per-partition spilling is the next step.
 
 Matching cannot be made fully streaming: a match may span an entire partition, so
 the partition must be complete first, and DuckDB does not deliver input clustered
 by partition key.
 
-Leave `VGI_WORKER_SHARED_STORAGE` alone: the buffering and producing phases may run
-in *different worker processes*, so the store has to outlive a process, and the
-in-process `memory` backend is rejected at bind time for exactly that reason. Every
-batch carries an independent row count that is checked when the relation is read
-back, so a short read is an error rather than a quietly incomplete answer.
+Leave `VGI_WORKER_SHARED_STORAGE` alone. The buffering and producing phases may run
+in *different worker processes*, so the store has to outlive a process. Two
+independent guards make a misconfiguration an error rather than a quiet
+under-count:
+
+- Setting it to `memory` fails at bind with an explanation. Of the SDK's backends
+  that is the only unsafe value — `sqlite` (the default) and `fs` are durable, and
+  an unrecognized value falls back to `fs`.
+- Independently of any backend name, the number of buffering sinks is carried to
+  the finalize phase *outside* the store. If sinks ran and finalize reads back no
+  rows, the two phases are not sharing state and the query fails. Each batch also
+  carries a separate row-count record, and the totals must agree.
 
 ### Not hanging, not crashing
 
