@@ -64,6 +64,9 @@ pub struct Matcher<'a> {
     budget: i64,
     partition_label: String,
     match_number: i64,
+    /// The backtrack stack, owned by the matcher rather than by `run`, so its
+    /// capacity is paid for once per partition instead of once per start position.
+    stack: Vec<Alt>,
 }
 
 impl<'a> Matcher<'a> {
@@ -90,6 +93,7 @@ impl<'a> Matcher<'a> {
             budget: step_budget,
             partition_label: partition_label.into(),
             match_number: first_match_number,
+            stack: Vec::new(),
         }
     }
 
@@ -111,8 +115,12 @@ impl<'a> Matcher<'a> {
     pub fn find_all(&mut self) -> Result<Vec<Match>> {
         let mut matches = Vec::new();
         let mut i = 0usize;
+        // One buffer for the whole scan. Every failed attempt ends with `run`
+        // truncating it back to empty, so reusing it keeps the grown capacity
+        // instead of re-paying for it at each of the tape's start positions.
+        let mut binds: Vec<Bind> = Vec::new();
         while i < self.tape.len() {
-            let mut binds: Vec<Bind> = Vec::new();
+            binds.clear();
             let res = self.run(i, &mut binds)?;
             match res {
                 Some(end) => {
@@ -120,7 +128,11 @@ impl<'a> Matcher<'a> {
                         match_number: self.match_number,
                         start: i,
                         end,
-                        binds: binds.clone(),
+                        // Move the binds out rather than cloning them: `binds` is
+                        // cleared at the top of the next iteration either way, so a
+                        // clone would allocate a second Vec and deep-copy every
+                        // bind only to drop the original.
+                        binds: std::mem::take(&mut binds),
                     };
                     self.match_number += 1;
                     let next = self.skip_target(i, &m)?;
@@ -177,7 +189,9 @@ impl<'a> Matcher<'a> {
         // `self` and the loop body can still call `&mut self` / `&self` methods.
         let prog = self.prog;
         let base = binds.len();
-        let mut stack: Vec<Alt> = Vec::new();
+        // The backtrack stack lives on `self` so its capacity survives across start
+        // positions; `Alt` is `Copy`, so clearing is free and keeps the allocation.
+        self.stack.clear();
         let mut ip = 0usize;
         let mut pos = start_pos;
         loop {
@@ -201,7 +215,7 @@ impl<'a> Matcher<'a> {
                     // Popping LIFO reproduces exactly the preference order of the
                     // former recursive executor, so greedy vs reluctant semantics
                     // (which differ only in `Split` branch order) are unchanged.
-                    stack.push(Alt {
+                    self.stack.push(Alt {
                         ip: *b,
                         pos,
                         binds_len: binds.len(),
@@ -245,7 +259,7 @@ impl<'a> Matcher<'a> {
                 }
             };
             if !advanced {
-                match stack.pop() {
+                match self.stack.pop() {
                     Some(alt) => {
                         ip = alt.ip;
                         pos = alt.pos;
