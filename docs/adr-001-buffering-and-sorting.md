@@ -95,15 +95,24 @@ concern the *input*:
 
 - `requires_input_batch_index` hands us DuckDB's per-chunk batch index, which would
   give us the true input order — enough to make tie ordering deterministic and to
-  let a future finalize stream partitions. It requires a source that can supply one.
-  The extension's own comment names `range()` as a source that cannot, and says it
-  will "fail loudly" with an `IOException`. **Measured with the community extension,
-  it does not fail loudly: it segfaults the DuckDB process (exit 139) on
-  `(SELECT i FROM range(10))`, with no error and no output.** Removing the flag makes
-  the same query work. So the flag is unusable today, and even once fixed it would
-  restrict the function to sources with batch-index support — the error text suggests
-  "wrap input in a TEMP TABLE", which is not a reasonable thing to ask of every
-  caller.
+  let a future finalize stream partitions. It requires a source that can supply one,
+  which `range()` and `VALUES` cannot.
+
+  Declaring it used to be unusable: DuckDB asserts
+  `pipeline.source->SupportsPartitioning(BatchIndex())` in `PipelineExecutor`'s
+  constructor, so such a query died before any extension code ran — an
+  InternalException in a debug build, and a **segfault** (exit 139, no error, no
+  output) in release, where the assert compiles out. **Fixed upstream** in the vgi
+  extension (`table_buffering: don't crash when the source cannot supply a
+  batch_index`): the plan now checks the pipeline source and, when it cannot supply
+  an index, serializes the sink and numbers the batches itself, so the worker gets a
+  valid monotonic index from any source and no caller has to wrap their input.
+
+  We still do not declare it here, for one reason: the fix is not in a released
+  community extension yet, so declaring it would crash for anyone on the current
+  release. Once the fixed extension ships, declaring it becomes safe and buys
+  deterministic tie ordering — at the cost of a serialized sink on sources that
+  cannot supply an index, which is why it should be weighed then rather than assumed.
 - `sink_order_dependent` forces `ParallelSink=false`, a single-threaded sink. That
   works with any source, but ingest is ~83% of a realistic query's wall time, so it
   trades most of the throughput for ordering.
