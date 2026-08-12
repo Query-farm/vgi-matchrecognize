@@ -119,6 +119,8 @@ pub fn split(
 ) -> Result<Vec<u64>> {
     debug_assert!(shards > 1, "splitting into one shard is a no-op");
     let mut rows_per_shard = vec![0u64; shards];
+    // Held open for the whole pass; see `ShardWriters`.
+    let mut writers = crate::spool::ShardWriters::new(scope, shards)?;
     let part_cols = plan.partition_by_columns();
     let paths = crate::spool::files_with_prefix(scope, "sink-");
     for path in &paths {
@@ -152,7 +154,7 @@ pub fn split(
                 }
                 let sub = take_rows(&batch, rows)?;
                 rows_per_shard[s] += sub.num_rows() as u64;
-                crate::spool::append_shard(scope, s, &sub, index)?;
+                writers.append(s, &sub, index)?;
             }
         }
         // This file's rows are all in shards now, so the copy of them here is dead
@@ -160,6 +162,9 @@ pub fn split(
         // plus one file, instead of two full copies.
         crate::spool::remove_file(path);
     }
+    // Before the row counts are handed out as finalize state, every byte must be on
+    // its way to disk — another process may read these files.
+    writers.finish()?;
     Ok(rows_per_shard)
 }
 

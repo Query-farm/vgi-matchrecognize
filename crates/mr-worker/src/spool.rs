@@ -45,7 +45,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -217,40 +217,93 @@ pub fn sink_bytes(scope: &[u8]) -> u64 {
         .sum()
 }
 
-/// Append a batch to one shard of an execution, for the finalize-phase split.
-pub fn append_shard(
-    scope: &[u8],
-    shard: usize,
-    batch: &RecordBatch,
-    batch_index: i64,
-) -> Result<()> {
-    let Some(dir) = dir(scope) else {
-        return Err(re("match_recognize: no spool directory to shard into"));
-    };
-    let payload = ipc::write_batch(batch)?;
-    let len = u32::try_from(payload.len())
-        .map_err(|_| re("match_recognize: buffered batch exceeds 4 GiB"))?;
-    let path = dir.join(format!("shard{shard}.mrspool"));
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| {
-            re(format!(
-                "match_recognize: opening {} failed: {e}",
-                path.display()
-            ))
-        })?;
-    let mut record = Vec::with_capacity(HEADER + payload.len());
-    record.extend_from_slice(&batch_index.to_le_bytes());
-    record.extend_from_slice(&len.to_le_bytes());
-    record.extend_from_slice(&payload);
-    f.write_all(&record).map_err(|e| {
-        re(format!(
-            "match_recognize: writing {} failed: {e}",
-            path.display()
-        ))
-    })
+/// The open shard files of one split pass.
+///
+/// The split writes a piece of every input batch to every shard it touches, so opening
+/// the file per piece means `batches x shards` open/write/close cycles — measured at
+/// 48,830 of them for a 10M-row query, and **86% of the split's entire cost** (259
+/// ns/row, of which deciding, gathering and encoding the rows accounted for 35).
+/// Holding the files open for the pass removes that.
+///
+/// Buffered, which the sink path deliberately is *not*: `split` is one call with a
+/// defined end, so [`ShardWriters::finish`] is a guaranteed flush point. `process()`
+/// has no such point, which is why it writes straight through.
+pub struct ShardWriters {
+    dir: PathBuf,
+    /// One per shard, created on first use — a shard that receives no rows gets no
+    /// file, which `read_shard` already treats as an empty shard.
+    writers: Vec<Option<BufWriter<File>>>,
+    buffer_capacity: usize,
+}
+
+/// Total buffering across all shards, split evenly. Bounded so that a query sharded
+/// into hundreds of pieces does not turn its write buffers into a memory problem of
+/// their own.
+const SHARD_BUFFER_TOTAL: usize = 8 * 1024 * 1024;
+
+impl ShardWriters {
+    pub fn new(scope: &[u8], shards: usize) -> Result<Self> {
+        let Some(dir) = dir(scope) else {
+            return Err(re("match_recognize: no spool directory to shard into"));
+        };
+        Ok(ShardWriters {
+            dir,
+            writers: (0..shards).map(|_| None).collect(),
+            buffer_capacity: (SHARD_BUFFER_TOTAL / shards.max(1)).clamp(16 * 1024, 1024 * 1024),
+        })
+    }
+
+    /// Append one batch to a shard, in the same framing the sink uses.
+    pub fn append(&mut self, shard: usize, batch: &RecordBatch, batch_index: i64) -> Result<()> {
+        let payload = ipc::write_batch(batch)?;
+        let len = u32::try_from(payload.len())
+            .map_err(|_| re("match_recognize: buffered batch exceeds 4 GiB"))?;
+        let capacity = self.buffer_capacity;
+        let dir = self.dir.clone();
+        let slot = self
+            .writers
+            .get_mut(shard)
+            .ok_or_else(|| re(format!("match_recognize: shard {shard} out of range")))?;
+        if slot.is_none() {
+            let path = dir.join(format!("shard{shard}.mrspool"));
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| {
+                    re(format!(
+                        "match_recognize: opening {} failed: {e}",
+                        path.display()
+                    ))
+                })?;
+            *slot = Some(BufWriter::with_capacity(capacity, f));
+        }
+        let w = slot.as_mut().expect("just created");
+        let mut record = Vec::with_capacity(HEADER + payload.len());
+        record.extend_from_slice(&batch_index.to_le_bytes());
+        record.extend_from_slice(&len.to_le_bytes());
+        record.extend_from_slice(&payload);
+        w.write_all(&record)
+            .map_err(|e| re(format!("match_recognize: writing a shard failed: {e}")))
+    }
+
+    /// Flush every shard, propagating any failure.
+    ///
+    /// Explicit rather than left to `Drop`, which swallows errors: the finalize states
+    /// are handed out immediately after this returns and may be read by another
+    /// process, so a write that did not land has to be an error here.
+    pub fn finish(mut self) -> Result<()> {
+        for (shard, slot) in self.writers.iter_mut().enumerate() {
+            if let Some(w) = slot {
+                w.flush().map_err(|e| {
+                    re(format!(
+                        "match_recognize: flushing shard {shard} failed: {e}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Delete one spool file.
