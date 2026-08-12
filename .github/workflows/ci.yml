@@ -1,9 +1,40 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Four jobs, sized against what each one actually costs. Measured per run before this
+# layout (5 jobs, ~12-16 runner-minutes):
+#
+#   supply-chain audit      5m40   <- `cargo install cargo-audit` from source, every run
+#   SQLLogic e2e            2m10   <- release build of the worker
+#   metadata quality        2m25   <- the *same* release build again
+#   fmt · clippy · doc      1m15
+#   MSRV check              0m31
+#
+# Two of those were pure waste. `rustsec/audit-check` compiles cargo-audit and ~300 of its
+# dependencies on a fresh runner each time, so the most expensive job in the matrix never
+# built our code at all — a prebuilt binary does the same check in seconds. And the e2e and
+# metadata jobs each built the release worker, so the release build ran twice; they are now
+# one job that builds it once and then lints the binary it just produced.
+#
+# What remains is roughly halved and each job earns its slot: a debug job for the fast
+# checks, a release job for anything that needs the actual binary, a cheap audit, and an
+# MSRV check that has to use its own toolchain (and therefore its own cache) by definition.
+
 name: CI
 
 on:
   push:
     branches: [main]
+    # Docs-only pushes have nothing for these jobs to check. Pull requests deliberately
+    # have no such filter, so required checks always report on a PR.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
   pull_request:
+  # Advisories are published without us pushing anything, so the audit runs on its own
+  # schedule. Every other job is skipped on this trigger — see the `if:` guards.
+  schedule:
+    - cron: '17 6 * * 1'
   workflow_dispatch:
   workflow_call:
 
@@ -18,6 +49,7 @@ env:
 jobs:
   build-test:
     name: fmt · clippy · doc · unit + proptest
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -45,8 +77,12 @@ jobs:
       - name: Unit tests + property-based fuzzing
         run: cargo test --workspace --all-features
 
-  e2e:
-    name: SQLLogic e2e (haybarn)
+  # Everything that needs the release binary, so it is built once. `run_tests.sh` builds it
+  # and runs the SQLLogic suite against it; vgi-lint then reads the metadata out of the same
+  # file. Splitting these paid for a second release build and bought nothing.
+  release-checks:
+    name: SQLLogic e2e (haybarn) · metadata quality (vgi-lint)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -61,34 +97,22 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          # The runner otherwise re-downloads haybarn (a DuckDB build, ~10 MB) every run.
+          enable-cache: true
 
       - name: Install the haybarn unittest runner
         run: |
           uv tool install haybarn-unittest
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # The `vgi` extension comes from haybarn, which has builds the community repository
+      # does not.
       - name: Install the vgi community extension
         run: echo "INSTALL vgi FROM community;" | uvx haybarn-cli
 
       - name: Run SQLLogic suite against the built worker
         run: ./run_tests.sh
-
-  metadata-quality:
-    name: metadata quality (vgi-lint)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Build worker (release)
-        run: cargo build --release --bin vgi-matchrecognize-worker
 
       - name: vgi-lint
         uses: Query-farm/vgi-lint-check@v1
@@ -99,26 +123,29 @@ jobs:
   audit:
     name: supply-chain audit (cargo-audit)
     runs-on: ubuntu-latest
-    # rustsec/audit-check posts a check-run, which needs checks:write; the
-    # top-level `permissions: contents: read` alone yields
-    # "Resource not accessible by integration - create-a-check-run".
-    permissions:
-      contents: read
-      checks: write
     steps:
       - uses: actions/checkout@v7
-      - name: cargo audit
-        uses: rustsec/audit-check@v2
+
+      # A prebuilt release binary. `rustsec/audit-check` shells out to `cargo install
+      # cargo-audit`, which compiled it from source on every run and made this the most
+      # expensive job in CI (5m40) for a check that only reads Cargo.lock.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
 
   msrv:
     name: MSRV check (rust 1.97)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain (pinned MSRV)
         uses: dtolnay/rust-toolchain@1.97
+      # Its own toolchain means its own artifacts; this cache cannot be shared with the
+      # stable jobs.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: msrv
