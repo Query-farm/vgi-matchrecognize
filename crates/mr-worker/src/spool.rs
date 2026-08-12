@@ -45,22 +45,50 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use arrow_array::RecordBatch;
+use arrow_buffer::{Buffer, MutableBuffer};
+use arrow_ipc::reader::StreamDecoder;
 use vgi::ipc;
 use vgi_rpc::{Result, RpcError};
 
-/// Fixed-width record header: the batch index, the payload length, and how the payload
-/// is encoded.
+/// Fixed-width record header, **padded to 64 bytes**, followed by the payload, followed
+/// by padding to the next multiple of 64.
 ///
-/// The codec is per *record* rather than per build, so a spool stays readable when the
-/// setting changes between one query and the next — and so a fallback record and a
-/// compressed one can sit in the same directory.
-const HEADER: usize = 8 + 4 + 1;
+/// ```text
+/// 0..8    batch_index  i64  (i64::MIN when the source could not supply one)
+/// 8..12   stored_len   u32  bytes of payload as written
+/// 12..16  raw_len      u32  bytes of payload before compression
+/// 16..17  codec        u8
+/// 17..64  zero padding
+/// ```
+///
+/// Two things pay for that padding, both of which the previous 13-byte header gave away:
+///
+/// - **Alignment.** Arrow writes each buffer inside a payload 64-byte aligned *relative
+///   to the payload start*, so a payload beginning at an arbitrary file offset has every
+///   buffer misaligned, and a reader must reallocate and copy all of it. Padding the
+///   header to 64 and each record up to a multiple of 64 keeps every payload 64-aligned,
+///   which is what lets [`read_files`] decode without copying the data.
+/// - **The memory budget.** `raw_len` is the uncompressed size, which is what predicts
+///   the producer's in-memory peak. `shard_count` divides *that* by the budget; using
+///   bytes on disk silently loosened the bound by the compression ratio.
+///
+/// 64 bytes of header on a ~49 KB record is 0.13%, and the codec being per record means a
+/// spool stays readable when the setting changes between queries.
+const HEADER: usize = 64;
+
+/// Alignment for record starts and payload starts alike; arrow's own buffer alignment.
+const RECORD_ALIGN: usize = 64;
+
+/// `n` rounded up to a multiple of [`RECORD_ALIGN`].
+fn aligned(n: usize) -> usize {
+    n.div_ceil(RECORD_ALIGN) * RECORD_ALIGN
+}
 
 /// Payload is a plain Arrow IPC stream.
 const CODEC_NONE: u8 = 0;
@@ -78,29 +106,30 @@ fn re(e: impl std::fmt::Display) -> RpcError {
     RpcError::runtime_error(e.to_string())
 }
 
-/// Bytes a sink writes uncompressed before it starts compressing — **when compression is
-/// asked for at all**, which it is not by default. See [`compression`].
+/// Bytes a sink writes uncompressed before it starts compressing.
+///
+/// Compression is worth CPU only where the bytes hurt, and for a small query they never
+/// do: the whole spool stays in the page cache and is deleted seconds later. So a sink
+/// starts plain and switches once it has written this much — which costs a short query
+/// nothing and still compresses all but the first slice of a large one. Counted
+/// *uncompressed*, so the threshold means the same thing on both sides of itself.
 const COMPRESS_AFTER_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Whether to compress spooled batches. **Opt-in**: `VGI_MR_SPOOL_COMPRESSION=lz4`.
+/// Whether to compress spooled batches: on past [`COMPRESS_AFTER_BYTES`], and
+/// `VGI_MR_SPOOL_COMPRESSION=lz4|none` forces it either way.
 ///
-/// It was briefly the size-triggered default, and that was wrong for a reason worth
-/// recording. The finalize phase decides how many shards it needs by comparing the
-/// spool's size on disk against a budget that means *the producer's in-memory peak*
-/// ([`crate::shard::budget_bytes`]). Those are the same number only while the spool is
-/// uncompressed. Compressing it makes the on-disk figure smaller than what the producer
-/// will hold, so the shard count comes out low by the compression ratio and peak memory
-/// runs 1.5-2.9x over budget — the budget stops binding, which is precisely what
-/// sharding exists to prevent.
+/// This was briefly off by default, for a reason now fixed. The finalize phase decides
+/// how many shards it needs by dividing the spool's size by a budget that means *the
+/// producer's in-memory peak* ([`crate::shard::budget_bytes`]) — and it used to measure
+/// bytes on disk, which stops predicting that as soon as anything is compressed, quietly
+/// loosening the bound by the compression ratio. Each record now carries its uncompressed
+/// length and [`sink_uncompressed_bytes`] totals *that*, so the two are comparable again
+/// and compression is safe to enable.
 ///
-/// The fix is for each record to carry its *uncompressed* payload length so `combine`
-/// can total that instead of file sizes; until then compression stays off by default,
-/// because a wrong memory bound is worse than a larger spool.
-///
-/// When it is on, the payload is compressed **whole** rather than through arrow's
-/// `IpcWriteOptions`. Arrow compresses each buffer separately — per column, per batch —
-/// and the split's ~205-row pieces made that catastrophic: reading shards back cost
-/// 346-507 ns/row against 20 for whole-record framing.
+/// The payload is compressed **whole** rather than through arrow's `IpcWriteOptions`.
+/// Arrow compresses each buffer separately — per column, per batch — and the split's
+/// ~205-row pieces made that catastrophic: reading shards back cost 346-507 ns/row
+/// against 20 for whole-record framing.
 ///
 /// Compression is applied to the **whole IPC payload as one blob**, not through Arrow's
 /// `IpcWriteOptions`. Arrow's scheme compresses each buffer separately — one per column,
@@ -118,43 +147,101 @@ fn compression(written: u64) -> u8 {
         .to_ascii_lowercase()
         .as_str()
     {
-        // Explicitly asked for: compress once past the threshold, so a short query still
-        // pays nothing.
-        "lz4" | "on" | "1" if written >= COMPRESS_AFTER_BYTES => CODEC_LZ4_FRAME,
-        "lz4" | "on" | "1" => CODEC_NONE,
-        // Anything else, including unset and typos, leaves it off.
+        // Forced on: from the first record, no threshold.
+        "lz4" | "on" | "1" => CODEC_LZ4_FRAME,
+        "none" | "off" | "0" => CODEC_NONE,
+        // Unset, or a typo: decide by size rather than failing a query over an
+        // environment variable.
+        _ if written >= COMPRESS_AFTER_BYTES => CODEC_LZ4_FRAME,
         _ => CODEC_NONE,
     }
 }
 
+/// One encoded record's payload: how it is encoded, its uncompressed size, and the bytes
+/// as they will be stored.
+struct Encoded {
+    codec: u8,
+    raw_len: u32,
+    payload: Vec<u8>,
+}
+
 /// Serialise one batch, and say how.
-fn encode_batch(batch: &RecordBatch, written: u64) -> Result<(u8, Vec<u8>)> {
+fn encode_batch(batch: &RecordBatch, written: u64) -> Result<Encoded> {
     let ipc_bytes = ipc::write_batch(batch)?;
+    let raw_len = u32::try_from(ipc_bytes.len())
+        .map_err(|_| re("match_recognize: buffered batch exceeds 4 GiB"))?;
     match compression(written) {
-        CODEC_LZ4_FRAME => Ok((
-            CODEC_LZ4_FRAME,
-            lz4_flex::block::compress_prepend_size(&ipc_bytes),
-        )),
-        _ => Ok((CODEC_NONE, ipc_bytes)),
+        CODEC_LZ4_FRAME => Ok(Encoded {
+            codec: CODEC_LZ4_FRAME,
+            raw_len,
+            payload: lz4_flex::block::compress_prepend_size(&ipc_bytes),
+        }),
+        _ => Ok(Encoded {
+            codec: CODEC_NONE,
+            raw_len,
+            payload: ipc_bytes,
+        }),
     }
 }
 
-/// Decode a record's payload, whatever it was written with.
-fn decode_batch(codec: u8, payload: &[u8]) -> Result<RecordBatch> {
-    match codec {
-        CODEC_NONE => ipc::read_batch(payload),
+/// Lay out one record: padded header, payload, padding to the next 64-byte boundary.
+fn frame_record(batch_index: i64, enc: &Encoded) -> Result<Vec<u8>> {
+    let stored_len = u32::try_from(enc.payload.len())
+        .map_err(|_| re("match_recognize: buffered batch exceeds 4 GiB"))?;
+    let total = aligned(HEADER + enc.payload.len());
+    let mut record = vec![0u8; total];
+    record[0..8].copy_from_slice(&batch_index.to_le_bytes());
+    record[8..12].copy_from_slice(&stored_len.to_le_bytes());
+    record[12..16].copy_from_slice(&enc.raw_len.to_le_bytes());
+    record[16] = enc.codec;
+    record[HEADER..HEADER + enc.payload.len()].copy_from_slice(&enc.payload);
+    Ok(record)
+}
+
+/// Decode one record's payload into a batch.
+///
+/// Goes through arrow's own [`StreamDecoder`] over an aligned [`Buffer`], not the SDK's
+/// `ipc::read_batch`. Two reasons: the SDK reader copies the whole payload through a
+/// `Read` adapter and rewrites the schema's nullability on every record — pointless here,
+/// since we wrote that schema ourselves from a real batch — and it cannot hand out arrays
+/// that borrow the input. Decoding from a `Buffer` whose payload is 64-byte aligned lets
+/// the resulting arrays point *into* it, so an uncompressed record costs no copy of its
+/// data at all.
+fn decode_payload(codec: u8, raw_len: u32, payload: Buffer) -> Result<RecordBatch> {
+    let mut buffer = match codec {
+        CODEC_NONE => payload,
         CODEC_LZ4_FRAME => {
-            let raw = lz4_flex::block::decompress_size_prepended(payload).map_err(|e| {
-                re(format!(
-                    "match_recognize: corrupt compressed spool record: {e}"
-                ))
-            })?;
-            ipc::read_batch(&raw)
+            // Decompress into an arrow buffer rather than a `Vec`: `MutableBuffer` is
+            // 64-byte aligned, so the arrays can borrow from it just as in the
+            // uncompressed case. The first four bytes are lz4_flex's size prefix.
+            let mut out = MutableBuffer::from_len_zeroed(raw_len as usize);
+            let written =
+                lz4_flex::block::decompress_into(&payload.as_slice()[4..], out.as_slice_mut())
+                    .map_err(|e| {
+                        re(format!(
+                            "match_recognize: corrupt compressed spool record: {e}"
+                        ))
+                    })?;
+            if written != raw_len as usize {
+                return Err(re(format!(
+                    "match_recognize: spool record decompressed to {written} bytes, header says \
+                     {raw_len}"
+                )));
+            }
+            out.into()
         }
-        other => Err(re(format!(
-            "match_recognize: spool record has unknown codec {other}; the file was written \
-             by a different version of this worker"
-        ))),
+        other => {
+            return Err(re(format!(
+                "match_recognize: spool record has unknown codec {other}; the file was written \
+                 by a different version of this worker"
+            )))
+        }
+    };
+    let mut decoder = StreamDecoder::new();
+    match decoder.decode(&mut buffer) {
+        Ok(Some(batch)) => Ok(batch),
+        Ok(None) => Err(re("match_recognize: spool record holds no batch")),
+        Err(e) => Err(re(format!("match_recognize: decoding a spool record: {e}"))),
     }
 }
 
@@ -249,7 +336,6 @@ pub fn append(scope: &[u8], batch: &RecordBatch, batch_index: Option<i64>) -> Re
     let Some(dir) = dir(scope) else {
         return Ok(false);
     };
-    let mut record = Vec::new();
     FILES.with(|files| {
         let mut files = files.borrow_mut();
         if !files.contains_key(scope) {
@@ -273,19 +359,13 @@ pub fn append(scope: &[u8], batch: &RecordBatch, batch_index: Option<i64>) -> Re
         }
         let f = files.get_mut(scope).expect("just inserted");
         // How much this sink has written decides whether the record is compressed; see
-        // `COMPRESS_AFTER_BYTES`.
-        let (codec, payload) = encode_batch(batch, f.written)?;
-        record.reserve(HEADER + payload.len());
+        // `COMPRESS_AFTER_BYTES`. Counted uncompressed, so the threshold means what it
+        // says whichever side of it the sink is on.
+        let enc = encode_batch(batch, f.written)?;
         // An absent index sorts before every real one, and the merge is stable, so a run
         // without indices keeps arrival order — the same convention the SDK log uses.
-        record.extend_from_slice(&batch_index.unwrap_or(i64::MIN).to_le_bytes());
-        let Ok(len) = u32::try_from(payload.len()) else {
-            return Err(re("match_recognize: buffered batch exceeds 4 GiB"));
-        };
-        record.extend_from_slice(&len.to_le_bytes());
-        record.push(codec);
-        record.extend_from_slice(&payload);
-        f.written += record.len() as u64;
+        let record = frame_record(batch_index.unwrap_or(i64::MIN), &enc)?;
+        f.written += enc.raw_len as u64;
         f.file.write_all(&record).map_err(|e| {
             re(format!(
                 "match_recognize: writing the buffered batch to {} failed: {e}",
@@ -321,14 +401,36 @@ pub fn files_with_prefix(scope: &[u8], prefix: &str) -> Vec<PathBuf> {
     paths
 }
 
-/// Total bytes an execution has spooled from its sinks — the input size, used to
-/// decide whether the finalize phase needs to shard (see [`crate::shard`]).
-pub fn sink_bytes(scope: &[u8]) -> u64 {
-    files_with_prefix(scope, "sink-")
-        .iter()
-        .filter_map(|p| fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum()
+/// How many *uncompressed* bytes an execution has spooled from its sinks.
+///
+/// This is the figure the shard count is derived from, and it has to be the uncompressed
+/// one: `shard_count` divides it by a budget that means the producer's in-memory peak, so
+/// measuring bytes on disk instead loosened that bound by whatever the compression ratio
+/// happened to be.
+///
+/// Reads only headers — 64 bytes per record, seeking over each payload — so this costs
+/// seeks rather than a pass over the data.
+pub fn sink_uncompressed_bytes(scope: &[u8]) -> u64 {
+    let mut total = 0u64;
+    for path in files_with_prefix(scope, "sink-") {
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        let mut header = [0u8; HEADER];
+        while reader.read_exact(&mut header).is_ok() {
+            let stored_len =
+                u32::from_le_bytes(header[8..12].try_into().expect("4 bytes")) as usize;
+            total += u64::from(u32::from_le_bytes(
+                header[12..16].try_into().expect("4 bytes"),
+            ));
+            let skip = (aligned(HEADER + stored_len) - HEADER) as i64;
+            if reader.seek_relative(skip).is_err() {
+                break;
+            }
+        }
+    }
+    total
 }
 
 /// The open shard files of one split pass.
@@ -369,12 +471,10 @@ impl ShardWriters {
 
     /// Append one batch to a shard, in the same framing the sink uses.
     pub fn append(&mut self, shard: usize, batch: &RecordBatch, batch_index: i64) -> Result<()> {
-        // A split only happens for an input past the memory budget, which is far past
-        // the size where compression is worth it — so shard records always compress
-        // (unless the environment says otherwise).
-        let (codec, payload) = encode_batch(batch, u64::MAX)?;
-        let len = u32::try_from(payload.len())
-            .map_err(|_| re("match_recognize: buffered batch exceeds 4 GiB"))?;
+        // A split only happens for an input past the memory budget, which is far past the
+        // size where compression is worth it — so shard records compress from the first
+        // one (unless the environment says otherwise).
+        let enc = encode_batch(batch, u64::MAX)?;
         let capacity = self.buffer_capacity;
         let dir = self.dir.clone();
         let slot = self
@@ -396,11 +496,7 @@ impl ShardWriters {
             *slot = Some(BufWriter::with_capacity(capacity, f));
         }
         let w = slot.as_mut().expect("just created");
-        let mut record = Vec::with_capacity(HEADER + payload.len());
-        record.extend_from_slice(&batch_index.to_le_bytes());
-        record.extend_from_slice(&len.to_le_bytes());
-        record.push(codec);
-        record.extend_from_slice(&payload);
+        let record = frame_record(batch_index, &enc)?;
         w.write_all(&record)
             .map_err(|e| re(format!("match_recognize: writing a shard failed: {e}")))
     }
@@ -447,42 +543,65 @@ pub fn read_all(scope: &[u8]) -> Result<Vec<(i64, RecordBatch)>> {
 }
 
 /// Read a list of spool files into `(batch_index, batch)` pairs.
+///
+/// Streams: one record's payload is resident at a time, and the file's bytes are never
+/// all in memory at once. The previous version read the whole file with `fs::read` and
+/// then kept every decoded batch, so a producer's peak was the file *plus* its decoded
+/// form — about twice its shard, against a memory budget that assumes once.
+///
+/// Each payload is read into a 64-byte-aligned [`MutableBuffer`], which is what allows
+/// [`decode_payload`] to hand out arrays that borrow it rather than copying.
 pub fn read_files(paths: &[PathBuf]) -> Result<Vec<(i64, RecordBatch)>> {
     let mut out = Vec::new();
     for path in paths {
-        let bytes = fs::read(path).map_err(|e| {
+        let file = File::open(path).map_err(|e| {
             re(format!(
-                "match_recognize: reading {} failed: {e}",
+                "match_recognize: opening {} failed: {e}",
                 path.display()
             ))
         })?;
-        let mut at = 0usize;
-        while at < bytes.len() {
-            if at + HEADER > bytes.len() {
-                return Err(re(format!(
-                    "match_recognize: truncated record header in {} at byte {at}",
-                    path.display()
-                )));
-            }
-            let index = i64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
-            let len =
-                u32::from_le_bytes(bytes[at + 8..at + 12].try_into().expect("4 bytes")) as usize;
-            let codec = bytes[at + 12];
-            at += HEADER;
-            let end = at
-                .checked_add(len)
-                .filter(|e| *e <= bytes.len())
-                .ok_or_else(|| {
-                    re(format!(
-                        "match_recognize: truncated batch in {} (record claims {len} bytes)",
-                        path.display()
-                    ))
-                })?;
-            out.push((index, decode_batch(codec, &bytes[at..end])?));
-            at = end;
+        let mut reader = BufReader::new(file);
+        while let Some((index, batch)) = read_record(&mut reader)
+            .map_err(|e| re(format!("match_recognize: reading {}: {e}", path.display())))?
+        {
+            out.push((index, batch));
         }
     }
     Ok(out)
+}
+
+/// Read one record, or `None` at a clean end of file.
+fn read_record<R: Read>(reader: &mut R) -> Result<Option<(i64, RecordBatch)>> {
+    let mut header = [0u8; HEADER];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(re(format!("truncated record header: {e}"))),
+    }
+    let index = i64::from_le_bytes(header[0..8].try_into().expect("8 bytes"));
+    let stored_len = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes")) as usize;
+    let raw_len = u32::from_le_bytes(header[12..16].try_into().expect("4 bytes"));
+    let codec = header[16];
+
+    // Aligned, so the decoded arrays can borrow it.
+    let mut payload = MutableBuffer::from_len_zeroed(stored_len);
+    reader.read_exact(payload.as_slice_mut()).map_err(|e| {
+        re(format!(
+            "truncated record payload of {stored_len} bytes: {e}"
+        ))
+    })?;
+    // Records are padded to a multiple of 64; skip the tail so the next header is found.
+    let padding = aligned(HEADER + stored_len) - HEADER - stored_len;
+    if padding > 0 {
+        let mut skip = [0u8; RECORD_ALIGN];
+        reader
+            .read_exact(&mut skip[..padding])
+            .map_err(|e| re(format!("truncated record padding: {e}")))?;
+    }
+    Ok(Some((
+        index,
+        decode_payload(codec, raw_len, payload.into())?,
+    )))
 }
 
 /// Delete one shard's file, and the execution's directory if that was the last.

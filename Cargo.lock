@@ -1340,6 +1340,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
+ "arrow-ipc",
  "arrow-schema",
  "arrow-select",
  "env_logger",

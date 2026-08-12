@@ -64,11 +64,14 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     record, never via arrow's `IpcWriteOptions`**: arrow compresses per *buffer* (per
     column, per batch), and the split's ~205-row sub-batches made that catastrophic —
     346-507 ns/row to read shards back, against 20 frame-level.
-  - Known, reviewed, not yet fixed: records are 13-byte-framed, so every payload starts
-    at an arbitrary offset and arrow's 64-byte buffer alignment is lost — which rules out
-    any zero-copy read until the header is padded. `read_files` also slurps a whole file
-    *and* keeps every decoded batch, so a producer's peak is ~2x its shard, not the ~1x
-    `shard::budget_bytes` claims.
+    A record is a **64-byte header** (`batch_index | stored_len | raw_len | codec`, padded)
+    then the payload, then padding to the next 64. Both paddings earn their keep: arrow
+    aligns each buffer 64 bytes *relative to the payload start*, so a payload at an
+    arbitrary file offset has every buffer misaligned and a reader must copy all of it —
+    with the padding, `read_files` decodes through arrow's `StreamDecoder` over an aligned
+    `MutableBuffer` and the arrays borrow it. That took read+decode from 16 to **5
+    ns/row**. `raw_len` is what the shard count divides by the memory budget; file sizes
+    stopped predicting the producer's peak the moment anything was compressed.
   - `shard.rs` — splits the spool by partition key when it exceeds the finalize memory
     budget, so peak memory tracks a shard rather than the relation. **A trade, not a
     win**: measured 2× wall clock for 2× less memory (the split is a second full,
@@ -228,7 +231,7 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
 |---|---|
 | `VGI_MR_MATCH_THREADS` | Threads matching partitions. `1` forces the serial path, which is what the determinism checks compare against. Default: machine parallelism, capped at 8. |
 | `VGI_MR_FINALIZE_MEMORY_BYTES` | Spooled bytes above which the relation is sharded by partition key. Default 256 MB, at most 64 shards. Small values are how the sharded path gets exercised by hand. |
-| `VGI_MR_SPOOL_COMPRESSION` | `lz4` compresses spooled records past the first 32 MB a sink writes. **Off by default**: `shard_count` divides the spool's *on-disk* size by a budget that means the producer's *in-memory* peak, and compressing makes those two stop matching, so the memory bound silently loosens by the compression ratio. Fix that (carry the uncompressed length per record) before making it the default. |
+| `VGI_MR_SPOOL_COMPRESSION` | `lz4` compresses every spooled record, `none` never does. Unset is size-triggered: a sink writes plain until it has written 32 MB *uncompressed*, then switches, so a short query pays nothing. Safe now that the shard count is derived from each record's uncompressed length rather than from file sizes — measuring bytes on disk let compression loosen the memory bound by its own ratio. |
 | `VGI_BUFFERING_STORE_TTL_SECS` | Age at which orphaned spool directories are swept (also the SDK store's own knob). Default 24h. |
 | `VGI_WORKER_SHARED_STORAGE` | SDK store backend. `memory` is refused off-wasm — the control records must outlive a process. |
 

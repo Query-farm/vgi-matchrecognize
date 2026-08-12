@@ -36,6 +36,10 @@ arrow = { version = "59", default-features = false, features = ["ipc"] }
 # happens on the parallel sink path where cores are idle. zstd -1 would buy ~1.5x more
 # ratio for roughly twice the decompression cost.
 lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
+# For `StreamDecoder`, which decodes a spool record from an aligned buffer without copying
+# it. Not arrow's `ipc_compression` feature: that also enables arrow-ipc/zstd, and the
+# spool compresses whole records itself rather than per buffer.
+arrow-ipc = { version = "59", default-features = false }
 arrow-array = "59"
 arrow-buffer = "59"
 arrow-data = "59"

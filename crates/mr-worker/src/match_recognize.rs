@@ -429,7 +429,7 @@ impl TableBufferingFunction for MatchRecognize {
         let count = u32::try_from(state_ids.len()).unwrap_or(u32::MAX);
         let scope = &params.execution_id;
 
-        let spooled = crate::spool::sink_bytes(scope);
+        let spooled = crate::spool::sink_uncompressed_bytes(scope);
         let plan = params
             .input_schema
             .as_ref()
