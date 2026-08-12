@@ -106,6 +106,9 @@ pub struct Plan {
     /// Auto `classifier` column emitted (ALL ROWS, not shadowed by a measure).
     auto_classifier: bool,
     output_columns: Vec<OutputColumn>,
+    /// Pattern variables followed by subset names — the labels a qualifier may name.
+    /// Held so the matcher and the emit path can index binds by label.
+    labels: Vec<String>,
 }
 
 impl Plan {
@@ -199,6 +202,7 @@ impl Plan {
 
         Ok(Plan {
             program,
+            labels,
             define,
             subsets,
             measures,
@@ -303,6 +307,7 @@ impl Plan {
                 .unwrap_or_else(|| auto_step_budget(tape.len())),
             label,
             1,
+            &self.labels,
         );
         let matches = matcher.find_all()?;
         for m in &matches {
@@ -318,14 +323,17 @@ impl Plan {
                 out.push(self.emit_empty_row(store, tape, m)?);
                 continue;
             }
+            // Both emit paths resolve `LAST(label)` repeatedly, so index this
+            // match's binds by label once instead of scanning it per lookup.
+            let index = crate::engine::BindIndex::build(&self.labels, &m.binds, &self.subsets);
             if self.rows_all {
                 // One memo per match: the accumulators describe this bind sequence.
                 let memo = crate::engine::AggMemo::new();
                 for k in 0..m.binds.len() {
-                    out.push(self.emit_all_row(store, tape, m, k, &memo)?);
+                    out.push(self.emit_all_row(store, tape, m, k, &index, &memo)?);
                 }
             } else {
-                out.push(self.emit_one_row(store, tape, m)?);
+                out.push(self.emit_one_row(store, tape, m, &index)?);
             }
         }
         Ok(())
@@ -336,6 +344,7 @@ impl Plan {
         store: &dyn RowStore,
         tape: &[usize],
         m: &crate::engine::Match,
+        index: &crate::engine::BindIndex,
     ) -> Result<Vec<Value>> {
         let frame = Frame {
             store,
@@ -344,6 +353,7 @@ impl Plan {
             horizon: m.binds.len(),
             match_number: m.match_number,
             subsets: &self.subsets,
+            label_index: Some(index),
             // A single output row has no later rows to share a fold with.
             agg_memo: None,
         };
@@ -376,6 +386,8 @@ impl Plan {
             horizon: 0,
             match_number: m.match_number,
             subsets: &self.subsets,
+            // Nothing is bound, so there is nothing to index.
+            label_index: None,
             agg_memo: None,
         };
         let mut row = Vec::with_capacity(self.output_columns.len());
@@ -409,6 +421,7 @@ impl Plan {
         tape: &[usize],
         m: &crate::engine::Match,
         k: usize,
+        index: &crate::engine::BindIndex,
         memo: &crate::engine::AggMemo,
     ) -> Result<Vec<Value>> {
         let frame = Frame {
@@ -418,6 +431,7 @@ impl Plan {
             horizon: k + 1,
             match_number: m.match_number,
             subsets: &self.subsets,
+            label_index: Some(index),
             // `k` ascends through the match, so the horizon only ever advances and
             // each aggregate can extend its fold by the one newly visible bind.
             agg_memo: Some(memo),

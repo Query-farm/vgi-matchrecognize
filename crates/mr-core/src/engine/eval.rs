@@ -6,6 +6,7 @@
 //! RUNNING/FINAL semantics against it, with full 3-valued NULL logic.
 
 use super::aggmemo::{self, AggMemo};
+use super::bindindex::BindIndex;
 use super::rowstore::RowStore;
 use super::valops;
 use crate::error::{MrError, Result};
@@ -32,6 +33,9 @@ pub struct Frame<'a> {
     /// SUBSET name -> member variables. A qualifier naming a subset matches any
     /// of its members, so `U.price` and `COUNT(U.*)` range over all of them.
     pub subsets: &'a SubsetMap,
+    /// Where each label was last bound, so `LAST(A.x)` is a lookup rather than a
+    /// backwards scan of the match. `None` falls back to the scan.
+    pub label_index: Option<&'a BindIndex>,
     /// Incremental aggregate state shared by every output row of one match, so a
     /// RUNNING aggregate is folded once across the match instead of re-folded per
     /// row. `None` disables it (the matcher's frames, where the horizon jumps
@@ -104,8 +108,18 @@ impl<'a> Frame<'a> {
     }
 
     /// The last visible bind covered by `label` (logical `LAST` of that label).
+    ///
+    /// Uses the per-label index when one is available: scanning backwards costs the
+    /// distance to the label's last row, which for a variable bound once at the start
+    /// of a long match is the whole match, on every evaluation.
     fn last_bind_labelled(&self, label: &str, final_sem: bool) -> Option<&Bind> {
-        self.visible(final_sem)
+        let visible = self.visible(final_sem);
+        if let Some(idx) = self.label_index.filter(|ix| ix.knows(label)) {
+            return idx
+                .last_before(label, visible.len())
+                .and_then(|i| visible.get(i));
+        }
+        visible
             .iter()
             .rev()
             .find(|b| self.label_covers(label, &b.var))

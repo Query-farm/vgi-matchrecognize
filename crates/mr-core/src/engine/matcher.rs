@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use super::bindindex::BindIndex;
 use super::eval::{Bind, Frame, SubsetMap};
 use super::rowstore::RowStore;
 use crate::error::{MrError, Result};
@@ -67,6 +68,9 @@ pub struct Matcher<'a> {
     /// The backtrack stack, owned by the matcher rather than by `run`, so its
     /// capacity is paid for once per partition instead of once per start position.
     stack: Vec<Alt>,
+    /// Where each label is currently bound, maintained in lockstep with `binds` so a
+    /// DEFINE predicate referencing `A.x` does not scan the match to find `A`.
+    label_index: BindIndex,
 }
 
 impl<'a> Matcher<'a> {
@@ -82,6 +86,7 @@ impl<'a> Matcher<'a> {
         step_budget: i64,
         partition_label: impl Into<String>,
         first_match_number: i64,
+        labels: &[String],
     ) -> Self {
         Matcher {
             prog: &program.insts,
@@ -94,6 +99,7 @@ impl<'a> Matcher<'a> {
             partition_label: partition_label.into(),
             match_number: first_match_number,
             stack: Vec::new(),
+            label_index: BindIndex::new(labels),
         }
     }
 
@@ -121,6 +127,7 @@ impl<'a> Matcher<'a> {
         let mut binds: Vec<Bind> = Vec::new();
         while i < self.tape.len() {
             binds.clear();
+            self.label_index.clear();
             let res = self.run(i, &mut binds)?;
             match res {
                 Some(end) => {
@@ -243,6 +250,7 @@ impl<'a> Matcher<'a> {
                     if pos >= self.tape.len() {
                         false
                     } else {
+                        self.label_index.push(binds.len(), var, self.subsets);
                         binds.push(Bind {
                             tape_pos: pos,
                             var: var.clone(),
@@ -253,6 +261,7 @@ impl<'a> Matcher<'a> {
                             true
                         } else {
                             binds.pop();
+                            self.label_index.truncate(binds.len());
                             false
                         }
                     }
@@ -264,9 +273,11 @@ impl<'a> Matcher<'a> {
                         ip = alt.ip;
                         pos = alt.pos;
                         binds.truncate(alt.binds_len);
+                        self.label_index.truncate(alt.binds_len);
                     }
                     None => {
                         binds.truncate(base);
+                        self.label_index.truncate(base);
                         return Ok(None);
                     }
                 }
@@ -287,6 +298,7 @@ impl<'a> Matcher<'a> {
             horizon: binds.len(),
             match_number: self.match_number,
             subsets: self.subsets,
+            label_index: Some(&self.label_index),
             // Backtracking moves the horizon in both directions, so an extend-only
             // fold would be unsound here: a popped alternative un-binds rows that an
             // accumulator has already absorbed. DEFINE aggregates therefore still
