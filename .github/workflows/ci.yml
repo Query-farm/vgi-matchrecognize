@@ -137,13 +137,35 @@ jobs:
         run: cargo audit
 
   msrv:
-    name: MSRV check (rust 1.97)
+    name: MSRV check (rust-version from Cargo.toml)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      # Take the floor from the one place that defines it, so this job cannot test a
+      # different compiler than the crates claim to support — and so bumping
+      # `[workspace.package] rust-version` is tested without touching CI.
+      - name: Read the MSRV from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ -z "$version" ]]; then
+            echo "no rust-version in [workspace.package]" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV from Cargo.toml: $version"
+
+      # The ref here is the *action's* version; the Rust version is the `toolchain` input.
+      # Those must stay separate: this action also publishes version-like tags naming Rust
+      # releases (`@1.97`), and pinning the MSRV that way let Dependabot "bump" it — it
+      # proposed `@1.100`, a Rust release that does not exist, which failed the job while
+      # also meaning a successful bump would have silently moved the floor being tested.
       - name: Install Rust toolchain (pinned MSRV)
-        uses: dtolnay/rust-toolchain@1.97
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
       # Its own toolchain means its own artifacts; this cache cannot be shared with the
       # stable jobs.
       - uses: Swatinem/rust-cache@v2

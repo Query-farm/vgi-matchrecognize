@@ -27,5 +27,12 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # `dtolnay/rust-toolchain` publishes tags that name *Rust* releases, not action
+      # releases, so there is no such thing as a version bump for it: Dependabot read
+      # `@1.97` as a stale pin and proposed `@1.100`, a Rust version that does not exist.
+      # The MSRV job no longer pins the compiler through the ref (it passes `toolchain:`
+      # from Cargo.toml), and this keeps the ref itself out of Dependabot's reach.
+      - dependency-name: "dtolnay/rust-toolchain"
     commit-message:
       prefix: "ci"
