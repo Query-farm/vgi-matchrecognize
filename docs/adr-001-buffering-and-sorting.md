@@ -171,12 +171,23 @@ one finalize state per shard. Each producer reads one shard, so peak memory trac
 shard rather than the relation (8M rows: 365 MB → 167 MB at a 32 MB budget). No
 ordering assumption, and no fallback path to get wrong.
 
-That also delivered what the addendum said the batch-index flag would buy in the
-future: several finalize states give DuckDB something to drain in parallel. The caveat
-recorded there still applies — the operator sizes its drain threads from the *sink*
-worker count — which is why matching is also parallelised *inside* one producer
-(`std::thread::scope` over a chunk of partitions), where it does not depend on how
-DuckDB scheduled the sink.
+**But it is a memory-for-time trade, not a win**, and the first version of this note
+implied otherwise. The same query goes from **1.17 s to 2.20 s**: the split is a second
+full pass (decode, hash, take, re-encode, write, then decode again in the producers)
+and it is serial, so DuckDB idles through it. Hashing was measured and is not the
+bottleneck — a typed key reader in place of the per-row `Value` changed nothing outside
+noise, so it was reverted rather than kept as unproven complexity. The pass itself is
+the cost.
+
+The consequence for the default: the budget is set high (256 MB) so that ordinary
+queries never shard. Sharding is for the query that would otherwise not complete.
+
+The extra finalize ids do give DuckDB something to drain in parallel — what the
+addendum predicted the batch-index flag would buy — but that was **not observed to
+pay**: drain threads are sized from the *sink* worker count, and matching is already
+parallel inside a single producer (`std::thread::scope` over a chunk of partitions),
+which is the mechanism that actually delivered (8M rows, 2.08 s → 1.27 s single-threaded
+ingest).
 
 ### The sort
 

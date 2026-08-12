@@ -163,6 +163,27 @@ At L=32k the qualified-reference case went from 60,464 to 85 ns/row (600×).
 Extrapolated, a 1M-row match with one `A.k` reference went from roughly half an hour
 to about 0.1 s.
 
+## Sharded finalize: what it costs
+
+The one change that is a trade rather than a win. 8M rows, 2000 partitions, interleaved
+A/B runs:
+
+| Budget | shards | wall clock | peak worker RSS |
+|---|---|---|---|
+| 256 MB (default) | 1 — no split | **1.00–1.27 s** | 365 MB |
+| 32 MB | ~6 | 2.15–2.98 s | **167 MB** |
+| 8 MB | ~24 | 3.8–5.3 s | — |
+
+So ~2× the time for ~2× less memory, and it degrades as shards multiply. The split is a
+second full pass over the data and it is serial — DuckDB's own CPU time *drops* (1.54 s
+→ 0.29 s) while wall clock rises, i.e. it is waiting on the worker. Hashing is not the
+bottleneck: replacing the per-row `Value` with a typed key reader changed nothing
+outside noise, and was reverted.
+
+This is why the default budget is high: sharding is for the query that would otherwise
+run out of memory, not for throughput. Making it cheap would mean sharding at *sink*
+time (no extra pass, but a per-row cost on every query, whether it needs it or not).
+
 ## Measured and declined
 
 Two things the plan proposed that measurement argued against. Recorded so they are not

@@ -8,10 +8,25 @@
 //! When the spooled input is larger than a memory budget, `combine` rewrites it into
 //! `S` shard files, sending every row of a partition to the same shard, and returns one
 //! finalize state id per shard. Each producer then reads only its own shard, so peak
-//! memory is about `total / S` instead of `total`. As a bonus the extra finalize ids
-//! give DuckDB something to drain in parallel — though only up to the number of worker
-//! connections the *sink* phase created, which is how the operator sizes its drain
-//! threads.
+//! memory is about `total / S` instead of `total`.
+//!
+//! # It costs time to save memory
+//!
+//! Measured on an 8M-row query (2000 partitions), sharding at a 32 MB budget: peak
+//! worker RSS 365 MB -> 167 MB, wall clock **1.17 s -> 2.20 s**. The rewrite is a
+//! second full pass — decode, hash, `take`, re-encode, write, and then the producers
+//! decode again — and it is serial, so DuckDB sits idle through it (its CPU time drops
+//! while wall clock rises).
+//!
+//! So this is not a speedup and must not be sold as one. It is what makes a query whose
+//! input does not fit in memory *finish at all*, which is why the budget defaults high
+//! enough that ordinary queries never take this path. Hashing was measured and is not
+//! the bottleneck (a typed key reader replacing the per-row `Value` changed nothing
+//! outside noise), so the cost is the pass itself.
+//!
+//! Extra finalize ids do also give DuckDB something to drain in parallel, but that was
+//! not observed to pay here: drain threads are sized from the *sink* worker count, and
+//! matching is already parallel inside one producer.
 //!
 //! The split is skipped when it cannot help or is not needed:
 //!

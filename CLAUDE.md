@@ -61,7 +61,11 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     serialise). One `write()` per `process()` call — there is no end-of-input hook to
     flush a userspace buffer at.
   - `shard.rs` — splits the spool by partition key when it exceeds the finalize memory
-    budget, so peak memory tracks a shard rather than the relation.
+    budget, so peak memory tracks a shard rather than the relation. **A trade, not a
+    win**: measured 2× wall clock for 2× less memory (the split is a second full,
+    serial pass), so the default budget is high enough that ordinary queries never take
+    it. Do not "optimize" it expecting a speedup — hashing was measured and is not the
+    bottleneck.
   - `arrow_in.rs` — a `RowStore` over the buffered `RecordBatch`es, addressed as
     one contiguous row space (deliberately **not** concatenated — a merged copy
     would double peak memory for no gain).
