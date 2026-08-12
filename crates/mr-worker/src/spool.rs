@@ -549,8 +549,8 @@ pub fn read_all(scope: &[u8]) -> Result<Vec<(i64, RecordBatch)>> {
 /// then kept every decoded batch, so a producer's peak was the file *plus* its decoded
 /// form — about twice its shard, against a memory budget that assumes once.
 ///
-/// Each payload is read into a 64-byte-aligned [`MutableBuffer`], which is what allows
-/// [`decode_payload`] to hand out arrays that borrow it rather than copying.
+/// Each payload is read into a 64-byte-aligned `MutableBuffer`, which is what allows
+/// `decode_payload` below to hand out arrays that borrow it rather than copying.
 pub fn read_files(paths: &[PathBuf]) -> Result<Vec<(i64, RecordBatch)>> {
     let mut out = Vec::new();
     for path in paths {
