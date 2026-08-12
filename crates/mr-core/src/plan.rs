@@ -483,6 +483,11 @@ impl Plan {
                     .ok_or_else(|| MrError::Eval(format!("unknown partition column '{c}'")))
             })
             .collect::<Result<_>>()?;
+        // The common shape — one integer-family key, e.g. `partition_by := ['uid']` —
+        // groups on the raw integer, so no key string is built at all.
+        if let Some(groups) = self.partitions_by_int(store, &idxs) {
+            return Ok(groups);
+        }
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         // One reused buffer, one hash lookup, and an allocation only when a new
@@ -513,6 +518,62 @@ impl Plan {
                 (k, rows)
             })
             .collect())
+    }
+
+    /// Group on a single integer-family partition key, without rendering a key
+    /// string per row.
+    ///
+    /// The generic path builds a `String` for every row — a throwaway allocation per
+    /// key cell plus a string hash — which is most of what partitioning costs. Here
+    /// the key is the raw `i64` (or `None` for NULL, which groups with itself), and
+    /// the label a partition carries is rendered once per group instead of once per
+    /// row. Returns `None` when the shape does not apply, including a value that
+    /// disagrees with the column's declared type, so the generic path stays the
+    /// authority on how keys are formed.
+    fn partitions_by_int(
+        &self,
+        store: &dyn RowStore,
+        idxs: &[usize],
+    ) -> Option<Vec<(String, Vec<usize>)>> {
+        let [ci] = *idxs else { return None };
+        let ty = store.col_ty(ci);
+        if !matches!(ty, Ty::Int64 | Ty::Date | Ty::Timestamp(_) | Ty::Time(_)) {
+            return None;
+        }
+        let n = store.num_rows();
+        let mut first_seen: HashMap<Option<i64>, usize> = HashMap::new();
+        let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
+        for r in 0..n {
+            let cell = store.cell(r, ci);
+            let key = match (&cell, &ty) {
+                (Value::Null, _) => None,
+                (Value::Int(v), Ty::Int64) => Some(*v),
+                (Value::Date(v), Ty::Date) => Some(*v as i64),
+                (Value::Timestamp(v, u), Ty::Timestamp(want)) if u == want => Some(*v),
+                (Value::Time(v, u), Ty::Time(want)) if u == want => Some(*v),
+                // Not uniformly the declared type: let the generic path handle it.
+                _ => return None,
+            };
+            match first_seen.get(&key) {
+                Some(&g) => groups[g].1.push(r),
+                None => {
+                    first_seen.insert(key, groups.len());
+                    groups.push((cell, vec![r]));
+                }
+            }
+        }
+        Some(
+            groups
+                .into_iter()
+                .map(|(sample, rows)| {
+                    // Same rendering the generic path would produce, so a step-budget
+                    // error names the partition the same way either way.
+                    let mut label = String::new();
+                    write_key_part(&mut label, &sample);
+                    (label, rows)
+                })
+                .collect(),
+        )
     }
 
     /// Stable-sort a partition's row indices by the order-by keys.
