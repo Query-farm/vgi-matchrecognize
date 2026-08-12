@@ -62,7 +62,7 @@ Pre-ordered 1.6M input: 93 ms either direction (ascending or descending), versus
 
 ### Worker-side buffering round trip (2M rows × 3 BIGINT, 977 chunks)
 
-Measured separately (see ADR 001); not yet part of the probe:
+Measured separately; not yet part of the probe:
 
 | Step | ns/row |
 |---|---|
@@ -132,6 +132,13 @@ Same machine, same probes, `--test-threads=1`.
 
 Threads now help rather than being the only thing that helps: matching is parallel,
 and ingest no longer dominates.
+
+Two worker-side numbers that the README used to carry, kept here instead:
+
+| | |
+|---|---|
+| one unused 200-byte column, 2M rows | 1.02 s → **2.83 s** — which is why only referenced columns are buffered |
+| 5M *output* rows, peak worker RSS | **349 MB** — the result set streams in ~8k-row batches rather than being materialised |
 
 ### Compute phases
 
@@ -205,9 +212,10 @@ What actually limits it, in the order it bites:
    holding most of the rows, means the whole relation is resident and sharding cannot
    help. This is inherent: a match may span the partition, so the partition is the
    smallest unit that can be matched soundly.
-2. **Disk.** The spool is ~24 bytes/row. Peak was twice the relation until each sink
-   file started being deleted as the split consumed it; it is now the relation plus
-   about one file (5.0 → 3.0 GB on the 100M query).
+2. **Disk.** The spool is ~24 bytes/row, and a sharded run peaks at the spool *plus* the
+   shards — see [Peak disk during a split](#peak-disk-during-a-split), which corrects an
+   earlier claim here that deleting each sink as the split consumed it brought peak down
+   to about one relation. It does not.
 3. **Time**, because the split pass is serial — ~2.5× here, and DuckDB idles through it.
 4. **The shard ceiling**, raised from 64 to 1024 for exactly this reason: at 64 the
    budget stopped binding above 64 × 256 MB = 16 GB of input, and peak memory went back
@@ -216,6 +224,42 @@ What actually limits it, in the order it bites:
 Index widths are not a limit at this scale: tape positions, step budget, match numbers
 and batch indices are all `i64`, and the `u32` bind indices only cap a single *match* at
 4.29B rows.
+
+## Peak disk during a split
+
+Sampled every 0.2 s through a sharded 40M-row query (4 BIGINT columns = a 1.28 GB
+relation, 4000 partitions, 32 MB budget → 40 shards): `df` on the temp volume, against
+the sizes of the files still *linked* in the spool directory.
+
+| | linked sink MB | shards | linked shard MB | df above baseline |
+|---|---|---|---|---|
+| spool complete | 787 | 0 | 0 | 612 |
+| mid-split | 787 | 40 | 378 | 756 |
+| mid-split | 787 | 40 | 827 | 1374 |
+| end of split | 150 | 32 | 994 | 1902 |
+
+Peak is **1912 MB against a 1.28 GB relation** — the (compressed) spool plus the
+shards, about 1.5× — and it does not depend on when the sinks are deleted: 1911 MB
+before that was changed, 1909–1912 after. The sink bytes hold flat until the pass is
+nearly over because the indices are strided across the sinks, so consuming them in
+global index order drains all of them evenly and they all reach their last record at
+about the same time.
+
+This corrects two things:
+
+- An earlier note in this file said peak had come down to "the relation plus about one
+  file (5.0 → 3.0 GB on the 100M query)". That is what a `du` of the spool directory
+  reports, and `du` cannot see a file that has been unlinked while a reader still holds
+  it. In the run above the two disagree by 758 MB at the end of the split — `du` says
+  1144 MB, `df` says 1902 MB. **Measure peak disk with `df`.**
+- Unlinking a mapped file frees nothing until the mapping is dropped, so the delete now
+  happens only after the cursor and the batch decoded from it are released. That does
+  not move the peak either; it returns the space when the delete happens instead of when
+  `split` returns.
+
+Bounding the live sink bytes would take segmenting each sink into fixed-size files and
+chaining the segments behind one cursor, so that a segment is deleted when it is
+consumed rather than when its whole sink is. Not done.
 
 ## Spool compression: granularity decides it
 

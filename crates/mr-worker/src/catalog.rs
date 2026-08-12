@@ -182,7 +182,7 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
         //
         // Safe with any source: a source that cannot supply an index (`range()`,
         // `VALUES`) used to abort the pipeline, so the extension now serializes the
-        // sink and numbers the batches itself. See ADR 001.
+        // sink and numbers the batches itself.
         requires_input_batch_index: true,
         // Output rows come out partition by partition, in the order the partitions
         // happened to arrive — not in the input's order, and not in `order_by`

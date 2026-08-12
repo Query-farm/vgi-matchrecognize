@@ -332,9 +332,8 @@ process memory.
 
 - **Unused columns are free.** Only the columns the pattern reads — the partition
   and order keys plus everything `define`/`measures` reference — are buffered; the
-  rest are projected away first. This matters more than it sounds: buffering
-  volume dominates runtime, and on 2M rows a single unused 200-byte column cost
-  1.02s → **2.83s** before this was added.
+  rest are projected away first. Since buffering volume dominates runtime, selecting
+  fewer columns in the input subquery is the cheapest speedup available.
 - **Matching runs on several threads.** Partitions are independent, so a chunk of
   them is matched concurrently and the results are emitted in partition order —
   byte-identical to matching one at a time. `VGI_MR_MATCH_THREADS` pins the count;
@@ -342,44 +341,35 @@ process memory.
 - **Memory is bounded, and tunable.** If the buffered input exceeds
   `VGI_MR_FINALIZE_MEMORY_BYTES` (default 256 MB), it is split by partition key into
   shards and each is matched separately, so peak memory tracks a shard rather than
-  the relation: an 8M-row query went from **365 MB to 167 MB** of worker RSS with a
-  32 MB budget. Two things cannot be divided that way — a query with no
+  the relation. Lowering the budget trades time for memory: the split is a second
+  pass over the input. Two things cannot be divided that way — a query with no
   `partition_by` is a single partition by definition, and one enormous partition is
   irreducible, because a match may span all of it.
 - **Output streams.** Matching emits ~8k-row batches, so the result set is never
-  fully live: 5M *output* rows peak at **349 MB** of worker RSS. DuckDB can also stop
-  pulling, and a `LIMIT` then skips the matching it does not need.
+  fully live however many rows it produces. DuckDB can also stop pulling, and a
+  `LIMIT` then skips the matching it does not need.
 - **Pre-sorting the input still helps a little.** Ours is a single-threaded sort over
   the buffered rows; DuckDB's is parallel and vectorized. Adding `ORDER BY` to the
   input subquery — `(SELECT … FROM t ORDER BY user_id, ts)` — lets our sort see an
-  already-ordered run, which costs about a quarter of sorting a scrambled one. We
+  already-ordered run, which is markedly cheaper than sorting a scrambled one. We
   sort regardless, so this is purely a speedup, never a correctness dependency.
 
 Matching cannot be made fully streaming: a match may span an entire partition, so
 the partition must be complete first, and DuckDB does not deliver input clustered
-by partition key. [ADR 001](docs/adr-001-buffering-and-sorting.md) records why the
-buffer is a plain Arrow-IPC log rather than an embedded DuckDB, and
-[docs/perf-baseline.md](docs/perf-baseline.md) is the measured cost of every phase.
+by partition key. [docs/perf-baseline.md](docs/perf-baseline.md) is the measured cost
+of every phase.
 
-Leave `VGI_WORKER_SHARED_STORAGE` alone. The spool carries the buffered rows, but the
-SDK store still holds the small control records the finalize phase replays, and the
-two phases may run in *different worker processes* — so that store has to outlive a
-process. Three independent guards make a misconfiguration or a lost file an error
-rather than a quiet under-count:
+**Leave `VGI_WORKER_SHARED_STORAGE` alone.** The spool holds the buffered rows, but the
+SDK store still holds the small control records the finalize phase replays, and the two
+phases may run in *different worker processes* — so `memory` is refused at bind, while
+`sqlite` (the default) and `fs` are both fine. Whatever goes wrong there — a truncated
+spool file, two phases not sharing state — is an error that names what went missing,
+never a short answer.
 
-- Setting it to `memory` fails at bind with an explanation. Of the SDK's backends
-  that is the only unsafe value — `sqlite` (the default) and `fs` are durable, and
-  an unrecognized value falls back to `fs`. (The wasm build is the exception: one
-  module serves every phase there, so `memory` is both safe and required.)
-- The number of buffering sinks is carried to the finalize phase *outside* the store.
-  If sinks ran and finalize reads back nothing, the two phases are not sharing state
-  and the query fails.
-- Every buffered batch is length-prefixed and its writes are checked, and a sharded
-  run additionally carries the row count each shard should hold. A truncated or
-  missing file is an error naming the shard, not a short answer.
-
-Disk use is about 24 bytes per buffered row, plus one sink file's worth while a split
-is in progress. Spool files are deleted as soon as the finalize phase has read them. A query killed
+Disk use is about 24 bytes per buffered row — and roughly twice that while a split is
+in progress, since the shards are written before the buffered input can be released.
+Size `$TMPDIR` accordingly if you lower the memory budget. Spool files are deleted as
+soon as the finalize phase has read them. A query killed
 before that leaves the worker no hook at all, so directories older than
 `VGI_BUFFERING_STORE_TTL_SECS` (default 24h, the same knob the SDK's own store uses)
 are swept when a worker process first spools.
@@ -389,7 +379,7 @@ are swept when a worker process first spools.
 An ambiguous pattern can backtrack catastrophically, so the matcher runs on a
 **per-partition step budget** and returns a clean error rather than running forever.
 It never panics or aborts: property tests drive arbitrary patterns over arbitrary
-row tables, including partitions of 12,000–20,000 rows.
+row tables.
 
 The budget **scales with the partition** (128 steps per row, floor 5,000,000),
 because a constant is the wrong shape — catastrophic backtracking is super-linear in
@@ -398,13 +388,10 @@ and let an ordinary linear match finish on a large one. Pin it with
 `step_budget := <n>` for a hard ceiling.
 
 **A long match is linear, not quadratic.** The cost of a row does not depend on how
-long the match containing it is — which was not true until recently. Resolving a
-qualified reference (`A.price`, i.e. `LAST(A.price)`), walking a running aggregate, and
-`FIRST`/`LAST` navigation were each linear in the match, so a match of *L* rows cost
-O(L²): a `DEFINE B: price >= A.price` at L=32,000 cost 60 µs **per row**, and a
-million-row match extrapolated to about half an hour. Each is now a lookup or an
-extended fold, and the same shape costs 85 ns/row — the same as reading a plain
-column. See [docs/perf-baseline.md](docs/perf-baseline.md).
+long the match containing it is, so a qualified reference (`A.price`), a running
+aggregate and `FIRST`/`LAST` navigation are all as cheap inside a million-row match as
+inside a five-row one. This is worth stating because the obvious implementation of
+each is not: [docs/perf-baseline.md](docs/perf-baseline.md) has the measurements.
 
 Backtracking uses an explicit heap stack rather than host recursion, so one match
 may span millions of rows: an `A B*` sessionization whose partition is a single long

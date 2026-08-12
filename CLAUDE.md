@@ -123,6 +123,18 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
    measure ASTs (`mr-core::types::infer`), with an explicit `{"as","expr","type"}`
    override escape hatch for anything inference can't decide.
 
+**Do not "just embed a DuckDB"** in the worker to buffer and sort. It was considered and
+rejected: bundled libduckdb is ~47 MB against a 15 MB worker; it cannot compile for wasm,
+so it would have to be a cargo feature, and then the function's maximum input size would
+differ by build — a SQL surface that changes shape depending on how it was compiled. It
+also puts an engine inside an engine (init per `ATTACH`, two buffer pools, two versions to
+keep in step) and silently trades our sorting semantics for whichever ones that version
+has. Sorting is exactly where this project's bugs have been (an i64 overflow that reversed
+`ORDER BY` past 2262, NULL placement flipped by `DESC`, an intransitive comparator on
+NaN), all caught by `mr-worker/tests/sort_agreement.rs` pinning two comparators together —
+a moving reference is harder to pin, not easier. And it would not lift the memory ceiling
+by itself, since the relation still has to be read back to match it.
+
 ## Conventions / gotchas
 
 - All algorithms live in `mr-core` with unit + property tests; the worker is a
