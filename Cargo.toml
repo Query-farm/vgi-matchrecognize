@@ -40,6 +40,9 @@ lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
 # it. Not arrow's `ipc_compression` feature: that also enables arrow-ipc/zstd, and the
 # spool compresses whole records itself rather than per buffer.
 arrow-ipc = { version = "59", default-features = false }
+# Mapping spool files so an uncompressed record's arrays borrow the mapping instead of a
+# heap copy — see `spool::RecordCursor`.
+memmap2 = "0.9"
 arrow-array = "59"
 arrow-buffer = "59"
 arrow-data = "59"

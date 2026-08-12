@@ -31,6 +31,7 @@ log = "0.4"
 # --- Native ---------------------------------------------------------------
 # The SDK's real default features — the native binary serves over stdio/HTTP.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+memmap2.workspace = true
 vgi = { workspace = true, features = ["sqlite", "transport-http"] }
 vgi-rpc = { workspace = true, features = ["http"] }
 env_logger = "0.11"

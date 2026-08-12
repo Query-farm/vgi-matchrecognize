@@ -48,6 +48,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use arrow_array::RecordBatch;
@@ -163,6 +164,18 @@ struct Encoded {
     codec: u8,
     raw_len: u32,
     payload: Vec<u8>,
+}
+
+/// Serialise one batch without compressing it, whatever the environment says.
+fn encode_uncompressed(batch: &RecordBatch) -> Result<Encoded> {
+    let ipc_bytes = ipc::write_batch(batch)?;
+    let raw_len = u32::try_from(ipc_bytes.len())
+        .map_err(|_| re("match_recognize: buffered batch exceeds 4 GiB"))?;
+    Ok(Encoded {
+        codec: CODEC_NONE,
+        raw_len,
+        payload: ipc_bytes,
+    })
 }
 
 /// Serialise one batch, and say how.
@@ -471,10 +484,16 @@ impl ShardWriters {
 
     /// Append one batch to a shard, in the same framing the sink uses.
     pub fn append(&mut self, shard: usize, batch: &RecordBatch, batch_index: i64) -> Result<()> {
-        // A split only happens for an input past the memory budget, which is far past the
-        // size where compression is worth it — so shard records compress from the first
-        // one (unless the environment says otherwise).
-        let enc = encode_batch(batch, u64::MAX)?;
+        // Shard records are deliberately **not** compressed, whatever the sink does.
+        //
+        // A producer holds its whole shard resident, and a mapped uncompressed record lets
+        // the arrays borrow file-backed pages — which the kernel can evict and refault,
+        // where a decompressed copy is anonymous memory that must fit. It is also far
+        // cheaper to read: 0-1 ns/row mapped against 8-10 through a decompression pass.
+        //
+        // The sink spool still compresses, and that is where it pays: those bytes are
+        // written once and read once, sequentially, by the split.
+        let enc = encode_uncompressed(batch)?;
         let capacity = self.buffer_capacity;
         let dir = self.dir.clone();
         let slot = self
@@ -551,6 +570,23 @@ struct Head {
     codec: u8,
 }
 
+/// Where a cursor's bytes come from.
+enum Source {
+    /// The file, mapped. An uncompressed record's arrays then point *into* the mapping:
+    /// no read into a heap buffer and no zeroing one first, and the pages stay
+    /// file-backed, so a producer holding a whole shard can be paged out rather than
+    /// having to fit in anonymous memory.
+    ///
+    /// Sound because a spool file is only ever mapped once it is complete — the split maps
+    /// sink files in `combine`, after every sink has finished, and shard files are closed
+    /// before any producer opens them — and because nothing ever truncates one. Unlinking
+    /// a mapped file is fine: the inode outlives the mapping.
+    #[cfg(not(target_arch = "wasm32"))]
+    Mapped { map: Arc<memmap2::Mmap>, at: usize },
+    /// Read through a buffer instead, when the file cannot be mapped.
+    Streamed(BufReader<File>),
+}
+
 /// A lazy reader over one spool file's records, in the order they were written.
 ///
 /// Keeps the *next* header in hand so its batch index can be inspected without decoding
@@ -558,7 +594,7 @@ struct Head {
 /// order ([`crate::shard::split`]) while holding only one payload at a time.
 pub struct RecordCursor {
     path: PathBuf,
-    reader: BufReader<File>,
+    source: Source,
     head: Option<Head>,
 }
 
@@ -571,9 +607,10 @@ impl RecordCursor {
                 path.display()
             ))
         })?;
+        let source = map_file(&file).unwrap_or_else(|| Source::Streamed(BufReader::new(file)));
         let mut cursor = RecordCursor {
             path,
-            reader: BufReader::new(file),
+            source,
             head: None,
         };
         cursor.read_head()?;
@@ -582,18 +619,35 @@ impl RecordCursor {
 
     fn read_head(&mut self) -> Result<()> {
         let mut header = [0u8; HEADER];
-        match self.reader.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                self.head = None;
-                return Ok(());
+        let got = match &mut self.source {
+            #[cfg(not(target_arch = "wasm32"))]
+            Source::Mapped { map, at } => {
+                if *at >= map.len() {
+                    false
+                } else if *at + HEADER > map.len() {
+                    return Err(re(format!(
+                        "match_recognize: truncated record header in {}",
+                        self.path.display()
+                    )));
+                } else {
+                    header.copy_from_slice(&map[*at..*at + HEADER]);
+                    true
+                }
             }
-            Err(e) => {
-                return Err(re(format!(
-                    "match_recognize: truncated record header in {}: {e}",
-                    self.path.display()
-                )))
-            }
+            Source::Streamed(reader) => match reader.read_exact(&mut header) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
+                Err(e) => {
+                    return Err(re(format!(
+                        "match_recognize: truncated record header in {}: {e}",
+                        self.path.display()
+                    )))
+                }
+            },
+        };
+        if !got {
+            self.head = None;
+            return Ok(());
         }
         self.head = Some(Head {
             index: i64::from_le_bytes(header[0..8].try_into().expect("8 bytes")),
@@ -618,31 +672,76 @@ impl RecordCursor {
         let Some(head) = self.head else {
             return Ok(None);
         };
-        // Aligned, so the decoded arrays can borrow it.
-        let mut payload = MutableBuffer::from_len_zeroed(head.stored_len);
-        self.reader
-            .read_exact(payload.as_slice_mut())
-            .map_err(|e| {
-                re(format!(
-                    "match_recognize: truncated payload of {} bytes in {}: {e}",
-                    head.stored_len,
-                    self.path.display()
-                ))
-            })?;
-        // Records are padded to a multiple of 64; step over the tail.
-        let padding = (aligned(HEADER + head.stored_len) - HEADER - head.stored_len) as i64;
-        if padding > 0 {
-            self.reader.seek_relative(padding).map_err(|e| {
-                re(format!(
-                    "match_recognize: truncated record padding in {}: {e}",
-                    self.path.display()
-                ))
-            })?;
-        }
-        let batch = decode_payload(head.codec, head.raw_len, payload.into())?;
+        let payload: Buffer = match &mut self.source {
+            #[cfg(not(target_arch = "wasm32"))]
+            Source::Mapped { map, at } => {
+                let start = *at + HEADER;
+                let end = start + head.stored_len;
+                if end > map.len() {
+                    return Err(re(format!(
+                        "match_recognize: truncated payload of {} bytes in {}",
+                        head.stored_len,
+                        self.path.display()
+                    )));
+                }
+                *at += aligned(HEADER + head.stored_len);
+                // Borrow the mapping rather than copying out of it. Alignment holds by
+                // construction: `start` is a multiple of 64, since records are padded to 64
+                // and the header is exactly 64, and an mmap base is page-aligned.
+                let ptr = std::ptr::NonNull::new(unsafe { map.as_ptr().add(start) as *mut u8 })
+                    .expect("a mapping pointer is never null");
+                let owner: Arc<dyn arrow_buffer::alloc::Allocation> =
+                    Arc::clone(map) as Arc<dyn arrow_buffer::alloc::Allocation>;
+                // SAFETY: ptr points at `head.stored_len` readable bytes inside a mapping
+                // that lives as long as `owner`, which the buffer keeps. The file is
+                // complete and never truncated — see `Source::Mapped`.
+                unsafe { Buffer::from_custom_allocation(ptr, head.stored_len, owner) }
+            }
+            Source::Streamed(reader) => {
+                // Aligned, so the decoded arrays can borrow it.
+                let mut payload = MutableBuffer::from_len_zeroed(head.stored_len);
+                reader.read_exact(payload.as_slice_mut()).map_err(|e| {
+                    re(format!(
+                        "match_recognize: truncated payload of {} bytes in {}: {e}",
+                        head.stored_len,
+                        self.path.display()
+                    ))
+                })?;
+                // Records are padded to a multiple of 64; step over the tail.
+                let padding = (aligned(HEADER + head.stored_len) - HEADER - head.stored_len) as i64;
+                if padding > 0 {
+                    reader.seek_relative(padding).map_err(|e| {
+                        re(format!(
+                            "match_recognize: truncated record padding in {}: {e}",
+                            self.path.display()
+                        ))
+                    })?;
+                }
+                payload.into()
+            }
+        };
+        let batch = decode_payload(head.codec, head.raw_len, payload)?;
         self.read_head()?;
         Ok(Some((head.index, batch)))
     }
+}
+
+/// Map a spool file, or `None` if it cannot be mapped (including on wasm, where there is
+/// no spool at all).
+#[cfg(not(target_arch = "wasm32"))]
+fn map_file(file: &File) -> Option<Source> {
+    // SAFETY: the file is complete and nothing truncates a spool file, so the mapping
+    // cannot be invalidated under us. See `Source::Mapped`.
+    let map = unsafe { memmap2::Mmap::map(file) }.ok()?;
+    Some(Source::Mapped {
+        map: Arc::new(map),
+        at: 0,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn map_file(_file: &File) -> Option<Source> {
+    None
 }
 
 /// A cursor per sink file of an execution, ready to be merged.

@@ -72,6 +72,12 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     `MutableBuffer` and the arrays borrow it. That took read+decode from 16 to **5
     ns/row**. `raw_len` is what the shard count divides by the memory budget; file sizes
     stopped predicting the producer's peak the moment anything was compressed.
+    Files are **mmap'd** and an uncompressed record's arrays borrow the mapping — reading
+    is then pointer arithmetic (1-3 ns/row, and 0-1 for shard files) and the resident set
+    is file-backed, so a producer holding a whole shard can be paged rather than having to
+    fit in anonymous memory. Which is why **shard records are never compressed** even when
+    sink records are: borrowing beats a decompression pass into heap. Mapping is sound only
+    because a spool file is complete before it is mapped and is never truncated.
   - `shard.rs` — splits the spool by partition key when it exceeds the finalize memory
     budget, so peak memory tracks a shard rather than the relation. It **merges the sink
     files in global batch-index order**, which is not optional: sink files carry strided

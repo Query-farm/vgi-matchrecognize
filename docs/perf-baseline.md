@@ -260,12 +260,23 @@ Per-row costs over the 10M-row probe, before and after the four format changes
 (64-byte-aligned records, streaming zero-copy reader, uncompressed accounting, coalesced
 shard records):
 
-| | before | after |
-|---|---|---|
-| read + decode | 16 | **5–10** ns/row |
-| read shards back | 16 | **8–10** ns/row |
-| shard records written (10 shards) | 48,830 | **964** |
-| shard bytes vs input | 1.1x | **~1.0x** |
+| | before | aligned + streamed | + mmap |
+|---|---|---|---|
+| read + decode | 16 | 5–10 | **1–3** ns/row |
+| read shards back | 16 | 8–10 | **0–1** ns/row |
+| shard records written (10 shards) | 48,830 | **964** | 964 |
+| shard bytes vs input | 1.1x | **~1.0x** | ~1.0x |
+
+Reading became pointer arithmetic: the payload is 64-byte aligned inside a mapping, so the
+arrays borrow it instead of being copied out of a heap buffer that was zeroed first.
+
+**End to end at 100M rows this shows nothing** — 42 s against a 30–49 s spread on the same
+query before it, with the whole spool in page cache either way. The gains that matter here
+are structural rather than visible at this size: the resident set is now file-backed and
+evictable, 50x fewer records means the top of the shard range is usable at all, and the
+memory budget binds again. Note also that peak RSS *rose* (0.7 → 1.0 GB) precisely because
+mapped pages count as resident — RSS stopped being a clean proxy for memory pressure once
+the arrays borrow a file.
 
 The record-count collapse is the one that matters at scale. The split used to write each
 input batch's slice straight out, so with `s` shards its records held `2048 / s` rows — two
