@@ -669,11 +669,17 @@ impl Parser {
                 ))
             }
         };
-        let (months, days, nanos): (i32, i32, i64) = match unit.trim_end_matches('S') {
-            "YEAR" => ((n * 12) as i32, 0, 0),
-            "MONTH" => (n as i32, 0, 0),
-            "WEEK" => (0, (n * 7) as i32, 0),
-            "DAY" => (0, n as i32, 0),
+        // Scale in i128 and narrow once. The lexer has already checked that `n`
+        // fits i64, but the *scaled* value need not: `INTERVAL 9223372036854775807
+        // HOUR` multiplied by 3.6e12 overflowed, and `(n * 12) as i32` for YEAR
+        // truncated a large count into a small wrong one — a panic under
+        // `cargo test`, a silently wrong interval in release.
+        let n = n as i128;
+        let (months, days, nanos): (i128, i128, i128) = match unit.trim_end_matches('S') {
+            "YEAR" => (n * 12, 0, 0),
+            "MONTH" => (n, 0, 0),
+            "WEEK" => (0, n * 7, 0),
+            "DAY" => (0, n, 0),
             "HOUR" => (0, 0, n * 3_600_000_000_000),
             "MINUTE" => (0, 0, n * 60_000_000_000),
             "SECOND" => (0, 0, n * 1_000_000_000),
@@ -683,10 +689,11 @@ impl Parser {
                 return Err(self.err_at(unit_at, format!("unsupported INTERVAL unit '{other}'")))
             }
         };
+        let out_of_range = || self.err_at(count_at, format!("INTERVAL {n} {unit} is out of range"));
         Ok(Expr::Interval {
-            months,
-            days,
-            nanos,
+            months: i32::try_from(months).map_err(|_| out_of_range())?,
+            days: i32::try_from(days).map_err(|_| out_of_range())?,
+            nanos: i64::try_from(nanos).map_err(|_| out_of_range())?,
         })
     }
 

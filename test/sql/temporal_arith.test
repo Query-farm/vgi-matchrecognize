@@ -1,0 +1,71 @@
+# name: test/sql/temporal_arith.test
+# description: Timestamp differences and interval shifts stay exact past 2262.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# The release-profile case. Rescaling microsecond ticks to nanoseconds overflows
+# i64 past ~2262, and nothing sets overflow-checks for the shipped binary — so
+# this returned a *negative* interval, with no error anywhere.
+query T
+SELECT span::VARCHAR FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, TIMESTAMP '1970-01-01 00:00:00'),
+                              (2, TIMESTAMP '9999-12-31 00:00:00')) AS t(id, ts)),
+       order_by := ['id'], pattern := 'A+', define := '{}',
+       measures := '{"span":"LAST(ts) - FIRST(ts)"}');
+----
+2932896 days
+
+# A difference that already fitted keeps exactly the value it had before.
+query T
+SELECT span::VARCHAR FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, TIMESTAMP '2024-01-01 00:00:00'),
+                              (2, TIMESTAMP '2024-01-01 00:00:01')) AS t(id, ts)),
+       order_by := ['id'], pattern := 'A+', define := '{}',
+       measures := '{"span":"LAST(ts) - FIRST(ts)"}');
+----
+00:00:01
+
+# months * 30 * 86_400e9 overflowed i64 past ~113 months, so even a ten-year
+# shift was in range of the bug. The result reflects this engine's documented
+# calendar approximation — a month is 30 days — so 10 YEAR is 3600 days, not ten
+# calendar years.
+query T
+SELECT shifted::VARCHAR FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, TIMESTAMP '2000-01-01 00:00:00')) AS t(id, ts)),
+       order_by := ['id'], pattern := 'A', define := '{}',
+       measures := '{"shifted":"LAST(ts) + INTERVAL 10 YEAR"}');
+----
+2009-11-09 00:00:00
+
+# DATE - DATE is typed INTERVAL at bind but had no evaluation arm at all, so it
+# always failed at produce time with "non-numeric operand Date(..)".
+query T
+SELECT span::VARCHAR FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, DATE '2024-01-01'), (2, DATE '2024-01-31')) AS t(id, d)),
+       order_by := ['id'], pattern := 'A+', define := '{}',
+       measures := '{"span":"LAST(d) - FIRST(d)"}');
+----
+30 days
+
+# The same hole for TIME.
+query T
+SELECT span::VARCHAR FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, TIME '01:00:00'), (2, TIME '01:00:05')) AS t(id, tm)),
+       order_by := ['id'], pattern := 'A+', define := '{}',
+       measures := '{"span":"LAST(tm) - FIRST(tm)"}');
+----
+00:00:05
+
+# An INTERVAL literal whose scaled value overflows is a bind error, not a
+# wrapped constant.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, TIMESTAMP '2024-01-01 00:00:00')) AS t(id, ts)),
+       order_by := ['id'], pattern := 'A', define := '{}',
+       measures := '{"x":"LAST(ts) + INTERVAL 9223372036854775807 HOUR"}');
+----
+out of range

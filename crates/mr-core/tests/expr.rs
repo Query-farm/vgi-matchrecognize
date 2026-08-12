@@ -296,3 +296,48 @@ fn running_final_still_binds_tightly() {
         other => panic!("got {other:?}"),
     }
 }
+
+// --- INTERVAL literal ranges -----------------------------------------------
+
+/// The lexer checks that the digits fit i64, but the *scaled* value need not:
+/// `n * 3_600_000_000_000` for HOUR overflowed, which panicked under `cargo
+/// test` and wrapped silently in release.
+#[test]
+fn interval_literal_out_of_range_is_a_parse_error() {
+    for src in [
+        "INTERVAL 9223372036854775807 HOUR",
+        "INTERVAL 9223372036854775807 MINUTE",
+        "INTERVAL 9223372036854775807 SECOND",
+    ] {
+        let err = parse(src).unwrap_err().to_string();
+        assert!(
+            err.contains("out of range"),
+            "{src} should be out of range, got: {err}"
+        );
+    }
+}
+
+/// `(n * 12) as i32` truncated a large YEAR count into a small wrong one rather
+/// than reporting anything.
+#[test]
+fn interval_year_count_does_not_truncate() {
+    let err = parse("INTERVAL 200000000 YEAR").unwrap_err().to_string();
+    assert!(err.contains("out of range"), "got: {err}");
+    // The ordinary case is unchanged.
+    assert!(matches!(
+        e("INTERVAL 1 YEAR"),
+        Expr::Interval {
+            months: 12,
+            days: 0,
+            nanos: 0
+        }
+    ));
+    assert!(matches!(
+        e("INTERVAL 2 WEEK"),
+        Expr::Interval {
+            months: 0,
+            days: 14,
+            nanos: 0
+        }
+    ));
+}

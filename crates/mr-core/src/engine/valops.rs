@@ -38,7 +38,7 @@ fn unit_nanos(unit: TimeUnit) -> i64 {
 ///   *sort* comparator had already been fixed to compare integers exactly, so
 ///   `ORDER BY` and a DEFINE predicate disagreed about whether two rows were
 ///   equal. [`cmp_ints`] is now shared by both, and `tests/compare.rs`
-///   (`comparators_agree`) pins them together.
+///   (`comparators_agree_exactly`) pins them together.
 /// - **NaN.** `partial_cmp(...).or(Some(Equal))` reported NaN as *equal to
 ///   everything*, so `NaN = 1.0` was TRUE and `NaN <> 1.0` was FALSE.
 pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
@@ -216,9 +216,11 @@ fn arith(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
     if l.is_null() || r.is_null() {
         return Ok(Value::Null);
     }
-    // Temporal arithmetic.
+    // Temporal arithmetic. `None` means "not a temporal combination" and falls
+    // through to the numeric paths; `Some(Err(_))` means it *was* one and went
+    // out of range, which must not be confused with the former.
     if let Some(v) = temporal_arith(op, l, r) {
-        return Ok(v);
+        return v;
     }
     // Pure integer arithmetic stays integral.
     if let (Some(x), Some(y)) = (l.as_i128(), r.as_i128()) {
@@ -276,44 +278,120 @@ fn arith(op: BinOp, l: &Value, r: &Value) -> Result<Value> {
     Ok(Value::Double(out))
 }
 
-fn temporal_arith(op: BinOp, l: &Value, r: &Value) -> Option<Value> {
+/// Nanoseconds in one day — the exact conversion every consumer of
+/// [`Interval::days`] uses, which is what makes spilling days lossless below.
+const NS_PER_DAY: i128 = 86_400 * 1_000_000_000;
+
+/// Temporal arithmetic, or `None` when the operands are not a temporal
+/// combination (the caller then falls through to the numeric paths).
+///
+/// **Everything here computes in i128.** Rescaling i64 ticks to nanoseconds
+/// overflows well inside the representable timestamp range: i64 nanoseconds run
+/// out around 2262, so `TIMESTAMP '9999-12-31'` in microseconds is 2.5e20
+/// against a ceiling of 9.2e18. That was a panic under `cargo test` and a
+/// silently wrapped — negative — interval in release, where nothing sets
+/// `overflow-checks`. `compare` documents the same trap for ordering; this is
+/// the arithmetic half of it.
+///
+/// Genuine out-of-range is an error rather than a saturating value, matching
+/// `arith`'s "integer arithmetic overflow": saturating would only trade a wrap
+/// for a different wrong number.
+fn temporal_arith(op: BinOp, l: &Value, r: &Value) -> Option<Result<Value>> {
     match (op, l, r) {
         (BinOp::Add, Value::Timestamp(t, u), Value::Interval(i))
-        | (BinOp::Add, Value::Interval(i), Value::Timestamp(t, u)) => {
-            Some(Value::Timestamp(t + interval_in_unit(i, *u), *u))
-        }
-        (BinOp::Sub, Value::Timestamp(t, u), Value::Interval(i)) => {
-            Some(Value::Timestamp(t - interval_in_unit(i, *u), *u))
-        }
+        | (BinOp::Add, Value::Interval(i), Value::Timestamp(t, u)) => Some(ts_shift(*t, *u, i, 1)),
+        (BinOp::Sub, Value::Timestamp(t, u), Value::Interval(i)) => Some(ts_shift(*t, *u, i, -1)),
         (BinOp::Add, Value::Date(d), Value::Interval(i))
-        | (BinOp::Add, Value::Interval(i), Value::Date(d)) => {
-            Some(Value::Date(d + interval_in_days(i)))
-        }
-        (BinOp::Sub, Value::Date(d), Value::Interval(i)) => {
-            Some(Value::Date(d - interval_in_days(i)))
-        }
+        | (BinOp::Add, Value::Interval(i), Value::Date(d)) => Some(date_shift(*d, i, 1)),
+        (BinOp::Sub, Value::Date(d), Value::Interval(i)) => Some(date_shift(*d, i, -1)),
         (BinOp::Sub, Value::Timestamp(a, ua), Value::Timestamp(b, ub)) => {
-            let nanos = a * unit_nanos(*ua) - b * unit_nanos(*ub);
-            Some(Value::Interval(Interval {
+            Some(ts_diff(*a, *ua, *b, *ub))
+        }
+        // `DATE - DATE` and `TIME - TIME` are typed as INTERVAL by `infer`, so
+        // without these arms they bound cleanly and then died at produce time
+        // with "non-numeric operand Date(19723)" — a bind-time-valid expression
+        // that could never evaluate.
+        (BinOp::Sub, Value::Date(a), Value::Date(b)) => Some(Ok(Value::Interval(Interval {
+            months: 0,
+            days: (*a as i64 - *b as i64) as i32,
+            nanos: 0,
+        }))),
+        (BinOp::Sub, Value::Time(a, ua), Value::Time(b, ub)) => {
+            let nanos = *a as i128 * unit_nanos(*ua) as i128 - *b as i128 * unit_nanos(*ub) as i128;
+            // A time of day is under 24h, so the difference always fits i64.
+            Some(Ok(Value::Interval(Interval {
                 months: 0,
                 days: 0,
-                nanos,
-            }))
+                nanos: nanos as i64,
+            })))
         }
         _ => None,
     }
 }
 
-fn interval_in_unit(i: &Interval, unit: TimeUnit) -> i64 {
-    // Calendar parts approximated (month = 30 days); exact only for time parts.
-    let total_nanos = (i.months as i64) * 30 * 86_400 * 1_000_000_000
-        + (i.days as i64) * 86_400 * 1_000_000_000
-        + i.nanos;
-    total_nanos / unit_nanos(unit)
+/// `t ± interval`, in the timestamp's own unit.
+fn ts_shift(t: i64, u: TimeUnit, i: &Interval, sign: i128) -> Result<Value> {
+    let out = t as i128 + sign * interval_in_unit(i, u);
+    i64::try_from(out)
+        .map(|v| Value::Timestamp(v, u))
+        .map_err(|_| MrError::Eval("TIMESTAMP arithmetic is out of range".into()))
 }
 
-fn interval_in_days(i: &Interval) -> i32 {
-    i.months * 30 + i.days + (i.nanos / (86_400 * 1_000_000_000)) as i32
+/// `date ± interval`, in whole days.
+fn date_shift(d: i32, i: &Interval, sign: i128) -> Result<Value> {
+    let out = d as i128 + sign * interval_in_days(i);
+    i32::try_from(out)
+        .map(Value::Date)
+        .map_err(|_| MrError::Eval("DATE arithmetic is out of range".into()))
+}
+
+/// The interval between two timestamps, whatever their units.
+///
+/// A nanosecond count cannot span the timestamp range: i64 nanoseconds cover
+/// ~292 years and timestamps cover ~11,000. So a difference too large for
+/// `nanos` carries its whole days in `days` instead, which is **lossless** —
+/// every consumer (`interval_nanos`, `interval_in_unit`, `interval_in_days`)
+/// treats a day as exactly [`NS_PER_DAY`]. A difference that already fits keeps
+/// the exact shape it has always had, so only the inputs that used to panic or
+/// wrap change at all.
+fn ts_diff(a: i64, ua: TimeUnit, b: i64, ub: TimeUnit) -> Result<Value> {
+    let nanos = a as i128 * unit_nanos(ua) as i128 - b as i128 * unit_nanos(ub) as i128;
+    if let Ok(n) = i64::try_from(nanos) {
+        return Ok(Value::Interval(Interval {
+            months: 0,
+            days: 0,
+            nanos: n,
+        }));
+    }
+    // `%` keeps the dividend's sign and is under a day in magnitude, so both
+    // halves carry the same sign and the i64 cast cannot lose anything.
+    let days = i32::try_from(nanos / NS_PER_DAY).map_err(|_| {
+        MrError::Eval("timestamp difference is out of range for an INTERVAL".into())
+    })?;
+    Ok(Value::Interval(Interval {
+        months: 0,
+        days,
+        nanos: (nanos % NS_PER_DAY) as i64,
+    }))
+}
+
+/// An interval as a tick count in `unit`.
+///
+/// i128 throughout: `months * 30 * 86_400e9` overflows i64 past ~113 months, so
+/// `ts + INTERVAL 10 YEAR` was already in range of the bug. `i32::MAX` months is
+/// ~5.6e24 ns, comfortably inside i128, so this cannot itself fail — the range
+/// check belongs at the use site, where the result meets a real timestamp.
+fn interval_in_unit(i: &Interval, unit: TimeUnit) -> i128 {
+    // Calendar parts approximated (month = 30 days); exact only for time parts.
+    let total_nanos =
+        (i.months as i128) * 30 * NS_PER_DAY + (i.days as i128) * NS_PER_DAY + i.nanos as i128;
+    total_nanos / unit_nanos(unit) as i128
+}
+
+/// An interval as a whole number of days. i128 for the same reason as above:
+/// `i.months * 30` was i32 arithmetic and wrapped past ~71.6M months.
+fn interval_in_days(i: &Interval) -> i128 {
+    (i.months as i128) * 30 + i.days as i128 + i.nanos as i128 / NS_PER_DAY
 }
 
 /// Negate a numeric value (3-valued).
