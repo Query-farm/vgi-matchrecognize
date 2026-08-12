@@ -1,0 +1,57 @@
+# name: test/sql/not_precedence.test
+# description: Prefix NOT binds looser than comparison — NOT x IS NULL is not x IS NULL.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# `NOT flag IS NULL` means `NOT (flag IS NULL)`: it selects the row whose flag is
+# present. Parsing NOT at the unary level made it `(NOT flag) IS NULL`, which is
+# true exactly when flag IS NULL (because NOT NULL is NULL) — so this returned
+# id 2, the inverse of what was asked for.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, true), (2, NULL)) AS t(id, flag)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"NOT flag IS NULL"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+1
+
+# The complement, so the pair cannot both pass by being symmetric.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, true), (2, NULL)) AS t(id, flag)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"flag IS NULL"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+2
+
+# `NOT v > 10` is `NOT (v > 10)`. Under the old precedence this parsed as
+# `(NOT v) > 10`, and since DEFINE became type-checked at bind that is a hard
+# bind error rather than a wrong answer — valid SQL the function refused.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 5), (2, 20)) AS t(id, v)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"NOT v > 10"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+1
+
+# NOT stops at AND: this is `(NOT flag) AND v > 0`, never `NOT (flag AND v > 0)`.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 5, false), (2, 5, true), (3, 0, false)) AS t(id, v, flag)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"NOT flag AND v > 0"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+1

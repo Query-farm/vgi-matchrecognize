@@ -190,3 +190,109 @@ fn malformed_expr_errors() {
     assert!(parse("(a").is_err());
     assert!(parse("A.").is_err());
 }
+
+// --- prefix NOT precedence -------------------------------------------------
+//
+// SQL orders these OR < AND < NOT < comparison, so `NOT` swallows the whole
+// comparison to its right but stops at AND/OR. Parsing it at the unary level
+// instead inverted `NOT x IS NULL` into `x IS NULL`.
+
+#[test]
+fn not_is_looser_than_comparison() {
+    // NOT a = b  ==  NOT (a = b), not (NOT a) = b.
+    match e("NOT a = b") {
+        Expr::Not(inner) => assert!(matches!(*inner, Expr::Binary { op: BinOp::Eq, .. })),
+        other => panic!("got {other:?}"),
+    }
+    match e("NOT p > 10") {
+        Expr::Not(inner) => assert!(matches!(*inner, Expr::Binary { op: BinOp::Gt, .. })),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn not_is_looser_than_is_null() {
+    // The shape that inverted the end-to-end answer: `Not(IsNull(a))`, never
+    // `IsNull(Not(a))`.
+    match e("NOT a IS NULL") {
+        Expr::Not(inner) => assert!(matches!(*inner, Expr::IsNull { negated: false, .. })),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn not_is_tighter_than_and_and_or() {
+    // NOT a AND b  ==  (NOT a) AND b.
+    match e("NOT a AND b") {
+        Expr::Binary {
+            op: BinOp::And,
+            lhs,
+            rhs,
+        } => {
+            assert!(matches!(*lhs, Expr::Not(_)));
+            assert_eq!(*rhs, Expr::Col("b".into()));
+        }
+        other => panic!("got {other:?}"),
+    }
+    match e("NOT a OR b") {
+        Expr::Binary {
+            op: BinOp::Or, lhs, ..
+        } => assert!(matches!(*lhs, Expr::Not(_))),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn not_over_between_and_in() {
+    // Prefix NOT absorbs a comparison-level operator, giving the un-negated
+    // node wrapped in `Not` — semantically the same as the infix `negated: true`
+    // form that `between_in_isnull` pins.
+    match e("NOT x BETWEEN 1 AND 10") {
+        Expr::Not(inner) => assert!(matches!(*inner, Expr::Between { negated: false, .. })),
+        other => panic!("got {other:?}"),
+    }
+    match e("NOT x IN (1, 2)") {
+        Expr::Not(inner) => assert!(matches!(*inner, Expr::In { negated: false, .. })),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn double_negation() {
+    match e("NOT NOT a") {
+        Expr::Not(inner) => assert!(matches!(*inner, Expr::Not(_))),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn unary_minus_still_binds_tighter_than_mul() {
+    // Renumbering the ladder for BP_NOT must not move unary minus.
+    match e("-a * b") {
+        Expr::Binary {
+            op: BinOp::Mul,
+            lhs,
+            ..
+        } => assert!(matches!(*lhs, Expr::Neg(_))),
+        other => panic!("got {other:?}"),
+    }
+    match e("-a + b") {
+        Expr::Binary {
+            op: BinOp::Add,
+            lhs,
+            ..
+        } => assert!(matches!(*lhs, Expr::Neg(_))),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn running_final_still_binds_tightly() {
+    // FINAL LAST(x) > 3  ==  (FINAL LAST(x)) > 3.
+    match e("FINAL LAST(x) > 3") {
+        Expr::Binary {
+            op: BinOp::Gt, lhs, ..
+        } => assert!(matches!(*lhs, Expr::RunningFinal { final_: true, .. })),
+        other => panic!("got {other:?}"),
+    }
+}

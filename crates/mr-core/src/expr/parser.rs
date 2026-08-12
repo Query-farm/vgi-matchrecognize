@@ -8,13 +8,25 @@ use crate::error::{MrError, Result};
 use crate::types::{TimeUnit, Ty};
 
 // Binding powers (higher = tighter).
+//
+// The ladder must stay **contiguous**: `parse_infix` resumes a right operand with
+// `parse_expr(lbp + 1)` to get left associativity, which only names the next
+// tighter rung if there are no gaps.
 const BP_OR: u8 = 1;
 const BP_AND: u8 = 2;
-const BP_CMP: u8 = 3;
-const BP_CONCAT: u8 = 4;
-const BP_ADD: u8 = 5;
-const BP_MUL: u8 = 6;
-const BP_UNARY: u8 = 7;
+/// Prefix `NOT`, which binds *looser* than comparison: SQL reads `NOT a = b` as
+/// `NOT (a = b)` and `NOT a AND b` as `(NOT a) AND b`. Parsing it at `BP_UNARY`
+/// instead — as this did — silently inverted `NOT x IS NULL` into `x IS NULL`,
+/// because `Not(NULL)` is NULL and so `IS NULL` was true exactly when `x` was.
+///
+/// Never returned by `infix_bp`: this is the prefix form only (`parse_ident`).
+/// `NOT BETWEEN` / `NOT IN` are comparison-level operators and keep `BP_CMP`.
+const BP_NOT: u8 = 3;
+const BP_CMP: u8 = 4;
+const BP_CONCAT: u8 = 5;
+const BP_ADD: u8 = 6;
+const BP_MUL: u8 = 7;
+const BP_UNARY: u8 = 8;
 
 /// Maximum expression nesting depth. `parse_expr` recurses through parenthesized
 /// sub-expressions and call arguments, so deeply nested input would otherwise
@@ -358,7 +370,9 @@ impl Parser {
             }
             "NOT" => {
                 self.next();
-                let e = self.parse_expr(BP_UNARY)?;
+                // `BP_NOT`, not `BP_UNARY`: prefix NOT swallows the whole
+                // comparison after it. See the constant.
+                let e = self.parse_expr(BP_NOT)?;
                 Ok(Expr::Not(Box::new(e)))
             }
             "INTERVAL" => {
