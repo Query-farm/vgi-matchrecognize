@@ -4,13 +4,13 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
     IntervalMonthDayNanoArray, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow_buffer::IntervalMonthDayNano;
-use arrow_schema::SchemaRef;
+use arrow_buffer::{IntervalMonthDayNano, OffsetBuffer};
+use arrow_schema::{Field, SchemaRef};
 use mr_core::plan::OutputColumn;
 use mr_core::types::{TimeUnit, Ty};
 use mr_core::value::Value;
@@ -29,12 +29,12 @@ pub fn build_batch(
 ) -> Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for (j, col) in columns.iter().enumerate() {
-        arrays.push(build_column(col.ty, rows, j)?);
+        arrays.push(build_column(&col.ty, rows, j)?);
     }
     RecordBatch::try_new(schema, arrays).map_err(re)
 }
 
-fn build_column(ty: Ty, rows: &[Vec<Value>], j: usize) -> Result<ArrayRef> {
+fn build_column(ty: &Ty, rows: &[Vec<Value>], j: usize) -> Result<ArrayRef> {
     Ok(match ty {
         Ty::Boolean => Arc::new(
             rows.iter()
@@ -56,10 +56,10 @@ fn build_column(ty: Ty, rows: &[Vec<Value>], j: usize) -> Result<ArrayRef> {
         }
         Ty::Double => Arc::new(rows.iter().map(|r| r[j].as_f64()).collect::<Float64Array>()),
         Ty::Decimal(p, s) => {
-            let v: Vec<Option<i128>> = rows.iter().map(|r| to_decimal(&r[j], s)).collect();
+            let v: Vec<Option<i128>> = rows.iter().map(|r| to_decimal(&r[j], *s)).collect();
             Arc::new(
                 Decimal128Array::from(v)
-                    .with_precision_and_scale(p, s)
+                    .with_precision_and_scale(*p, *s)
                     .map_err(re)?,
             )
         }
@@ -80,8 +80,46 @@ fn build_column(ty: Ty, rows: &[Vec<Value>], j: usize) -> Result<ArrayRef> {
                 })
                 .collect::<Date32Array>(),
         ),
-        Ty::Timestamp(u) => build_timestamp(rows, j, u),
-        Ty::Time(u) => build_time(rows, j, u),
+        // A list column: flatten every row's elements into one child array and
+        // record where each row's slice starts. NULL and the empty list are
+        // distinct — an empty match yields an empty list, not NULL.
+        Ty::List(elem) => {
+            let mut flat: Vec<Vec<Value>> = Vec::new();
+            let mut offsets: Vec<i32> = Vec::with_capacity(rows.len() + 1);
+            let mut nulls: Vec<bool> = Vec::with_capacity(rows.len());
+            let mut acc = 0i32;
+            offsets.push(acc);
+            for r in rows {
+                match &r[j] {
+                    Value::List(items) => {
+                        nulls.push(true);
+                        acc += items.len() as i32;
+                        for it in items {
+                            flat.push(vec![it.clone()]);
+                        }
+                    }
+                    Value::Null => nulls.push(false),
+                    other => {
+                        return Err(re(format!("expected a list value, got {other:?}")));
+                    }
+                }
+                offsets.push(acc);
+            }
+            // Reuse the scalar builders for the child array by presenting the
+            // flattened elements as single-column rows.
+            let child = build_column(elem, &flat, 0)?;
+            Arc::new(
+                arrow_array::ListArray::try_new(
+                    Arc::new(Field::new("item", child.data_type().clone(), true)),
+                    OffsetBuffer::new(offsets.into()),
+                    child,
+                    Some(nulls.into()),
+                )
+                .map_err(re)?,
+            )
+        }
+        Ty::Timestamp(u) => build_timestamp(rows, j, *u),
+        Ty::Time(u) => build_time(rows, j, *u),
         Ty::Interval => Arc::new(
             rows.iter()
                 .map(|r| match &r[j] {

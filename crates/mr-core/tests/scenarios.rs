@@ -17,7 +17,7 @@ impl BindSchema for Sch {
         self.cols
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, t)| *t)
+            .map(|(_, t)| t.clone())
     }
     fn is_variable(&self, name: &str) -> bool {
         self.vars.iter().any(|v| v.eq_ignore_ascii_case(name))
@@ -32,7 +32,11 @@ struct Case {
 impl Case {
     fn run(&self, cfg: PlanConfig, vars: &[&str]) -> mr_core::Result<Vec<Vec<Value>>> {
         let sch = Sch {
-            cols: self.cols.iter().map(|(n, t)| (n.to_string(), *t)).collect(),
+            cols: self
+                .cols
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.clone()))
+                .collect(),
             vars: vars.iter().map(|s| s.to_ascii_uppercase()).collect(),
         };
         let store = VecRowStore::new(self.cols.clone(), self.rows.clone());
@@ -58,6 +62,7 @@ fn cfg(
     PlanConfig {
         pattern: pattern.into(),
         define_json: define.into(),
+        subset_json: String::new(),
         measures_json: measures.map(|m| m.into()),
         partition_by: vec![],
         order_by: vec![order.into()],
@@ -236,6 +241,7 @@ fn one_vs_all_rows_schema() {
     let mk = |rows_all| PlanConfig {
         pattern: "A B".into(),
         define_json: "{}".into(),
+        subset_json: String::new(),
         measures_json: Some(r#"{"n":"COUNT(*)"}"#.into()),
         partition_by: vec!["sym".into()],
         order_by: vec!["ts".into()],

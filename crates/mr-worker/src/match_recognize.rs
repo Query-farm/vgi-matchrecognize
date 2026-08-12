@@ -21,15 +21,12 @@ use mr_core::plan::{Plan, PlanConfig};
 use vgi::arguments::Arguments;
 use vgi::buffering::{BufferingParams, TableBufferingFunction};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata};
-use vgi::ipc;
 use vgi::table_function::TableProducer;
 use vgi_rpc::{OutputCollector, Result, RpcError};
 
 use crate::arrow_in::BatchRowStore;
 use crate::arrow_out::build_batch;
 use crate::schema::{output_field, ArrowBindSchema};
-
-const NS: &[u8] = b"match_recognize";
 
 pub struct MatchRecognize;
 
@@ -74,6 +71,7 @@ fn plan_config(args: &Arguments) -> Result<PlanConfig> {
         .named_str("pattern")
         .ok_or_else(|| ve("match_recognize: 'pattern' is required"))?;
     let define_json = args.named_str("define").unwrap_or_default();
+    let subset_json = args.named_str("subset").unwrap_or_default();
     let measures_json = args.named_str("measures");
     let partition_by = named_str_list(args, "partition_by")?;
     let order_by = named_str_list(args, "order_by")?;
@@ -107,6 +105,7 @@ fn plan_config(args: &Arguments) -> Result<PlanConfig> {
     Ok(PlanConfig {
         pattern,
         define_json,
+        subset_json,
         measures_json,
         partition_by,
         order_by,
@@ -122,8 +121,51 @@ fn build_plan(args: &Arguments, input_schema: &SchemaRef) -> Result<Plan> {
     let cfg = plan_config(args)?;
     // Parse the pattern once to get the variable set for inference.
     let pat = mr_core::pattern::parse(&cfg.pattern).map_err(ve)?;
-    let bind_schema = ArrowBindSchema::new(input_schema.clone(), pat.variables());
+    // Union variables are usable wherever a pattern variable is, so the schema
+    // must type-check qualifiers against both.
+    let mut labels = pat.variables();
+    labels.extend(mr_core::plan::subset_names(&cfg.subset_json).map_err(ve)?);
+    let bind_schema = ArrowBindSchema::new(input_schema.clone(), labels);
     Plan::build(&cfg, &bind_schema).map_err(ve)
+}
+
+/// The columns of `input_schema` that `plan` actually reads, as projection
+/// indices in schema order.
+///
+/// Everything else is dropped before the batch is buffered. Both `process` and
+/// `finalize_producer` derive this from the same arguments and input schema, so
+/// they always agree on the buffered layout.
+fn projection(plan: &Plan, input_schema: &SchemaRef) -> Vec<usize> {
+    let needed = plan.referenced_columns();
+    (0..input_schema.fields().len())
+        .filter(|i| {
+            let name = input_schema.field(*i).name();
+            needed.iter().any(|n| n.eq_ignore_ascii_case(name))
+        })
+        .collect()
+}
+
+/// Reject storage backends that cannot survive the sink and source running in
+/// different worker processes.
+///
+/// The subprocess transport pools workers, so `process` and `finalize_producer`
+/// are not guaranteed to share an address space. With an in-process store the
+/// buffered relation is simply *absent* at finalize and the function would return
+/// zero rows — silently. Durable backends (the default SQLite store, or the
+/// filesystem store) are all fine.
+fn check_storage_backend() -> Result<()> {
+    if std::env::var("VGI_WORKER_SHARED_STORAGE")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("memory")
+    {
+        return Err(ve(
+            "match_recognize: VGI_WORKER_SHARED_STORAGE=memory cannot be used with a buffering \
+             function — the buffering and producing phases may run in different worker processes, \
+             so an in-process store is empty at finalize and the result would be silently empty. \
+             Unset the variable to use the default durable store.",
+        ));
+    }
+    Ok(())
 }
 
 /// The output Arrow schema derived from a bound plan.
@@ -131,7 +173,7 @@ fn output_schema(plan: &Plan) -> SchemaRef {
     let fields = plan
         .output_columns()
         .iter()
-        .map(|c| output_field(&c.name, c.ty))
+        .map(|c| output_field(&c.name, &c.ty))
         .collect::<Vec<_>>();
     Arc::new(Schema::new(fields))
 }
@@ -192,6 +234,18 @@ impl TableBufferingFunction for MatchRecognize {
                  arithmetic/comparison/logical operators.",
             ),
             ArgSpec::const_arg(
+                "subset",
+                -1,
+                "varchar",
+                "SQL:2016 SUBSET: a JSON object declaring union variables. Each key names a new \
+                 union variable and its value is a JSON array naming the pattern variables that \
+                 union covers — for instance a key U whose array names the variables A and B. A \
+                 union variable stands for any of its members wherever a pattern variable may \
+                 appear, such as in a qualified column reference or an aggregate. Giving a union \
+                 variable its own predicate in define is an error. This argument is free-form \
+                 JSON, not a fixed vocabulary of keywords.",
+            ),
+            ArgSpec::const_arg(
                 "measures",
                 -1,
                 "varchar",
@@ -211,7 +265,8 @@ impl TableBufferingFunction for MatchRecognize {
                  one row per matched row, each tagged with its match_number and classifier \
                  (SQL:2016 ALL ROWS PER MATCH). The SQL:2016 phrases themselves are not accepted — \
                  pass 'one' or 'all'.",
-            ),
+            )
+            .with_choices(["one", "all"]),
             ArgSpec::const_arg(
                 "after",
                 -1,
@@ -220,9 +275,11 @@ impl TableBufferingFunction for MatchRecognize {
                  a successful match. It defaults to skipping past the last row of the matched \
                  span. It may instead resume at the row after the match start; or at the first / \
                  last row that was bound to a named pattern variable (naming any variable from \
-                 define). Browse the mr.main.after_match_skip_modes view for the full set. This \
-                 is free-form text, not a fixed vocabulary of keywords.",
-            ),
+                 define). Browse the mr.main.after_match_skip_modes view for the full set.",
+            )
+            // Two of the four forms name a pattern variable, so the value set is
+            // not closed; a pattern is the machine-readable constraint that fits.
+            .with_pattern(r"(?i)^(past last row|to next row|to (first|last) .+)$"),
             ArgSpec::const_arg(
                 "empty_matches",
                 -1,
@@ -233,7 +290,8 @@ impl TableBufferingFunction for MatchRecognize {
                  an empty match always reports a row, carrying NULL measures. Empty matches \
                  consume a match number either way. The SQL:2016 phrases themselves are not \
                  accepted — pass 'show' or 'omit'.",
-            ),
+            )
+            .with_choices(["show", "omit"]),
             ArgSpec::const_arg(
                 "step_budget",
                 -1,
@@ -242,7 +300,8 @@ impl TableBufferingFunction for MatchRecognize {
                  error is raised. Omit it to scale the budget with each partition's row count, \
                  which keeps ordinary long matches working at any size; pass a number to pin it \
                  instead. The matcher never hangs.",
-            ),
+            )
+            .with_ge(1.0),
         ]
     }
 
@@ -251,6 +310,7 @@ impl TableBufferingFunction for MatchRecognize {
             .input_schema
             .as_ref()
             .ok_or_else(|| ve("match_recognize: requires an input relation"))?;
+        check_storage_backend()?;
         let plan = build_plan(&params.arguments, input)?;
         Ok(BindResponse {
             output_schema: output_schema(&plan),
@@ -259,9 +319,18 @@ impl TableBufferingFunction for MatchRecognize {
     }
 
     fn process(&self, params: &BufferingParams, batch: &RecordBatch) -> Result<Vec<u8>> {
-        params
-            .storage
-            .append(&params.execution_id, NS, b"", ipc::write_batch(batch)?);
+        // Buffer only the columns the pattern reads. Volume through the store
+        // dominates runtime, so carrying unused columns is the most expensive
+        // thing we could do here.
+        let input_schema = params
+            .input_schema
+            .clone()
+            .ok_or_else(|| ve("match_recognize: missing input schema while buffering"))?;
+        let plan = build_plan(&params.arguments, &input_schema)?;
+        let projected = batch
+            .project(&projection(&plan, &input_schema))
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?;
+        crate::buffer::append_batch(&params.storage, &params.execution_id, &projected)?;
         Ok(params.execution_id.clone())
     }
 
@@ -280,26 +349,19 @@ impl TableBufferingFunction for MatchRecognize {
             .ok_or_else(|| ve("match_recognize: missing input schema at finalize"))?;
         let plan = build_plan(&params.arguments, &input_schema)?;
 
-        // Drain all buffered batches.
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut after_id = 0i64;
-        loop {
-            let rows = params
-                .storage
-                .scan(&finalize_state_id, NS, b"", after_id, 256);
-            if rows.is_empty() {
-                break;
-            }
-            for (id, bytes) in rows {
-                after_id = id;
-                batches.push(ipc::read_batch(&bytes)?);
-            }
-        }
+        // Read the buffered relation back, verifying nothing was lost in transit.
+        let batches = crate::buffer::read_batches(&params.storage, &finalize_state_id)?;
 
-        // The batches are kept as they arrived rather than concatenated: the
-        // engine reads cells by row index, so a merged copy would only double
-        // peak memory.
-        let store = BatchRowStore::new(input_schema, batches);
+        // The store is built over the *projected* schema, matching what `process`
+        // wrote; the batches are kept as they arrived rather than concatenated,
+        // since the engine reads cells by row index and a merged copy would only
+        // double peak memory.
+        let projected_schema = std::sync::Arc::new(
+            input_schema
+                .project(&projection(&plan, &input_schema))
+                .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+        );
+        let store = BatchRowStore::new(projected_schema, batches);
         let tapes = plan.partition_tapes(&store).map_err(ve)?;
         Ok(Box::new(PartitionStream {
             plan,

@@ -102,7 +102,7 @@ fn aggregates() {
 
 #[test]
 fn classifier_and_match_number() {
-    assert_eq!(e("CLASSIFIER()"), Expr::Classifier);
+    assert_eq!(e("CLASSIFIER()"), Expr::Classifier(None));
     assert_eq!(e("MATCH_NUMBER()"), Expr::MatchNumber);
 }
 

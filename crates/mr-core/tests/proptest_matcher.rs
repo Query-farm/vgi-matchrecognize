@@ -54,6 +54,7 @@ proptest! {
             pattern: pat,
             // A,B,C distinguish by x; some rows match none.
             define_json: r#"{"A":"x = 0","B":"x = 1","C":"x = 2"}"#.into(),
+            subset_json: String::new(),
             measures_json: Some(r#"{"mn":"MATCH_NUMBER()","n":"COUNT(*)"}"#.into()),
             partition_by: vec![],
             order_by: vec!["x".into()],
@@ -108,6 +109,7 @@ proptest! {
         let cfg = PlanConfig {
             pattern: pat,
             define_json: r#"{"A":"x = 0","B":"x = 1","C":"x = 2"}"#.into(),
+            subset_json: String::new(),
             measures_json: Some(r#"{"mn":"MATCH_NUMBER()","n":"COUNT(*)"}"#.into()),
             partition_by: vec![],
             order_by: vec!["x".into()],

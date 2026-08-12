@@ -31,7 +31,7 @@ impl VecRowStore {
     /// Build a store from column `(name, ty)` headers and row-major data.
     pub fn new(headers: Vec<(&str, Ty)>, rows: Vec<Vec<Value>>) -> Self {
         let names = headers.iter().map(|(n, _)| n.to_string()).collect();
-        let types = headers.iter().map(|(_, t)| *t).collect();
+        let types = headers.iter().map(|(_, t)| t.clone()).collect();
         VecRowStore { names, types, rows }
     }
 }
@@ -44,7 +44,7 @@ impl RowStore for VecRowStore {
         self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
     }
     fn col_ty(&self, idx: usize) -> Ty {
-        self.types[idx]
+        self.types[idx].clone()
     }
     fn cell(&self, row: usize, col: usize) -> Value {
         self.rows[row][col].clone()

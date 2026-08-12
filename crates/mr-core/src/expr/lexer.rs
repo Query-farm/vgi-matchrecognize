@@ -8,6 +8,10 @@ pub enum Tok {
     /// An identifier or keyword (raw text; keyword-ness is decided by the parser
     /// case-insensitively).
     Ident(String),
+    /// A double-quoted identifier — never a keyword, and **case-sensitive**, so
+    /// `"b"` is a different pattern variable from the unquoted `b` (which
+    /// canonicalizes to `B`).
+    QuotedIdent(String),
     Int(i64),
     Float(f64),
     Str(String),
@@ -185,6 +189,30 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                         .map_err(|_| MrError::Expr(format!("integer '{s}' out of range")))?;
                     toks.push(Tok::Int(v));
                 }
+            }
+            '"' => {
+                // A double-quoted identifier; `""` escapes a literal quote.
+                i += 1;
+                let mut s = String::new();
+                loop {
+                    if i >= chars.len() {
+                        return Err(MrError::Expr(
+                            "unterminated double-quoted identifier".into(),
+                        ));
+                    }
+                    if chars[i] == '"' {
+                        if i + 1 < chars.len() && chars[i + 1] == '"' {
+                            s.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    s.push(chars[i]);
+                    i += 1;
+                }
+                toks.push(Tok::QuotedIdent(s));
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;

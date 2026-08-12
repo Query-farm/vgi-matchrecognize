@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use super::eval::{Bind, Frame};
+use super::eval::{Bind, Frame, SubsetMap};
 use super::rowstore::RowStore;
 use crate::error::{MrError, Result};
 use crate::expr::ast::Expr;
@@ -59,6 +59,7 @@ pub struct Matcher<'a> {
     store: &'a dyn RowStore,
     tape: &'a [usize],
     define: &'a HashMap<String, Expr>,
+    subsets: &'a SubsetMap,
     after: &'a AfterSkip,
     budget: i64,
     partition_label: String,
@@ -73,6 +74,7 @@ impl<'a> Matcher<'a> {
         store: &'a dyn RowStore,
         tape: &'a [usize],
         define: &'a HashMap<String, Expr>,
+        subsets: &'a SubsetMap,
         after: &'a AfterSkip,
         step_budget: i64,
         partition_label: impl Into<String>,
@@ -83,6 +85,7 @@ impl<'a> Matcher<'a> {
             store,
             tape,
             define,
+            subsets,
             after,
             budget: step_budget,
             partition_label: partition_label.into(),
@@ -130,6 +133,16 @@ impl<'a> Matcher<'a> {
         Ok(matches)
     }
 
+    /// Whether a row bound to `bound` is covered by `label` — the same variable,
+    /// or a SUBSET that lists it.
+    fn label_covers(&self, label: &str, bound: &str) -> bool {
+        label == bound
+            || self
+                .subsets
+                .get(label)
+                .is_some_and(|ms| ms.iter().any(|m| m == bound))
+    }
+
     fn skip_target(&self, start: usize, m: &Match) -> Result<usize> {
         let pos = match self.after {
             AfterSkip::PastLastRow => m.end,
@@ -137,14 +150,14 @@ impl<'a> Matcher<'a> {
             AfterSkip::ToFirstVar(v) => m
                 .binds
                 .iter()
-                .find(|b| b.var.eq_ignore_ascii_case(v))
+                .find(|b| self.label_covers(v, &b.var))
                 .map(|b| b.tape_pos)
                 .unwrap_or(m.end),
             AfterSkip::ToLastVar(v) => m
                 .binds
                 .iter()
                 .rev()
-                .find(|b| b.var.eq_ignore_ascii_case(v))
+                .find(|b| self.label_covers(v, &b.var))
                 .map(|b| b.tape_pos)
                 .unwrap_or(m.end),
         };
@@ -259,6 +272,7 @@ impl<'a> Matcher<'a> {
             binds,
             horizon: binds.len(),
             match_number: self.match_number,
+            subsets: self.subsets,
         };
         let v = frame.eval_predicate(expr)?;
         Ok(matches!(v, Value::Bool(true)))

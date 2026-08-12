@@ -18,7 +18,7 @@ impl BindSchema for Sch {
         self.cols
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, t)| *t)
+            .map(|(_, t)| t.clone())
     }
     fn is_variable(&self, name: &str) -> bool {
         self.vars.iter().any(|v| v.eq_ignore_ascii_case(name))
@@ -27,7 +27,10 @@ impl BindSchema for Sch {
 
 fn sch(cols: &[(&str, Ty)], vars: &[&str]) -> Sch {
     Sch {
-        cols: cols.iter().map(|(n, t)| (n.to_string(), *t)).collect(),
+        cols: cols
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.clone()))
+            .collect(),
         vars: vars.iter().map(|s| s.to_ascii_uppercase()).collect(),
     }
 }
@@ -52,6 +55,7 @@ fn v_shape_one_row() {
     let cfg = PlanConfig {
         pattern: "START DOWN+ UP+".into(),
         define_json: r#"{"DOWN":"price < PREV(price)","UP":"price > PREV(price)"}"#.into(),
+        subset_json: String::new(),
         measures_json: Some(
             r#"{"match_no":"MATCH_NUMBER()","start_price":"FIRST(START.price)",
                 "bottom":"LAST(DOWN.price)","drawdown":"FIRST(START.price) - LAST(DOWN.price)"}"#
@@ -106,6 +110,7 @@ fn login_fail_then_success_all_rows() {
     let cfg = PlanConfig {
         pattern: "FAIL{3,} OK".into(),
         define_json: r#"{"FAIL":"outcome = 'fail'","OK":"outcome = 'success'"}"#.into(),
+        subset_json: String::new(),
         measures_json: Some(r#"{"var":"CLASSIFIER()","n_fails":"FINAL COUNT(FAIL.*)"}"#.into()),
         partition_by: vec!["uid".into()],
         order_by: vec!["ts".into()],

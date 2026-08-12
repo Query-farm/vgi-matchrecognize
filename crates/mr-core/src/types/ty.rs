@@ -27,8 +27,12 @@ pub enum TimeUnit {
 /// | `Timestamp(u)`    | `Timestamp(u, None)`        | `TIMESTAMP`      |
 /// | `Time(u)`         | `Time64(u)`                 | `TIME`           |
 /// | `Interval`        | `Interval(MonthDayNano)`    | `INTERVAL`       |
+/// | `List(elem)`      | `List(Field<elem>)`         | `elem[]`         |
 /// | `Null`            | (no concrete output type)   | —                |
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Not `Copy`: `List` owns its element type. Everything else is a scalar, so
+/// clones are cheap.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     Boolean,
     Int64,
@@ -40,6 +44,8 @@ pub enum Ty {
     Timestamp(TimeUnit),
     Time(TimeUnit),
     Interval,
+    /// `LIST(elem)` — produced by `array_agg`.
+    List(Box<Ty>),
     /// The "unknown" type — produced by a bare `NULL` literal or a wholly-NULL
     /// column. Unifies with anything; a measure that resolves to `Null` with no
     /// `type` override is a bind error.
@@ -48,12 +54,12 @@ pub enum Ty {
 
 impl Ty {
     /// Whether this is an integer-family type (`BIGINT`).
-    pub fn is_integer(self) -> bool {
+    pub fn is_integer(&self) -> bool {
         matches!(self, Ty::Int64)
     }
 
     /// Whether this is any numeric type (integer / hugeint / double / decimal).
-    pub fn is_numeric(self) -> bool {
+    pub fn is_numeric(&self) -> bool {
         matches!(
             self,
             Ty::Int64 | Ty::HugeInt | Ty::Double | Ty::Decimal(_, _)
@@ -61,13 +67,13 @@ impl Ty {
     }
 
     /// Whether this is a temporal type (date / timestamp / time).
-    pub fn is_temporal(self) -> bool {
+    pub fn is_temporal(&self) -> bool {
         matches!(self, Ty::Date | Ty::Timestamp(_) | Ty::Time(_))
     }
 
     /// Rank in the numeric promotion lattice: `Int64 < HugeInt < Double`.
     /// `Decimal` is handled separately (never silently joins binary floats).
-    fn numeric_rank(self) -> Option<u8> {
+    fn numeric_rank(&self) -> Option<u8> {
         match self {
             Ty::Int64 => Some(0),
             Ty::HugeInt => Some(1),
@@ -78,19 +84,23 @@ impl Ty {
 
     /// Least-upper-bound (join) of two types under the promotion lattice, or
     /// `None` when they do not unify (a bind error at the call site).
-    pub fn unify(self, other: Ty) -> Option<Ty> {
+    pub fn unify(&self, other: &Ty) -> Option<Ty> {
         use Ty::*;
         // NULL unifies with anything (yields the other type).
         match (self, other) {
-            (Null, t) | (t, Null) => return Some(t),
+            (Null, t) | (t, Null) => return Some(t.clone()),
             _ => {}
         }
         if self == other {
-            return Some(self);
+            return Some(self.clone());
+        }
+        // Lists unify element-wise.
+        if let (List(a), List(b)) = (self, other) {
+            return a.unify(b).map(|e| List(Box::new(e)));
         }
         // Decimal arithmetic widening: keep the larger precision/scale.
         if let (Decimal(p1, s1), Decimal(p2, s2)) = (self, other) {
-            return Some(Decimal(p1.max(p2), s1.max(s2)));
+            return Some(Decimal(*p1.max(p2), *s1.max(s2)));
         }
         // A decimal combined with a binary float widens to DOUBLE.
         if (matches!(self, Decimal(_, _)) && matches!(other, Double))
@@ -102,12 +112,12 @@ impl Ty {
         // headroom for the integer part).
         if let (Decimal(p, s), o) | (o, Decimal(p, s)) = (self, other) {
             if matches!(o, Int64 | HugeInt) {
-                return Some(Decimal(p.max(20), s));
+                return Some(Decimal((*p).max(20), *s));
             }
         }
         // Pure numeric lattice.
         if let (Some(a), Some(b)) = (self.numeric_rank(), other.numeric_rank()) {
-            return Some(if a >= b { self } else { other });
+            return Some(if a >= b { self.clone() } else { other.clone() });
         }
         // Temporal types unify with themselves only (handled by `self == other`).
         None
@@ -115,20 +125,20 @@ impl Ty {
 
     /// SUM widening: integer family -> HUGEINT; float -> DOUBLE; decimal ->
     /// `DECIMAL(38, s)`.
-    pub fn sum_ty(self) -> Option<Ty> {
+    pub fn sum_ty(&self) -> Option<Ty> {
         match self {
             Ty::Int64 | Ty::HugeInt => Some(Ty::HugeInt),
             Ty::Double => Some(Ty::Double),
-            Ty::Decimal(_, s) => Some(Ty::Decimal(38, s)),
+            Ty::Decimal(_, s) => Some(Ty::Decimal(38, *s)),
             _ => None,
         }
     }
 
     /// AVG widening: numeric -> DOUBLE (DECIMAL -> `DECIMAL(38, max(s,4))`).
-    pub fn avg_ty(self) -> Option<Ty> {
+    pub fn avg_ty(&self) -> Option<Ty> {
         match self {
             Ty::Int64 | Ty::HugeInt | Ty::Double => Some(Ty::Double),
-            Ty::Decimal(_, s) => Some(Ty::Decimal(38, s.max(4))),
+            Ty::Decimal(_, s) => Some(Ty::Decimal(38, (*s).max(4))),
             _ => None,
         }
     }

@@ -38,6 +38,7 @@ fn build_plan(batch: &RecordBatch, measures: &str, rows_all: bool) -> Plan {
     let cfg = PlanConfig {
         pattern: "START DOWN+ UP+".into(),
         define_json: r#"{"DOWN":"price < PREV(price)","UP":"price > PREV(price)"}"#.into(),
+        subset_json: String::new(),
         measures_json: Some(measures.into()),
         partition_by: vec!["symbol".into()],
         order_by: vec!["ts".into()],
@@ -65,7 +66,7 @@ fn arrow_round_trip_one_row() {
     let fields: Vec<Field> = plan
         .output_columns()
         .iter()
-        .map(|c| output_field(&c.name, c.ty))
+        .map(|c| output_field(&c.name, &c.ty))
         .collect();
     let out_schema = Arc::new(Schema::new(fields));
     assert_eq!(out_schema.field(0).data_type(), &DataType::Utf8);
@@ -113,7 +114,7 @@ fn arrow_all_rows_has_auto_columns() {
 
     let store = BatchRowStore::single(batch);
     let rows = plan.run(&store).unwrap();
-    let fields: Vec<Field> = cols.iter().map(|c| output_field(&c.name, c.ty)).collect();
+    let fields: Vec<Field> = cols.iter().map(|c| output_field(&c.name, &c.ty)).collect();
     let out = build_batch(Arc::new(Schema::new(fields)), cols, &rows).unwrap();
     // The V is START(10) DOWN(8) DOWN(6) UP(9) UP(11) -> 5 matched rows.
     assert_eq!(out.num_rows(), 5);

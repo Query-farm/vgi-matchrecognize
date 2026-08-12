@@ -88,7 +88,7 @@ impl RowStore for BatchRowStore {
     }
 
     fn col_ty(&self, idx: usize) -> Ty {
-        self.types[idx]
+        self.types[idx].clone()
     }
 
     fn cell(&self, row: usize, col: usize) -> Value {

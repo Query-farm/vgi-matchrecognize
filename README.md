@@ -39,6 +39,7 @@ mr.match_recognize(
     order_by     := ['col', …], -- VARCHAR[]   (required; 'col DESC' / 'NULLS FIRST' ok)
     pattern      := '…',        -- the row pattern (regex over variables)
     define       := '{…}',      -- JSON: { "VAR": "<boolean predicate>", … }
+    subset       := '{…}',      -- JSON: { "U": ["A","B"], … }  (SQL:2016 SUBSET)
     measures     := '{…}',      -- JSON object/array of output expressions
     rows         := 'one'|'all',-- ONE ROW PER MATCH (default) | ALL ROWS PER MATCH
     empty_matches := 'show'|'omit', -- SHOW (default) / OMIT EMPTY MATCHES
@@ -144,11 +145,32 @@ A regular expression **over pattern variables** (not characters):
 ## DEFINE / MEASURES expression language
 
 Column refs (`price`), variable-qualified refs (`A.price`), literals,
-`PREV`/`NEXT`/`FIRST`/`LAST(expr[,n])`, running aggregates
-`SUM`/`COUNT`/`AVG`/`MIN`/`MAX` (incl. `COUNT(*)` and `COUNT(A.*)`),
-`CLASSIFIER()`, `MATCH_NUMBER()`, `RUNNING`/`FINAL`, arithmetic, comparison,
-`AND`/`OR`/`NOT`, `IS [NOT] NULL`, `BETWEEN`, `IN`, `||`, and `CAST`/`::`.
-DEFINE predicates are always **RUNNING** (they see only rows matched so far).
+`PREV`/`NEXT`/`FIRST`/`LAST(expr[,n])`, aggregates
+`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`/`ARRAY_AGG`/`ARBITRARY` (incl. `COUNT(*)`,
+`COUNT()` and `COUNT(A.*)`), `CLASSIFIER([label])`, `MATCH_NUMBER()`,
+`RUNNING`/`FINAL`, arithmetic, comparison, `AND`/`OR`/`NOT`, `IS [NOT] NULL`,
+`BETWEEN`, `IN`, `||`, `CAST`/`::`, and the scalar functions `abs`, `ceil`,
+`floor`, `round`, `sqrt`, `lower`, `upper`, `trim`/`ltrim`/`rtrim`, `length`,
+`coalesce`, `nullif`, `greatest`, `least`. DEFINE predicates are always
+**RUNNING** (they see only rows matched so far).
+
+`array_agg(expr)` collects the matched values in match order as a DuckDB list
+(`BIGINT[]`, `VARCHAR[]`, …); over an empty match it is an empty list, not NULL.
+
+**Anything else, compose around the call** rather than inside it — the host's full
+function library is available on both sides, so nothing is really out of reach:
+a row-local computation belongs in the input subquery
+(`(SELECT *, lower(event) AS ev FROM t)`), and post-processing a measure belongs
+in the outer `SELECT` (`SELECT lower(cls) FROM mr.main.match_recognize(…)`).
+
+A **double-quoted label** is case-sensitive, so `"b"` is a different variable from
+the unquoted `b` (which canonicalizes to `B`), and `CLASSIFIER()` reports the
+canonical spelling.
+
+`subset := '{"U": ["A","B"]}'` declares SQL:2016 **union variables**: `U` then
+stands for any of its members wherever a pattern variable may appear — `U.price`,
+`COUNT(U.*)`, `SUM(U.price)`, `CLASSIFIER(U)`, and `after := 'to last U'`. A union
+variable may not have its own DEFINE predicate.
 
 A bare `A.price` is the standard's shorthand for `LAST(A.price)` under the
 prevailing RUNNING/FINAL semantics — the last row bound to `A`, or NULL if `A`
@@ -233,8 +255,33 @@ exhausting the stack.
 ## Memory & streaming
 
 Input is **buffered to disk, not held in RAM**: each incoming batch is written to
-the worker's cross-process store as Arrow IPC (a SQLite file under `$TMPDIR` by
-default; set `VGI_WORKER_SHARED_STORAGE=memory|fs|sqlite` to choose a backend).
+the worker's cross-process store as Arrow IPC — a SQLite file under `$TMPDIR`,
+the SDK default.
+
+The buffering sink and the producing source may run in **different worker
+processes**, so the store has to outlive any one process. The durable backends
+(the default `sqlite`, or `fs`) both work; `VGI_WORKER_SHARED_STORAGE=memory` is
+rejected at bind time, because an in-process map is simply empty in the other
+process and the result would be silently empty.
+
+Reading the buffered log back is guarded two ways, because a short read here
+would mean a confidently wrong answer rather than an error:
+
+- The scan cursor starts **below every representable id**, not at `0`. Backends
+  only promise *monotonic* ids — SQLite starts at 1, the filesystem store at 0 —
+  so paging from `0` silently skipped the first batch on a 0-based backend
+  (measured: 547 missing matches out of 1,333,333). `crates/mr-worker/src/buffer.rs`
+  owns that convention, and `tests/storage_probe.rs` round-trips every backend
+  through it.
+- Each batch is written with an **independent row-count record**, and the two
+  totals are compared at finalize; a mismatch is an error naming the backend.
+
+**Unused columns cost nothing.** Only the columns the pattern actually reads —
+the partition and order keys plus everything referenced by `define`/`measures` —
+are buffered; the rest are projected away before they reach the store. Buffering
+volume dominates runtime, so this matters: on 2M rows a single unused 200-byte
+column took a query from 1.02s to **2.83s** before projection pushdown, and 1.02s
+after.
 
 At finalize the buffered relation is read back and matched. Two properties keep
 the footprint down:

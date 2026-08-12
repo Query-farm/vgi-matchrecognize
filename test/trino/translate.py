@@ -161,6 +161,39 @@ def parse_define(s):
     return out
 
 
+def parse_subset(s):
+    """`U = (A, B), V = (C)` -> {"U": ["A", "B"], "V": ["C"]}"""
+    out = {}
+    for item in split_top_commas_paren_aware(s):
+        if "=" not in item:
+            raise Unsupported(f"malformed SUBSET item: {item}")
+        name, members = item.split("=", 1)
+        name = name.strip().strip('"')
+        members = members.strip()
+        if not (members.startswith("(") and members.endswith(")")):
+            raise Unsupported(f"malformed SUBSET members: {members}")
+        out[name] = [m.strip().strip('"') for m in members[1:-1].split(",") if m.strip()]
+    return out
+
+
+def split_top_commas_paren_aware(s):
+    """Split `U = (A, B), V = (C)` at the commas *between* items."""
+    parts, depth, cur = [], 0, []
+    for c in s:
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return [p.strip() for p in parts]
+
+
 def normalize_after(s):
     t = " ".join(s.split()).upper()
     if t == "PAST LAST ROW":
@@ -200,8 +233,6 @@ def translate(query):
     source = head[fm + 4:].strip()
 
     cl = parse_mr(body)
-    if "SUBSET" in cl:
-        raise Unsupported("SUBSET (union variables) not implemented")
     if "PATTERN" not in cl:
         raise Unsupported("no PATTERN")
 
@@ -236,6 +267,7 @@ def translate(query):
     order_by = col_list(cl["ORDER BY"]) if "ORDER BY" in cl else []
     partition_by = col_list(cl["PARTITION BY"]) if "PARTITION BY" in cl else []
     measures = parse_measures(cl["MEASURES"]) if "MEASURES" in cl else {}
+    subsets = parse_subset(cl["SUBSET"]) if "SUBSET" in cl else {}
     define = parse_define(cl["DEFINE"]) if "DEFINE" in cl else {}
     after = normalize_after(cl["AFTER MATCH SKIP"]) if "AFTER MATCH SKIP" in cl else "past last row"
 
@@ -248,6 +280,8 @@ def translate(query):
     args.append("order_by := [" + ", ".join(sql_lit(c) for c in order_by) + "]")
     args.append("pattern := " + sql_lit(pattern))
     args.append("define := " + sql_lit(json.dumps(define)))
+    if subsets:
+        args.append("subset := " + sql_lit(json.dumps(subsets)))
     if measures:
         args.append("measures := " + sql_lit(json.dumps(measures)))
     args.append("rows := " + ("'all'" if rows_all else "'one'"))

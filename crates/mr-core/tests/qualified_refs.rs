@@ -22,7 +22,7 @@ impl BindSchema for Sch {
         self.cols
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, t)| *t)
+            .map(|(_, t)| t.clone())
     }
     fn is_variable(&self, name: &str) -> bool {
         matches!(name.to_ascii_uppercase().as_str(), "A" | "B" | "C")
@@ -65,6 +65,7 @@ fn run_cfg(
     let cfg = PlanConfig {
         pattern: pattern.into(),
         define_json: define.into(),
+        subset_json: String::new(),
         measures_json: Some(measures.into()),
         partition_by: vec![],
         order_by: vec!["ts".into()],

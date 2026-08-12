@@ -104,6 +104,34 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                 })?;
                 toks.push(Tok::Num(n));
             }
+            '"' => {
+                // A double-quoted label is case-sensitive: `"b"` is a different
+                // variable from the unquoted `b` (which canonicalizes to `B`).
+                i += 1;
+                let mut s = String::new();
+                loop {
+                    if i >= chars.len() {
+                        return Err(MrError::Pattern(
+                            "unterminated double-quoted pattern variable".into(),
+                        ));
+                    }
+                    if chars[i] == '"' {
+                        if i + 1 < chars.len() && chars[i + 1] == '"' {
+                            s.push('"');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    s.push(chars[i]);
+                    i += 1;
+                }
+                if s.is_empty() {
+                    return Err(MrError::Pattern("empty pattern variable name".into()));
+                }
+                toks.push(Tok::Var(s));
+            }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
                 while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {

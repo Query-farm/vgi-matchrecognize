@@ -36,6 +36,8 @@ pub enum Value {
     /// Time-of-day ticks at the given resolution.
     Time(i64, TimeUnit),
     Interval(Interval),
+    /// A list value, produced by `array_agg`. Elements share one type.
+    List(Vec<Value>),
 }
 
 impl Value {

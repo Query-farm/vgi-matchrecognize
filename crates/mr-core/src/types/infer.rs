@@ -42,7 +42,7 @@ pub fn infer(expr: &Expr, schema: &dyn BindSchema) -> Result<Ty> {
         }
         Expr::Nav { arg, .. } => infer(arg, schema),
         Expr::Agg { kind, arg } => infer_agg(*kind, arg, schema),
-        Expr::Classifier => Ok(Ty::Varchar),
+        Expr::Classifier(_) => Ok(Ty::Varchar),
         Expr::MatchNumber => Ok(Ty::Int64),
         Expr::RunningFinal { inner, .. } => infer(inner, schema),
         Expr::Neg(e) => {
@@ -69,7 +69,14 @@ pub fn infer(expr: &Expr, schema: &dyn BindSchema) -> Result<Ty> {
             }
             Ok(Ty::Boolean)
         }
-        Expr::Cast { ty, .. } => Ok(*ty),
+        Expr::Cast { ty, .. } => Ok(ty.clone()),
+        Expr::Call { name, args } => {
+            let arg_tys = args
+                .iter()
+                .map(|a| infer(a, schema))
+                .collect::<Result<Vec<_>>>()?;
+            crate::engine::scalar::result_ty(name, &arg_tys)
+        }
         Expr::Binary { op, lhs, rhs } => infer_binary(*op, lhs, rhs, schema),
     }
 }
@@ -88,7 +95,12 @@ fn expect_bool(e: &Expr, schema: &dyn BindSchema, ctx: &str) -> Result<Ty> {
 fn infer_agg(kind: AggKind, arg: &AggArg, schema: &dyn BindSchema) -> Result<Ty> {
     match kind {
         AggKind::Count => Ok(Ty::Int64),
-        AggKind::Sum | AggKind::Avg | AggKind::Min | AggKind::Max => {
+        AggKind::Sum
+        | AggKind::Avg
+        | AggKind::Min
+        | AggKind::Max
+        | AggKind::ArrayAgg
+        | AggKind::Arbitrary => {
             let inner = match arg {
                 AggArg::Expr(e) => infer(e, schema)?,
                 AggArg::Star | AggArg::QualStar(_) => {
@@ -104,7 +116,10 @@ fn infer_agg(kind: AggKind, arg: &AggArg, schema: &dyn BindSchema) -> Result<Ty>
                 AggKind::Avg => inner
                     .avg_ty()
                     .ok_or_else(|| MrError::Infer(format!("AVG of non-numeric {inner:?}"))),
-                AggKind::Min | AggKind::Max => Ok(inner),
+                // A list of whatever the argument is; an empty match yields an
+                // empty list, so the element type still comes from the argument.
+                AggKind::ArrayAgg => Ok(Ty::List(Box::new(inner))),
+                AggKind::Min | AggKind::Max | AggKind::Arbitrary => Ok(inner),
                 AggKind::Count => unreachable!(),
             }
         }
@@ -129,7 +144,7 @@ fn infer_binary(op: BinOp, lhs: &Expr, rhs: &Expr, schema: &dyn BindSchema) -> R
         Eq | Ne | Lt | Le | Gt | Ge => {
             // Comparable check: both numeric, both same temporal, both varchar,
             // both boolean, or NULL on either side.
-            if comparable(l, r) {
+            if comparable(&l, &r) {
                 Ok(Ty::Boolean)
             } else {
                 Err(MrError::Infer(format!("cannot compare {l:?} with {r:?}")))
@@ -143,8 +158,8 @@ fn infer_binary(op: BinOp, lhs: &Expr, rhs: &Expr, schema: &dyn BindSchema) -> R
     }
 }
 
-fn comparable(l: Ty, r: Ty) -> bool {
-    if l == Ty::Null || r == Ty::Null {
+fn comparable(l: &Ty, r: &Ty) -> bool {
+    if *l == Ty::Null || *r == Ty::Null {
         return true;
     }
     if l.is_numeric() && r.is_numeric() {
@@ -191,8 +206,8 @@ fn arith_mul(l: Ty, r: Ty, op: BinOp) -> Result<Ty> {
 
 fn arith_div(l: Ty, r: Ty) -> Result<Ty> {
     // DECIMAL / DECIMAL stays DECIMAL; otherwise division widens to DOUBLE.
-    if let (Ty::Decimal(p1, s1), Ty::Decimal(p2, s2)) = (l, r) {
-        return Ok(Ty::Decimal(p1.max(p2), s1.max(s2)));
+    if let (Ty::Decimal(p1, s1), Ty::Decimal(p2, s2)) = (&l, &r) {
+        return Ok(Ty::Decimal(*p1.max(p2), *s1.max(s2)));
     }
     if (l.is_numeric() || l == Ty::Null) && (r.is_numeric() || r == Ty::Null) {
         Ok(Ty::Double)
@@ -203,7 +218,7 @@ fn arith_div(l: Ty, r: Ty) -> Result<Ty> {
 
 fn numeric_promote(l: Ty, r: Ty, sym: &str) -> Result<Ty> {
     if (l.is_numeric() || l == Ty::Null) && (r.is_numeric() || r == Ty::Null) {
-        l.unify(r)
+        l.unify(&r)
             .ok_or_else(|| MrError::Infer(format!("cannot apply '{sym}' to {l:?} and {r:?}")))
     } else {
         Err(MrError::Infer(format!(

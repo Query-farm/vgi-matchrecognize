@@ -286,6 +286,7 @@ impl Parser {
                 Ok(Expr::Str(s))
             }
             Some(Tok::Ident(name)) => self.parse_ident(name),
+            Some(Tok::QuotedIdent(name)) => self.parse_quoted_ident(name),
             other => Err(MrError::Expr(format!(
                 "unexpected token {other:?} where an expression was expected"
             ))),
@@ -356,28 +357,68 @@ impl Parser {
                 };
                 self.parse_nav(nav)
             }
-            "SUM" | "COUNT" | "AVG" | "MIN" | "MAX" => {
+            "SUM" | "COUNT" | "AVG" | "MIN" | "MAX" | "ARRAY_AGG" | "LIST" | "ARBITRARY"
+            | "ANY_VALUE" => {
                 self.next();
                 let agg = match kw.as_str() {
                     "SUM" => AggKind::Sum,
                     "COUNT" => AggKind::Count,
                     "AVG" => AggKind::Avg,
                     "MIN" => AggKind::Min,
-                    _ => AggKind::Max,
+                    "MAX" => AggKind::Max,
+                    // DuckDB spells array_agg `list`; Trino spells any_value
+                    // `arbitrary`. Accept both spellings of each.
+                    "ARRAY_AGG" | "LIST" => AggKind::ArrayAgg,
+                    _ => AggKind::Arbitrary,
                 };
                 self.parse_agg(agg)
             }
             "CLASSIFIER" => {
                 self.next();
                 self.expect(&Tok::LParen)?;
+                // `CLASSIFIER(label)` restricts the reference to rows bound to a
+                // pattern variable or SUBSET; bare `CLASSIFIER()` is unrestricted.
+                let label = match self.peek().cloned() {
+                    Some(Tok::Ident(v)) => {
+                        self.next();
+                        Some(v.to_ascii_uppercase())
+                    }
+                    Some(Tok::QuotedIdent(v)) => {
+                        self.next();
+                        Some(v)
+                    }
+                    _ => None,
+                };
                 self.expect(&Tok::RParen)?;
-                Ok(Expr::Classifier)
+                Ok(Expr::Classifier(label))
             }
             "MATCH_NUMBER" => {
                 self.next();
                 self.expect(&Tok::LParen)?;
                 self.expect(&Tok::RParen)?;
                 Ok(Expr::MatchNumber)
+            }
+            _ if matches!(self.peek_at(1), Some(Tok::LParen)) => {
+                // Not a keyword, but applied to an argument list: a scalar
+                // function call such as `abs(x)` or `coalesce(a, b)`.
+                self.next();
+                self.expect(&Tok::LParen)?;
+                let mut args = Vec::new();
+                if !matches!(self.peek(), Some(Tok::RParen)) {
+                    loop {
+                        args.push(self.parse_expr(0)?);
+                        if matches!(self.peek(), Some(Tok::Comma)) {
+                            self.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen)?;
+                Ok(Expr::Call {
+                    name: raw.to_ascii_lowercase(),
+                    args,
+                })
             }
             _ => {
                 // A column reference, possibly qualified `VAR.col`.
@@ -386,6 +427,9 @@ impl Parser {
                     self.next();
                     match self.next() {
                         Some(Tok::Ident(col)) => Ok(Expr::Qualified(raw.to_ascii_uppercase(), col)),
+                        Some(Tok::QuotedIdent(col)) => {
+                            Ok(Expr::Qualified(raw.to_ascii_uppercase(), col))
+                        }
                         Some(Tok::Star) => Err(MrError::Expr(
                             "`A.*` is only valid as the argument to COUNT(...)".into(),
                         )),
@@ -397,6 +441,29 @@ impl Parser {
                     Ok(Expr::Col(raw))
                 }
             }
+        }
+    }
+
+    /// A double-quoted identifier: never a keyword, and case-sensitive. It names
+    /// either a column (`"My Col"`) or a pattern variable (`"b".value`); the
+    /// variable name keeps its exact spelling, unlike the unquoted form.
+    fn parse_quoted_ident(&mut self, raw: String) -> Result<Expr> {
+        self.next();
+        if matches!(self.peek(), Some(Tok::Dot)) {
+            self.next();
+            match self.next() {
+                Some(Tok::Ident(col)) | Some(Tok::QuotedIdent(col)) => {
+                    Ok(Expr::Qualified(raw, col))
+                }
+                Some(Tok::Star) => Err(MrError::Expr(
+                    "`A.*` is only valid as the argument to COUNT(...)".into(),
+                )),
+                other => Err(MrError::Expr(format!(
+                    "expected a column name after '\"{raw}\".', found {other:?}"
+                ))),
+            }
+        } else {
+            Ok(Expr::Col(raw))
         }
     }
 
@@ -432,7 +499,15 @@ impl Parser {
     fn parse_agg(&mut self, kind: AggKind) -> Result<Expr> {
         self.expect(&Tok::LParen)?;
         // COUNT(*) / COUNT(A.*) special forms.
-        let arg = if matches!(self.peek(), Some(Tok::Star)) {
+        let arg = if matches!(self.peek(), Some(Tok::RParen)) {
+            // `count()` is the same as `count(*)`, as SQL:2016 and Trino allow.
+            if kind != AggKind::Count {
+                return Err(MrError::Expr(format!(
+                    "{kind:?}() needs an argument; only COUNT() may be empty"
+                )));
+            }
+            AggArg::Star
+        } else if matches!(self.peek(), Some(Tok::Star)) {
             self.next();
             if kind != AggKind::Count {
                 return Err(MrError::Expr(format!(
@@ -440,12 +515,14 @@ impl Parser {
                 )));
             }
             AggArg::Star
-        } else if matches!(self.peek(), Some(Tok::Ident(_)))
+        } else if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)))
             && matches!(self.peek_at(1), Some(Tok::Dot))
             && matches!(self.peek_at(2), Some(Tok::Star))
         {
             let var = match self.next() {
                 Some(Tok::Ident(v)) => v.to_ascii_uppercase(),
+                // A quoted label keeps its exact spelling.
+                Some(Tok::QuotedIdent(v)) => v,
                 _ => unreachable!(),
             };
             self.next(); // dot
@@ -539,7 +616,16 @@ impl Parser {
                     Ok(Ty::Decimal(18, 3))
                 }
             }
-            "VARCHAR" | "TEXT" | "STRING" | "CHAR" => Ok(Ty::Varchar),
+            "VARCHAR" | "TEXT" | "STRING" | "CHAR" => {
+                // `VARCHAR(n)` / `CHAR(n)`: accept and ignore the length, as DuckDB
+                // does — the declared width is not part of our type model.
+                if matches!(self.peek(), Some(Tok::LParen)) {
+                    self.next();
+                    self.expect_int()?;
+                    self.expect(&Tok::RParen)?;
+                }
+                Ok(Ty::Varchar)
+            }
             "BOOLEAN" | "BOOL" => Ok(Ty::Boolean),
             "DATE" => Ok(Ty::Date),
             "TIMESTAMP" | "DATETIME" => Ok(Ty::Timestamp(TimeUnit::Micro)),

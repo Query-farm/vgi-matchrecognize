@@ -25,6 +25,10 @@ pub enum AggKind {
     Avg,
     Min,
     Max,
+    /// `array_agg(x)` — the matched values in match order, as a LIST.
+    ArrayAgg,
+    /// `arbitrary(x)` / `any_value(x)` — the first non-NULL matched value.
+    Arbitrary,
 }
 
 /// Binary operators.
@@ -86,8 +90,9 @@ pub enum Expr {
         kind: AggKind,
         arg: AggArg,
     },
-    /// `CLASSIFIER()`.
-    Classifier,
+    /// `CLASSIFIER()` or `CLASSIFIER(label)`, where `label` is a pattern variable
+    /// or a SUBSET name: the variable bound to the row the reference resolves to.
+    Classifier(Option<String>),
     /// `MATCH_NUMBER()`.
     MatchNumber,
     /// `RUNNING(inner)` / `FINAL(inner)`.
@@ -126,5 +131,12 @@ pub enum Expr {
     Cast {
         expr: Box<Expr>,
         ty: Ty,
+    },
+    /// A scalar function call, e.g. `abs(x)` / `coalesce(a, b)`. The name is
+    /// canonicalized to lower case; the supported set lives in
+    /// [`crate::engine::scalar`].
+    Call {
+        name: String,
+        args: Vec<Expr>,
     },
 }

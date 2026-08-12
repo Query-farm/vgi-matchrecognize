@@ -14,7 +14,7 @@ impl BindSchema for Sch {
         self.cols
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, t)| *t)
+            .map(|(_, t)| t.clone())
     }
     fn is_variable(&self, name: &str) -> bool {
         self.vars.iter().any(|v| v.eq_ignore_ascii_case(name))

@@ -111,8 +111,24 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
   grouping, and `pattern`/`define`/`measures` are user-supplied strings.
 - A bare qualified ref `A.col` outside a navigation/aggregate call means
   `LAST(A.col)` under the prevailing RUNNING/FINAL semantics (NULL if `A` is
-  unbound); `eval` reads it directly only when the row being evaluated is itself
-  bound to `A`, which is how nav/aggregate scopes pin their row.
+  unbound); `eval` reads it directly only when the row being evaluated is
+  **covered by** the label — `Frame::label_covers`, which is subset-aware. An
+  equality test there silently broke `array_agg(U.col)`, since a member variable
+  is not equal to the union's name.
+- SUBSET union variables live in `Frame::subsets`; a label matches a bound row if
+  it is the same variable or a subset listing it. `CLASSIFIER` resolves from the
+  tape (`var_at_tp`), not from `cur_var`, so it stays right when a navigation pins
+  `cur_var` to a qualifier.
+- Labels are canonical: unquoted -> UPPER, double-quoted -> as written, and
+  comparisons are then **exact**. `plan::resolve_var` maps a written name (a JSON
+  key or an expression reference) to the canonical one, exact match first.
+- `Ty` is NOT `Copy` (it owns `List`'s element type); clone it.
+- The worker buffers only `Plan::referenced_columns()`. Buffering volume dominates
+  runtime — one unused 200-byte column measured 2.8x on 2M rows.
+- `mr-worker/src/buffer.rs` owns the scan-cursor convention. Backends promise only
+  *monotonic* ids: SQLite starts at 1, the fs store at 0, so paging from
+  `after_id = 0` silently dropped the first batch. Start below every id.
+  `tests/storage_probe.rs` round-trips every backend through the real helper.
 - Empty matches (zero bound rows) ARE reported and DO consume a match number, per
   SQL:2016 — one row positioned on the row the match sits on, with every measure
   evaluated over an empty frame (`CLASSIFIER()`/navigation NULL, `COUNT(*)` 0).

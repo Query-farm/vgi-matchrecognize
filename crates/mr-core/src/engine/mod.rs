@@ -4,8 +4,9 @@
 pub mod eval;
 pub mod matcher;
 pub mod rowstore;
+pub mod scalar;
 pub mod valops;
 
-pub use eval::{Bind, Frame};
+pub use eval::{Bind, Frame, SubsetMap};
 pub use matcher::{AfterSkip, Match, Matcher};
 pub use rowstore::{RowStore, VecRowStore};

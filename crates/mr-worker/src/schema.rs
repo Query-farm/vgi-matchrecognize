@@ -18,26 +18,33 @@ pub fn arrow_to_ty(dt: &DataType) -> Option<Ty> {
         Time32(u) | Time64(u) => Ty::Time(from_arrow_unit(u)),
         Decimal128(p, s) => Ty::Decimal(*p, *s),
         Interval(_) | Duration(_) => Ty::Interval,
+        List(f) | LargeList(f) => Ty::List(Box::new(arrow_to_ty(f.data_type())?)),
         _ => return None,
     })
 }
 
 /// Map a core [`Ty`] to the Arrow `DataType` emitted in the output schema.
-pub fn ty_to_arrow(ty: Ty) -> DataType {
+pub fn ty_to_arrow(ty: &Ty) -> DataType {
     match ty {
         Ty::Boolean => DataType::Boolean,
         Ty::Int64 => DataType::Int64,
         Ty::HugeInt => DataType::Decimal128(38, 0),
         Ty::Double => DataType::Float64,
-        Ty::Decimal(p, s) => DataType::Decimal128(p, s),
+        Ty::Decimal(p, s) => DataType::Decimal128(*p, *s),
         Ty::Varchar => DataType::Utf8,
         Ty::Date => DataType::Date32,
-        Ty::Timestamp(u) => DataType::Timestamp(to_arrow_unit(u), None),
+        Ty::Timestamp(u) => DataType::Timestamp(to_arrow_unit(*u), None),
         Ty::Time(u) => match u {
-            TimeUnit::Second | TimeUnit::Milli => DataType::Time32(to_arrow_unit(u)),
-            TimeUnit::Micro | TimeUnit::Nano => DataType::Time64(to_arrow_unit(u)),
+            TimeUnit::Second | TimeUnit::Milli => DataType::Time32(to_arrow_unit(*u)),
+            TimeUnit::Micro | TimeUnit::Nano => DataType::Time64(to_arrow_unit(*u)),
         },
         Ty::Interval => DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
+        // DuckDB reads an Arrow list as `elem[]`; the child field is nullable.
+        Ty::List(elem) => DataType::List(std::sync::Arc::new(Field::new(
+            "item",
+            ty_to_arrow(elem),
+            true,
+        ))),
         // Should never reach output; fall back to a nullable Utf8.
         Ty::Null => DataType::Utf8,
     }
@@ -92,6 +99,6 @@ impl BindSchema for ArrowBindSchema {
 }
 
 /// A nullable output `Field` for a column.
-pub fn output_field(name: &str, ty: Ty) -> Field {
+pub fn output_field(name: &str, ty: &Ty) -> Field {
     Field::new(name, ty_to_arrow(ty), true)
 }

@@ -149,7 +149,9 @@ def parse_output(text, n):
 
 def main():
     cases = json.load(open(sys.argv[1]))
-    runnable = [c for c in cases if c.get("translated")]
+    # `failure` cases assert Trino's own error text, which is not a portable
+    # conformance signal; they are counted as skipped rather than run.
+    runnable = [c for c in cases if c.get("translated") and c["kind"] != "failure"]
     script = build_script(runnable)
     open("conformance.sql", "w").write(script)
     text = run(script)

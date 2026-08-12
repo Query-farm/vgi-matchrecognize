@@ -28,7 +28,13 @@ pub struct Frame<'a> {
     /// Number of binds visible under RUNNING semantics (current index + 1).
     pub horizon: usize,
     pub match_number: i64,
+    /// SUBSET name -> member variables. A qualifier naming a subset matches any
+    /// of its members, so `U.price` and `COUNT(U.*)` range over all of them.
+    pub subsets: &'a SubsetMap,
 }
+
+/// SUBSET declarations: union-variable name -> the pattern variables it covers.
+pub type SubsetMap = std::collections::HashMap<String, Vec<String>>;
 
 impl<'a> Frame<'a> {
     /// Evaluate a measure expression. `final_default` is FINAL for ONE ROW PER
@@ -80,13 +86,28 @@ impl<'a> Frame<'a> {
             .map(|i| binds[i].var.clone())
     }
 
-    /// Tape position of the last visible row bound to `var` (logical `LAST`).
-    fn last_bind_of(&self, var: &str, final_sem: bool) -> Option<usize> {
+    /// Whether a row bound to `bound` is covered by the label `label` — either the
+    /// same variable, or a SUBSET that lists it.
+    fn label_covers(&self, label: &str, bound: &str) -> bool {
+        if label == bound {
+            return true;
+        }
+        self.subsets
+            .get(label)
+            .is_some_and(|members| members.iter().any(|m| m == bound))
+    }
+
+    /// The last visible bind covered by `label` (logical `LAST` of that label).
+    fn last_bind_labelled(&self, label: &str, final_sem: bool) -> Option<&Bind> {
         self.visible(final_sem)
             .iter()
             .rev()
-            .find(|b| b.var.eq_ignore_ascii_case(var))
-            .map(|b| b.tape_pos)
+            .find(|b| self.label_covers(label, &b.var))
+    }
+
+    /// Tape position of the last visible row bound to `var` (logical `LAST`).
+    fn last_bind_of(&self, var: &str, final_sem: bool) -> Option<usize> {
+        self.last_bind_labelled(var, final_sem).map(|b| b.tape_pos)
     }
 
     fn col_value(&self, name: &str, tp: usize) -> Result<Value> {
@@ -137,7 +158,7 @@ impl<'a> Frame<'a> {
             // their row, and it also makes `B.col` inside `DEFINE[B]` mean the
             // candidate row.
             Expr::Qualified(var, col) => {
-                if cur_var.is_some_and(|cv| cv.eq_ignore_ascii_case(var)) {
+                if cur_var.is_some_and(|cv| self.label_covers(var, cv)) {
                     self.col_value(col, cur_tp)
                 } else {
                     match self.last_bind_of(var, final_sem) {
@@ -146,9 +167,28 @@ impl<'a> Frame<'a> {
                     }
                 }
             }
-            Expr::Classifier => Ok(cur_var
-                .map(|v| Value::Str(v.to_string()))
+            // The classifier of the row this reference resolves to. Reading it
+            // from the tape rather than `cur_var` keeps it correct when a
+            // navigation has pinned `cur_var` to a qualifier.
+            Expr::Classifier(None) => Ok(self
+                .var_at_tp(cur_tp, final_sem)
+                .or_else(|| cur_var.map(|v| v.to_string()))
+                .map(Value::Str)
                 .unwrap_or(Value::Null)),
+            // `CLASSIFIER(label)`: the last visible row covered by that label.
+            Expr::Classifier(Some(label)) => {
+                // Inside a FIRST/LAST/aggregate scope walk the row is already
+                // pinned to a member of the label, so report that row.
+                if let Some(v) = self.var_at_tp(cur_tp, final_sem) {
+                    if self.label_covers(label, &v) {
+                        return Ok(Value::Str(v));
+                    }
+                }
+                Ok(self
+                    .last_bind_labelled(label, final_sem)
+                    .map(|b| Value::Str(b.var.clone()))
+                    .unwrap_or(Value::Null))
+            }
             Expr::MatchNumber => Ok(Value::Int(self.match_number)),
             Expr::RunningFinal { final_, inner } => self.eval(inner, cur_tp, cur_var, *final_),
             Expr::Neg(x) => valops::negate(&self.eval(x, cur_tp, cur_var, final_sem)?),
@@ -214,7 +254,14 @@ impl<'a> Frame<'a> {
             }
             Expr::Cast { expr, ty } => {
                 let v = self.eval(expr, cur_tp, cur_var, final_sem)?;
-                valops::coerce(v, *ty)
+                valops::coerce(v, ty)
+            }
+            Expr::Call { name, args } => {
+                let vals = args
+                    .iter()
+                    .map(|a| self.eval(a, cur_tp, cur_var, final_sem))
+                    .collect::<Result<Vec<_>>>()?;
+                super::scalar::call(name, &vals)
             }
             Expr::Nav { kind, arg, offset } => {
                 self.eval_nav(*kind, arg, *offset, cur_tp, final_sem)
@@ -341,7 +388,7 @@ impl<'a> Frame<'a> {
             (AggKind::Count, AggArg::QualStar(var)) => {
                 let n = visible
                     .iter()
-                    .filter(|b| b.var.eq_ignore_ascii_case(var))
+                    .filter(|b| self.label_covers(var, &b.var))
                     .count();
                 Ok(Value::Int(n as i64))
             }
@@ -363,6 +410,11 @@ impl<'a> Frame<'a> {
                     AggKind::Avg => fold_avg(&vals),
                     AggKind::Min => fold_extreme(&vals, true),
                     AggKind::Max => fold_extreme(&vals, false),
+                    // The matched values in match order. Unlike the other
+                    // aggregates this is empty rather than NULL over no rows,
+                    // which is what makes a RUNNING array_agg grow row by row.
+                    AggKind::ArrayAgg => Ok(Value::List(vals)),
+                    AggKind::Arbitrary => Ok(vals.into_iter().next().unwrap_or(Value::Null)),
                 }
             }
         }
@@ -375,7 +427,7 @@ impl<'a> Frame<'a> {
         self.visible(final_sem)
             .iter()
             .filter(|b| match &qual {
-                Some(v) => b.var.eq_ignore_ascii_case(v),
+                Some(v) => self.label_covers(v, &b.var),
                 None => true,
             })
             .cloned()
@@ -394,6 +446,8 @@ fn dominant_qualifier(e: &Expr) -> Option<String> {
             dominant_qualifier(lhs).or_else(|| dominant_qualifier(rhs))
         }
         Expr::Nav { arg, .. } => dominant_qualifier(arg),
+        Expr::Call { args, .. } => args.iter().find_map(dominant_qualifier),
+        Expr::Classifier(label) => label.clone(),
         Expr::Agg {
             arg: AggArg::Expr(x),
             ..

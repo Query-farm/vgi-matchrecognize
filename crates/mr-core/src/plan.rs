@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use crate::engine::matcher::{AfterSkip, Matcher};
-use crate::engine::{Frame, RowStore};
+use crate::engine::{Frame, RowStore, SubsetMap};
 use crate::error::{MrError, Result};
-use crate::expr::ast::Expr;
+use crate::expr::ast::{AggArg, Expr};
 use crate::expr::parser::{parse as parse_expr, parse_type_name};
 use crate::pattern::compile::{compile, Program};
 use crate::pattern::parser::{parse as parse_pattern, Pattern};
@@ -56,6 +56,9 @@ pub struct PlanConfig {
     /// would contribute. Ignored for ONE ROW PER MATCH, which always reports
     /// empty matches. Default `false` (SQL:2016 SHOW EMPTY MATCHES).
     pub omit_empty_matches: bool,
+    /// SUBSET declarations as a JSON object mapping a union-variable name to its
+    /// member pattern variables, e.g. `{"U": ["A", "B"]}`. Empty means none.
+    pub subset_json: String,
     /// Raw AFTER MATCH SKIP string (`"past last row"`, `"to first A"`, …).
     pub after: String,
     /// Per-partition matcher step budget. `None` scales it with the partition's
@@ -90,6 +93,7 @@ pub struct OutputColumn {
 pub struct Plan {
     program: Program,
     define: HashMap<String, Expr>,
+    subsets: SubsetMap,
     measures: Vec<Measure>,
     partition_by: Vec<String>,
     order_by: Vec<OrderKey>,
@@ -111,11 +115,19 @@ impl Plan {
         let program = compile(&pattern)?;
         let vars = pattern.variables();
 
-        // DEFINE.
-        let define = parse_define(&cfg.define_json, &vars)?;
+        // SUBSET. Union variables are usable anywhere a pattern variable is, so
+        // the label universe that DEFINE/MEASURES resolve against is the pattern
+        // variables plus the subset names.
+        let subsets = parse_subsets(&cfg.subset_json, &vars)?;
+        let mut labels = vars.clone();
+        labels.extend(subsets.keys().cloned());
+
+        // DEFINE. Only real pattern variables may be defined, but a predicate may
+        // reference subsets.
+        let define = parse_define(&cfg.define_json, &vars, &labels)?;
 
         // MEASURES.
-        let measures = parse_measures(cfg.measures_json.as_deref(), schema)?;
+        let measures = parse_measures(cfg.measures_json.as_deref(), schema, &labels)?;
 
         // ORDER BY (required).
         if cfg.order_by.is_empty() {
@@ -139,7 +151,7 @@ impl Plan {
         }
 
         // AFTER MATCH SKIP.
-        let after = parse_after(&cfg.after, &vars)?;
+        let after = parse_after(&cfg.after, &labels)?;
 
         if cfg.step_budget.is_some_and(|b| b <= 0) {
             return Err(MrError::Bind("step_budget must be positive".into()));
@@ -181,13 +193,14 @@ impl Plan {
         for m in &measures {
             output_columns.push(OutputColumn {
                 name: m.name.clone(),
-                ty: m.ty,
+                ty: m.ty.clone(),
             });
         }
 
         Ok(Plan {
             program,
             define,
+            subsets,
             measures,
             partition_by: cfg.partition_by.clone(),
             order_by,
@@ -209,6 +222,38 @@ impl Plan {
     /// The measures (for diagnostics / tests).
     pub fn measures(&self) -> &[Measure] {
         &self.measures
+    }
+
+    /// Every input column this plan reads: the partition and order keys plus every
+    /// column referenced by a DEFINE predicate or a MEASURES expression.
+    ///
+    /// The worker projects buffered batches down to these before writing them to
+    /// storage. Buffering volume dominates runtime — a single unused 200-byte
+    /// column measured 2.8x on a 2M-row query — so carrying columns the pattern
+    /// never reads is the most expensive thing this function can do.
+    ///
+    /// Names are returned as written in the input schema's terms (matching is
+    /// case-insensitive, as elsewhere), de-duplicated, order not significant.
+    pub fn referenced_columns(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let add = |name: &str, out: &mut Vec<String>| {
+            if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                out.push(name.to_string());
+            }
+        };
+        for c in &self.partition_by {
+            add(c, &mut out);
+        }
+        for k in &self.order_by {
+            add(&k.col, &mut out);
+        }
+        for e in self.define.values() {
+            collect_columns(e, &mut out);
+        }
+        for m in &self.measures {
+            collect_columns(&m.expr, &mut out);
+        }
+        out
     }
 
     /// Produce-time: group into partitions, sort each, match, and emit output
@@ -252,6 +297,7 @@ impl Plan {
             store,
             tape,
             &self.define,
+            &self.subsets,
             &self.after,
             self.step_budget
                 .unwrap_or_else(|| auto_step_budget(tape.len())),
@@ -295,6 +341,7 @@ impl Plan {
             binds: &m.binds,
             horizon: m.binds.len(),
             match_number: m.match_number,
+            subsets: &self.subsets,
         };
         let mut row = Vec::with_capacity(self.output_columns.len());
         let anchor_tape = m.binds.first().map(|b| b.tape_pos).unwrap_or(m.start);
@@ -303,7 +350,7 @@ impl Plan {
         }
         for meas in &self.measures {
             let v = frame.eval_measure(&meas.expr, true)?;
-            row.push(crate::engine::valops::coerce(v, meas.ty)?);
+            row.push(crate::engine::valops::coerce(v, &meas.ty)?);
         }
         Ok(row)
     }
@@ -324,6 +371,7 @@ impl Plan {
             binds: &m.binds,
             horizon: 0,
             match_number: m.match_number,
+            subsets: &self.subsets,
         };
         let mut row = Vec::with_capacity(self.output_columns.len());
         for c in &self.partition_by {
@@ -345,7 +393,7 @@ impl Plan {
             // FINAL for ONE ROW PER MATCH, RUNNING for ALL ROWS — the same default
             // the non-empty paths use. Over an empty match the two coincide.
             let v = frame.eval_measure(&meas.expr, !self.rows_all)?;
-            row.push(crate::engine::valops::coerce(v, meas.ty)?);
+            row.push(crate::engine::valops::coerce(v, &meas.ty)?);
         }
         Ok(row)
     }
@@ -363,6 +411,7 @@ impl Plan {
             binds: &m.binds,
             horizon: k + 1,
             match_number: m.match_number,
+            subsets: &self.subsets,
         };
         let row_tape = m.binds[k].tape_pos;
         let mut row = Vec::with_capacity(self.output_columns.len());
@@ -380,7 +429,7 @@ impl Plan {
         }
         for meas in &self.measures {
             let v = frame.eval_measure(&meas.expr, false)?;
-            row.push(crate::engine::valops::coerce(v, meas.ty)?);
+            row.push(crate::engine::valops::coerce(v, &meas.ty)?);
         }
         Ok(row)
     }
@@ -534,7 +583,7 @@ fn parse_after(s: &str, vars: &[String]) -> Result<AfterSkip> {
         return Ok(AfterSkip::ToNextRow);
     }
     let resolve = |var: &str| -> Result<String> {
-        let v = var.to_ascii_uppercase();
+        let v = resolve_var(var, vars).unwrap_or_else(|| var.to_ascii_uppercase());
         if vars.iter().any(|x| x.eq_ignore_ascii_case(&v)) {
             Ok(v)
         } else {
@@ -555,7 +604,7 @@ fn parse_after(s: &str, vars: &[String]) -> Result<AfterSkip> {
     )))
 }
 
-fn parse_define(json: &str, vars: &[String]) -> Result<HashMap<String, Expr>> {
+fn parse_define(json: &str, vars: &[String], labels: &[String]) -> Result<HashMap<String, Expr>> {
     let trimmed = json.trim();
     let map: serde_json::Map<String, serde_json::Value> = if trimmed.is_empty() {
         serde_json::Map::new()
@@ -568,23 +617,200 @@ fn parse_define(json: &str, vars: &[String]) -> Result<HashMap<String, Expr>> {
         let pred = v
             .as_str()
             .ok_or_else(|| MrError::Bind(format!("define['{k}'] must be a string predicate")))?;
-        let var = k.to_ascii_uppercase();
-        let expr = parse_expr(pred)?;
-        out.insert(var, expr);
-    }
-    // Warn-style validation: every DEFINE var should be in the pattern. We make
-    // it an error to catch typos early.
-    for k in out.keys() {
-        if !vars.iter().any(|x| x.eq_ignore_ascii_case(k)) {
-            return Err(MrError::Bind(format!(
+        // Catch typos early: a DEFINE key must name a variable the pattern declares.
+        let var = resolve_var(&k, vars).ok_or_else(|| {
+            MrError::Bind(format!(
                 "define variable '{k}' does not appear in the pattern"
-            )));
-        }
+            ))
+        })?;
+        let mut expr = parse_expr(pred)?;
+        canonicalize_vars(&mut expr, labels)?;
+        out.insert(var, expr);
     }
     Ok(out)
 }
 
-fn parse_measures(json: Option<&str>, schema: &dyn BindSchema) -> Result<Vec<Measure>> {
+/// Collect every column name `e` reads, appending to `out` without duplicates.
+fn collect_columns(e: &Expr, out: &mut Vec<String>) {
+    let push = |name: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            out.push(name.to_string());
+        }
+    };
+    match e {
+        Expr::Col(name) => push(name, out),
+        Expr::Qualified(_, col) => push(col, out),
+        Expr::Nav { arg, .. } => collect_columns(arg, out),
+        Expr::RunningFinal { inner, .. } => collect_columns(inner, out),
+        Expr::Neg(x) | Expr::Not(x) | Expr::Cast { expr: x, .. } => collect_columns(x, out),
+        Expr::IsNull { expr, .. } => collect_columns(expr, out),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_columns(lhs, out);
+            collect_columns(rhs, out);
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            collect_columns(expr, out);
+            collect_columns(lo, out);
+            collect_columns(hi, out);
+        }
+        Expr::In { expr, list, .. } => {
+            collect_columns(expr, out);
+            for it in list {
+                collect_columns(it, out);
+            }
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                collect_columns(a, out);
+            }
+        }
+        Expr::Agg { arg, .. } => match arg {
+            AggArg::Expr(x) => collect_columns(x, out),
+            // `COUNT(*)` / `COUNT(A.*)` read no column values, only bindings.
+            AggArg::Star | AggArg::QualStar(_) => {}
+        },
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Double(_)
+        | Expr::Str(_)
+        | Expr::Interval { .. }
+        | Expr::Classifier(_)
+        | Expr::MatchNumber => {}
+    }
+}
+
+/// Resolve a written pattern-variable name to its canonical spelling.
+///
+/// An unquoted label canonicalizes to upper case; a double-quoted one keeps its
+/// exact spelling. So a written name is matched **exactly first**, then as an
+/// unquoted (upper-cased) name — which makes `define {"b": …}` mean the quoted
+/// label `b` when the pattern declares one, and the ordinary label `B` otherwise.
+fn resolve_var(written: &str, vars: &[String]) -> Option<String> {
+    if vars.iter().any(|v| v == written) {
+        return Some(written.to_string());
+    }
+    let upper = written.to_ascii_uppercase();
+    vars.iter().find(|v| **v == upper).cloned()
+}
+
+/// Rewrite every pattern-variable reference in `e` to its canonical spelling, so
+/// the evaluator can compare names exactly (quoted labels are case-sensitive).
+fn canonicalize_vars(e: &mut Expr, vars: &[String]) -> Result<()> {
+    let fix = |name: &mut String| -> Result<()> {
+        match resolve_var(name, vars) {
+            Some(c) => {
+                *name = c;
+                Ok(())
+            }
+            None => Err(MrError::Bind(format!(
+                "'{name}' is not a pattern variable (declared: {})",
+                vars.join(", ")
+            ))),
+        }
+    };
+    match e {
+        Expr::Qualified(var, _) => fix(var)?,
+        Expr::Agg {
+            arg: AggArg::QualStar(var),
+            ..
+        } => fix(var)?,
+        Expr::Agg {
+            arg: AggArg::Expr(x),
+            ..
+        } => canonicalize_vars(x, vars)?,
+        Expr::Nav { arg, .. } => canonicalize_vars(arg, vars)?,
+        Expr::RunningFinal { inner, .. } => canonicalize_vars(inner, vars)?,
+        Expr::Neg(x) | Expr::Not(x) | Expr::Cast { expr: x, .. } => canonicalize_vars(x, vars)?,
+        Expr::IsNull { expr, .. } => canonicalize_vars(expr, vars)?,
+        Expr::Binary { lhs, rhs, .. } => {
+            canonicalize_vars(lhs, vars)?;
+            canonicalize_vars(rhs, vars)?;
+        }
+        Expr::Between { expr, lo, hi, .. } => {
+            canonicalize_vars(expr, vars)?;
+            canonicalize_vars(lo, vars)?;
+            canonicalize_vars(hi, vars)?;
+        }
+        Expr::In { expr, list, .. } => {
+            canonicalize_vars(expr, vars)?;
+            for it in list {
+                canonicalize_vars(it, vars)?;
+            }
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                canonicalize_vars(a, vars)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The SUBSET names declared in `subset_json`, canonicalized — the worker adds
+/// these to the label set its bind schema type-checks qualifiers against.
+pub fn subset_names(subset_json: &str) -> Result<Vec<String>> {
+    let trimmed = subset_json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(trimmed)
+        .map_err(|e| MrError::Bind(format!("subset is not a JSON object: {e}")))?;
+    Ok(map.keys().map(|k| k.to_ascii_uppercase()).collect())
+}
+
+/// Parse the `subset` argument: `{"U": ["A", "B"], …}`.
+fn parse_subsets(json: &str, vars: &[String]) -> Result<SubsetMap> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(SubsetMap::new());
+    }
+    let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(trimmed)
+        .map_err(|e| MrError::Bind(format!("subset is not a JSON object: {e}")))?;
+    let mut out = SubsetMap::new();
+    for (name, v) in map {
+        // A subset name canonicalizes like any label, and must not collide with a
+        // pattern variable (it would be ambiguous in a qualifier).
+        let canon = if vars.contains(&name) {
+            return Err(MrError::Bind(format!(
+                "subset '{name}' collides with a pattern variable of the same name"
+            )));
+        } else {
+            name.to_ascii_uppercase()
+        };
+        let arr = v.as_array().ok_or_else(|| {
+            MrError::Bind(format!(
+                "subset['{name}'] must be an array of pattern variable names"
+            ))
+        })?;
+        if arr.is_empty() {
+            return Err(MrError::Bind(format!("subset['{name}'] is empty")));
+        }
+        let mut members = Vec::new();
+        for m in arr {
+            let raw = m.as_str().ok_or_else(|| {
+                MrError::Bind(format!("subset['{name}'] members must be strings"))
+            })?;
+            let member = resolve_var(raw, vars).ok_or_else(|| {
+                MrError::Bind(format!(
+                    "subset['{name}'] member '{raw}' does not appear in the pattern"
+                ))
+            })?;
+            if !members.contains(&member) {
+                members.push(member);
+            }
+        }
+        out.insert(canon, members);
+    }
+    Ok(out)
+}
+
+fn parse_measures(
+    json: Option<&str>,
+    schema: &dyn BindSchema,
+    vars: &[String],
+) -> Result<Vec<Measure>> {
     let json = match json {
         Some(s) if !s.trim().is_empty() => s,
         _ => return Ok(Vec::new()),
@@ -609,7 +835,8 @@ fn parse_measures(json: Option<&str>, schema: &dyn BindSchema) -> Result<Vec<Mea
                     .get("expr")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| MrError::Bind(format!("measures[{i}] needs an 'expr'")))?;
-                let expr = parse_expr(expr_s)?;
+                let mut expr = parse_expr(expr_s)?;
+                canonicalize_vars(&mut expr, vars)?;
                 let ty = match obj.get("type").and_then(|v| v.as_str()) {
                     Some(t) => parse_type_name(t)?,
                     None => resolve_measure_ty(&expr, schema, &name)?,
@@ -623,7 +850,8 @@ fn parse_measures(json: Option<&str>, schema: &dyn BindSchema) -> Result<Vec<Mea
                 let expr_s = v.as_str().ok_or_else(|| {
                     MrError::Bind(format!("measures['{name}'] must be a string expression"))
                 })?;
-                let expr = parse_expr(expr_s)?;
+                let mut expr = parse_expr(expr_s)?;
+                canonicalize_vars(&mut expr, vars)?;
                 let ty = resolve_measure_ty(&expr, schema, &name)?;
                 measures.push(Measure { name, expr, ty });
             }

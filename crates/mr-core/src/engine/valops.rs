@@ -110,6 +110,20 @@ fn concat(l: &Value, r: &Value) -> Value {
 /// A display string for a value (used by `||` and CAST-to-VARCHAR).
 pub fn to_string(v: &Value) -> String {
     match v {
+        // A list renders like DuckDB's list literal: [a, b, c].
+        Value::List(items) => {
+            let inner: Vec<String> = items
+                .iter()
+                .map(|i| {
+                    if i.is_null() {
+                        "NULL".to_string()
+                    } else {
+                        to_string(i)
+                    }
+                })
+                .collect();
+            format!("[{}]", inner.join(", "))
+        }
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
@@ -262,7 +276,7 @@ pub fn negate(v: &Value) -> Result<Value> {
 }
 
 /// Coerce a value to a target type (CAST and final output coercion).
-pub fn coerce(v: Value, ty: Ty) -> Result<Value> {
+pub fn coerce(v: Value, ty: &Ty) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
@@ -297,8 +311,8 @@ pub fn coerce(v: Value, ty: Ty) -> Result<Value> {
             let f = v
                 .as_f64()
                 .ok_or_else(|| MrError::Eval(format!("cannot cast {v:?} to DECIMAL")))?;
-            let unscaled = (f * 10f64.powi(s as i32)).round() as i128;
-            Ok(Value::Decimal(unscaled, s))
+            let unscaled = (f * 10f64.powi(*s as i32)).round() as i128;
+            Ok(Value::Decimal(unscaled, *s))
         }
         Ty::Varchar => Ok(Value::Str(to_string(&v))),
         Ty::Date => match v {
@@ -316,6 +330,16 @@ pub fn coerce(v: Value, ty: Ty) -> Result<Value> {
         Ty::Interval => match v {
             Value::Interval(_) => Ok(v),
             other => Err(MrError::Eval(format!("cannot cast {other:?} to INTERVAL"))),
+        },
+        // A list coerces element-wise; a scalar is not a list.
+        Ty::List(elem) => match v {
+            Value::List(items) => Ok(Value::List(
+                items
+                    .into_iter()
+                    .map(|it| coerce(it, elem))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            other => Err(MrError::Eval(format!("cannot cast {other:?} to a LIST"))),
         },
         Ty::Null => Ok(Value::Null),
     }

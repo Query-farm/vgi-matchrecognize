@@ -36,6 +36,7 @@ fn cfg(pattern: &str, define: &str, measures: &str, budget: Option<i64>) -> Plan
     PlanConfig {
         pattern: pattern.into(),
         define_json: define.into(),
+        subset_json: String::new(),
         measures_json: Some(measures.into()),
         partition_by: vec![],
         order_by: vec!["x".into()],

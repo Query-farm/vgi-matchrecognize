@@ -15,6 +15,7 @@
 
 mod arrow_in;
 mod arrow_out;
+pub mod buffer;
 mod catalog;
 mod match_recognize;
 mod meta;
