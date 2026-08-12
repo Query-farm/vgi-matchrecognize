@@ -458,17 +458,26 @@ impl Plan {
             .collect::<Result<_>>()?;
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        // One reused buffer, one hash lookup, and an allocation only when a new
+        // group appears. Building a `Vec<String>` and joining it per row — then
+        // cloning the key twice and looking it up twice — cost about four
+        // allocations and two lookups on every row of the input.
+        let mut key = String::new();
         for r in 0..n {
-            let key = idxs
-                .iter()
-                .map(|&ci| key_part(&store.cell(r, ci)))
-                .collect::<Vec<_>>()
-                .join("\u{1}");
-            groups.entry(key.clone()).or_insert_with(|| {
-                order.push(key.clone());
-                Vec::new()
-            });
-            groups.get_mut(&key).unwrap().push(r);
+            key.clear();
+            for (j, &ci) in idxs.iter().enumerate() {
+                if j > 0 {
+                    key.push('\u{1}');
+                }
+                write_key_part(&mut key, &store.cell(r, ci));
+            }
+            match groups.get_mut(&key) {
+                Some(rows) => rows.push(r),
+                None => {
+                    order.push(key.clone());
+                    groups.insert(key.clone(), vec![r]);
+                }
+            }
         }
         Ok(order
             .into_iter()
@@ -491,13 +500,11 @@ impl Plan {
                     .map(|ci| (ci, k.desc, k.nulls_first))
             })
             .collect::<Result<_>>()?;
-        // Stable sort by successive keys.
+        // Stable sort by successive keys. Comparison goes through the store rather
+        // than materializing a `Value` per comparison — see `RowStore::cmp_cells`.
         tape.sort_by(|&a, &b| {
             for &(ci, desc, nulls_first) in &keys {
-                let va = store.cell(a, ci);
-                let vb = store.cell(b, ci);
-                let ord = cmp_with_nulls(&va, &vb, nulls_first);
-                let ord = if desc { ord.reverse() } else { ord };
+                let ord = store.cmp_cells(a, b, ci, desc, nulls_first);
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -508,33 +515,13 @@ impl Plan {
     }
 }
 
-fn cmp_with_nulls(a: &Value, b: &Value, nulls_first: bool) -> std::cmp::Ordering {
-    use std::cmp::Ordering::*;
-    match (a.is_null(), b.is_null()) {
-        (true, true) => Equal,
-        (true, false) => {
-            if nulls_first {
-                Less
-            } else {
-                Greater
-            }
-        }
-        (false, true) => {
-            if nulls_first {
-                Greater
-            } else {
-                Less
-            }
-        }
-        (false, false) => crate::engine::valops::compare(a, b).unwrap_or(Equal),
-    }
-}
-
 /// A stable key fragment for a partition value.
-fn key_part(v: &Value) -> String {
+fn write_key_part(out: &mut String, v: &Value) {
     match v {
-        Value::Null => "\u{0}NULL".to_string(),
-        other => crate::engine::valops::to_string(other),
+        // A sentinel that no rendered value can produce, so NULL groups with NULL
+        // and with nothing else.
+        Value::Null => out.push_str("\u{0}NULL"),
+        other => out.push_str(&crate::engine::valops::to_string(other)),
     }
 }
 
@@ -564,8 +551,9 @@ fn parse_order_key(spec: &str, schema: &dyn BindSchema) -> Result<OrderKey> {
     if schema.col_ty(&col).is_none() {
         return Err(MrError::Bind(format!("order_by column '{col}' not found")));
     }
-    // Default NULLS ordering follows DuckDB: NULLS LAST for ASC, FIRST for DESC.
-    let nulls_first = nulls_first.unwrap_or(desc);
+    // Default NULLS ordering follows DuckDB, which sorts NULLs last in *both*
+    // directions (verified: `ORDER BY k DESC` yields [2, 1, NULL]).
+    let nulls_first = nulls_first.unwrap_or(false);
     Ok(OrderKey {
         col,
         desc,

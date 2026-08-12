@@ -19,6 +19,7 @@ use arrow_schema::{DataType, IntervalUnit, SchemaRef, TimeUnit as ArrowTimeUnit}
 use mr_core::engine::RowStore;
 use mr_core::types::{TimeUnit, Ty};
 use mr_core::value::{Interval, Value};
+use std::cmp::Ordering;
 
 use crate::schema::arrow_to_ty;
 
@@ -98,6 +99,97 @@ impl RowStore for BatchRowStore {
             return Value::Null;
         }
         cell_value(arr, r)
+    }
+
+    /// Compare in place, without building a [`Value`].
+    ///
+    /// Sorting calls this O(n log n) times. The default trait implementation
+    /// materializes both cells, which for a `Utf8` key means a `String` allocation
+    /// per comparison — measured at roughly twice the cost of a `BIGINT` key over
+    /// 1.6M rows. The typed arms below read the underlying buffers directly;
+    /// anything not covered falls back to the materializing default.
+    fn cmp_cells(&self, a: usize, b: usize, col: usize, desc: bool, nulls_first: bool) -> Ordering {
+        let (ba, ra) = self.locate(a);
+        let (bb, rb) = self.locate(b);
+        let aa = self.batches[ba].column(col);
+        let ab = self.batches[bb].column(col);
+        // NULL ordering first: it is the same for every type.
+        match (aa.is_null(ra), ab.is_null(rb)) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => {
+                return if nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                return if nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {}
+        }
+        let ord = match aa.data_type() {
+            DataType::Int64 => aa
+                .as_primitive::<Int64Type>()
+                .value(ra)
+                .cmp(&ab.as_primitive::<Int64Type>().value(rb)),
+            DataType::Int32 => aa
+                .as_primitive::<Int32Type>()
+                .value(ra)
+                .cmp(&ab.as_primitive::<Int32Type>().value(rb)),
+            DataType::Date32 => aa
+                .as_primitive::<Date32Type>()
+                .value(ra)
+                .cmp(&ab.as_primitive::<Date32Type>().value(rb)),
+            DataType::Utf8 => aa
+                .as_string::<i32>()
+                .value(ra)
+                .cmp(ab.as_string::<i32>().value(rb)),
+            DataType::LargeUtf8 => aa
+                .as_string::<i64>()
+                .value(ra)
+                .cmp(ab.as_string::<i64>().value(rb)),
+            DataType::Utf8View => aa
+                .as_string_view()
+                .value(ra)
+                .cmp(ab.as_string_view().value(rb)),
+            DataType::Float64 => aa
+                .as_primitive::<Float64Type>()
+                .value(ra)
+                .total_cmp(&ab.as_primitive::<Float64Type>().value(rb)),
+            // Same unit by construction (one column, one type), so the raw ticks
+            // order identically to the decoded timestamps.
+            DataType::Timestamp(ArrowTimeUnit::Microsecond, _) => aa
+                .as_primitive::<TimestampMicrosecondType>()
+                .value(ra)
+                .cmp(&ab.as_primitive::<TimestampMicrosecondType>().value(rb)),
+            DataType::Timestamp(ArrowTimeUnit::Nanosecond, _) => aa
+                .as_primitive::<TimestampNanosecondType>()
+                .value(ra)
+                .cmp(&ab.as_primitive::<TimestampNanosecondType>().value(rb)),
+            DataType::Decimal128(_, _) => aa
+                .as_primitive::<Decimal128Type>()
+                .value(ra)
+                .cmp(&ab.as_primitive::<Decimal128Type>().value(rb)),
+            // Uncommon types: fall back to materializing, which is still correct.
+            // Both cells are non-NULL here, so the direction and NULL placement are
+            // applied below rather than inside the fallback.
+            _ => mr_core::engine::valops::cmp_for_sort(
+                &self.cell(a, col),
+                &self.cell(b, col),
+                false,
+                nulls_first,
+            ),
+        };
+        if desc {
+            ord.reverse()
+        } else {
+            ord
+        }
     }
 }
 

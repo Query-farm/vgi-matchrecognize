@@ -1,0 +1,80 @@
+# name: test/sql/sorting.test
+# description: ORDER BY correctness through the worker: far-future timestamps, NULL placement, DESC.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# Microsecond ticks past ~year 2262 used to wrap when rescaled in i64, so
+# TIMESTAMP '9999-12-31' sorted BEFORE 2020 and the tape came out reversed. `pos`
+# is the RUNNING COUNT, i.e. the row's position in the tape, so it pins the order
+# the matcher actually saw rather than the order the outer query displays.
+query II
+SELECT ts, pos
+FROM mr.match_recognize(
+       (SELECT * FROM (VALUES
+          (TIMESTAMP '2026-01-01 00:00:00'),
+          (TIMESTAMP '9999-12-31 00:00:00'),
+          (TIMESTAMP '2020-01-01 00:00:00')
+        ) AS t(ts)),
+       order_by := ['ts'],
+       pattern  := 'A+',
+       define   := '{}',
+       measures := '{"pos":"RUNNING COUNT(*)"}',
+       rows     := 'all')
+ORDER BY pos;
+----
+2020-01-01 00:00:00	1
+2026-01-01 00:00:00	2
+9999-12-31 00:00:00	3
+
+# NULL placement must not be flipped by DESC. DuckDB sorts NULLs last in both
+# directions by default, and honours an explicit NULLS FIRST.
+query II
+SELECT k, pos
+FROM mr.match_recognize(
+       (SELECT * FROM (VALUES (1), (NULL), (2)) AS t(k)),
+       order_by := ['k DESC'],
+       pattern  := 'A+',
+       define   := '{}',
+       measures := '{"pos":"RUNNING COUNT(*)"}',
+       rows     := 'all')
+ORDER BY pos;
+----
+2	1
+1	2
+NULL	3
+
+query II
+SELECT k, pos
+FROM mr.match_recognize(
+       (SELECT * FROM (VALUES (1), (NULL), (2)) AS t(k)),
+       order_by := ['k DESC NULLS FIRST'],
+       pattern  := 'A+',
+       define   := '{}',
+       measures := '{"pos":"RUNNING COUNT(*)"}',
+       rows     := 'all')
+ORDER BY pos;
+----
+NULL	1
+2	2
+1	3
+
+# A VARCHAR key at a size where the comparison path matters, checked by asking the
+# worker for its own ordering and comparing it to DuckDB's.
+query I
+WITH got AS (
+  SELECT s, pos FROM mr.match_recognize(
+    (SELECT 'k-' || lpad(((i*7919) % 20000)::VARCHAR, 8, '0') AS s FROM range(20000) r(i)),
+    order_by := ['s'], pattern := 'A+', define := '{}',
+    measures := '{"pos":"RUNNING COUNT(*)"}', rows := 'all')
+), want AS (
+  SELECT s, row_number() OVER (ORDER BY s) AS pos
+  FROM (SELECT 'k-' || lpad(((i*7919) % 20000)::VARCHAR, 8, '0') AS s FROM range(20000) r(i))
+)
+SELECT CASE WHEN count(*) = 0 THEN 'PASS' ELSE 'FAIL' END
+FROM (SELECT * FROM got EXCEPT SELECT * FROM want);
+----
+PASS

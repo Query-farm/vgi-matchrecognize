@@ -32,10 +32,21 @@ pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Bool(x), Bool(y)) => Some(x.cmp(y)),
         (Date(x), Date(y)) => Some(x.cmp(y)),
         (Interval(x), Interval(y)) => Some(interval_nanos(x).cmp(&interval_nanos(y))),
-        (Timestamp(x, ux), Timestamp(y, uy)) => {
-            Some((*x * unit_nanos(*ux)).cmp(&(*y * unit_nanos(*uy))))
-        }
-        (Time(x, ux), Time(y, uy)) => Some((*x * unit_nanos(*ux)).cmp(&(*y * unit_nanos(*uy)))),
+        // Rescale in i128, and skip rescaling entirely when the units already
+        // match (the normal case: one column carries one unit). Multiplying i64
+        // ticks by the unit scale overflows — microsecond ticks past ~year 2262
+        // wrap, so `TIMESTAMP '9999-12-31'` compared as *less* than 2020, which
+        // silently reversed ORDER BY and corrupted every match in the partition.
+        (Timestamp(x, ux), Timestamp(y, uy)) => Some(if ux == uy {
+            x.cmp(y)
+        } else {
+            (*x as i128 * unit_nanos(*ux) as i128).cmp(&(*y as i128 * unit_nanos(*uy) as i128))
+        }),
+        (Time(x, ux), Time(y, uy)) => Some(if ux == uy {
+            x.cmp(y)
+        } else {
+            (*x as i128 * unit_nanos(*ux) as i128).cmp(&(*y as i128 * unit_nanos(*uy) as i128))
+        }),
         _ => {
             // Numeric comparison.
             let (x, y) = (a.as_f64()?, b.as_f64()?);
@@ -272,6 +283,58 @@ pub fn negate(v: &Value) -> Result<Value> {
         Value::Double(d) => Ok(Value::Double(-d)),
         Value::Decimal(u, s) => Ok(Value::Decimal(-u, *s)),
         other => Err(MrError::Eval(format!("cannot negate {other:?}"))),
+    }
+}
+
+/// A **total** order for sorting, placing NULLs first or last as requested.
+///
+/// Deliberately not [`compare`], which implements SQL comparison semantics: that
+/// maps an unordered pair to `None`, and treating that as `Equal` is intransitive
+/// (a NaN key would be "equal" to both 1 and 2 while 1 != 2). `sort_by` with an
+/// intransitive comparator is free to return an arbitrary permutation, so a single
+/// NaN in an ORDER BY column could scramble the partition. Sorting therefore uses
+/// a total order: `total_cmp` for floats, and exact integer/decimal comparison
+/// where the values allow it, which also matches what a typed store comparing
+/// Arrow buffers in place will do.
+pub fn cmp_for_sort(a: &Value, b: &Value, desc: bool, nulls_first: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    // NULL placement is absolute: `nulls_first` says where NULLs land in the final
+    // order, so it must be decided here rather than by reversing the whole
+    // comparison for DESC — reversing flips the NULLs too, which made
+    // `ORDER BY k DESC NULLS FIRST` put them last.
+    match (a.is_null(), b.is_null()) {
+        (true, true) => return Equal,
+        (true, false) => {
+            return if nulls_first { Less } else { Greater };
+        }
+        (false, true) => {
+            return if nulls_first { Greater } else { Less };
+        }
+        (false, false) => {}
+    }
+    let ord = cmp_present(a, b);
+    if desc {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
+/// Total order over two non-NULL values.
+fn cmp_present(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        // Exact where possible: `as_f64` would lose precision past 2^53.
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::HugeInt(x), Value::HugeInt(y)) => x.cmp(y),
+        (Value::Decimal(x, sx), Value::Decimal(y, sy)) if sx == sy => x.cmp(y),
+        (Value::Double(x), Value::Double(y)) => x.total_cmp(y),
+        _ => match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            // Non-numeric (strings, temporals, booleans): SQL comparison is already
+            // a total order for a single column's type.
+            _ => compare(a, b).unwrap_or(Equal),
+        },
     }
 }
 
