@@ -308,12 +308,10 @@ impl<'a> Frame<'a> {
                 arg: inner,
                 offset,
             } => {
-                let scope = self.scope(inner, final_sem);
-                let idx = match kind {
-                    NavKind::First => *offset,
-                    _ => scope.len().checked_sub(1 + *offset)?,
-                };
-                scope.get(idx).map(|b| (b.tape_pos, &**inner, final_sem))
+                let qual = dominant_qualifier(inner);
+                let from_end = matches!(kind, NavKind::Last);
+                self.scope_nth(qual.as_deref(), final_sem, *offset, from_end)
+                    .map(|b| (b.tape_pos, &**inner, final_sem))
             }
             // Nested physical navigation, e.g. `PREV(NEXT(x))`: resolve the inner
             // one to a row, then let the caller apply the outer offset.
@@ -373,21 +371,15 @@ impl<'a> Frame<'a> {
                 }
             }
             NavKind::First | NavKind::Last => {
-                let scope = self.scope(arg, final_sem);
-                if scope.is_empty() {
-                    return Ok(Value::Null);
-                }
-                let idx = match kind {
-                    NavKind::First => offset,
-                    _ => {
-                        if offset >= scope.len() {
-                            return Ok(Value::Null);
-                        }
-                        scope.len() - 1 - offset
+                // `FIRST(x, n)` is the n-th row of the scope from the start,
+                // `LAST(x, n)` the n-th from the end; off the end is NULL.
+                let qual = dominant_qualifier(arg);
+                let from_end = matches!(kind, NavKind::Last);
+                match self.scope_nth(qual.as_deref(), final_sem, offset, from_end) {
+                    Some(b) => {
+                        let (tp, var) = (b.tape_pos, b.var.clone());
+                        self.eval(arg, tp, Some(var.as_str()), final_sem)
                     }
-                };
-                match scope.get(idx) {
-                    Some(b) => self.eval(arg, b.tape_pos, Some(b.var.as_str()), final_sem),
                     None => Ok(Value::Null),
                 }
             }
@@ -497,10 +489,16 @@ impl<'a> Frame<'a> {
                 Err(MrError::Eval("only COUNT accepts '*'".into()))
             }
             (kind, AggArg::Expr(e)) => {
-                let scope = self.scope(e, final_sem);
+                // The recompute path, for shapes `aggmemo` declines. Still no
+                // materialized scope: only the surviving values are collected.
+                let qual = dominant_qualifier(e);
+                let rows: Vec<(usize, String)> = self
+                    .scope_iter(qual.as_deref(), final_sem)
+                    .map(|b| (b.tape_pos, b.var.clone()))
+                    .collect();
                 let mut vals: Vec<Value> = Vec::new();
-                for b in &scope {
-                    let v = self.eval(e, b.tape_pos, Some(b.var.as_str()), final_sem)?;
+                for (tp, var) in &rows {
+                    let v = self.eval(e, *tp, Some(var.as_str()), final_sem)?;
                     if !v.is_null() {
                         vals.push(v);
                     }
@@ -521,18 +519,54 @@ impl<'a> Frame<'a> {
         }
     }
 
-    /// The visible rows an aggregate / FIRST / LAST ranges over, filtered by the
-    /// dominant variable qualifier of `arg` (whole match when unqualified).
-    fn scope(&self, arg: &Expr, final_sem: bool) -> Vec<Bind> {
-        let qual = dominant_qualifier(arg);
-        self.visible(final_sem)
-            .iter()
-            .filter(|b| match &qual {
-                Some(v) => self.label_covers(v, &b.var),
-                None => true,
-            })
-            .cloned()
-            .collect()
+    /// The visible rows an aggregate / FIRST / LAST ranges over: the visible prefix,
+    /// filtered by the dominant variable qualifier (the whole prefix when
+    /// unqualified).
+    ///
+    /// An iterator, not a `Vec`: this used to clone every bind in scope — one heap
+    /// `String` per matched row — on every call, which made a single `LAST(x)` under
+    /// ALL ROWS cost O(match length) per output row.
+    fn scope_iter<'s>(
+        &'s self,
+        qual: Option<&'s str>,
+        final_sem: bool,
+    ) -> impl Iterator<Item = &'s Bind> + 's {
+        self.visible(final_sem).iter().filter(move |b| match qual {
+            Some(v) => self.label_covers(v, &b.var),
+            None => true,
+        })
+    }
+
+    /// The `n`-th row of that scope, counted from the start or from the end.
+    ///
+    /// Unqualified scopes are index arithmetic on the visible prefix — O(1), which is
+    /// what makes `LAST(x)` and `FIRST(x)` flat in match length. A qualified scope
+    /// walks from the chosen end and stops at the row it wants, so it costs the
+    /// distance to that row rather than the whole match.
+    fn scope_nth(
+        &self,
+        qual: Option<&str>,
+        final_sem: bool,
+        n: usize,
+        from_end: bool,
+    ) -> Option<&Bind> {
+        let visible = self.visible(final_sem);
+        match qual {
+            None if from_end => visible
+                .len()
+                .checked_sub(1 + n)
+                .and_then(|i| visible.get(i)),
+            None => visible.get(n),
+            Some(v) if from_end => visible
+                .iter()
+                .rev()
+                .filter(|b| self.label_covers(v, &b.var))
+                .nth(n),
+            Some(v) => visible
+                .iter()
+                .filter(|b| self.label_covers(v, &b.var))
+                .nth(n),
+        }
     }
 }
 
