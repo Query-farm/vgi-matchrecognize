@@ -195,6 +195,16 @@ fn take_rows(batch: &RecordBatch, rows: &[u32]) -> Result<RecordBatch> {
 /// and floats hash by bit pattern so `-0.0` and `0.0` land together only if they
 /// compare equal (they do not, bitwise, which merely costs an extra shard entry, never
 /// a wrong grouping — rows are regrouped by the real comparator inside the shard).
+fn unit_tag(u: &mr_core::types::TimeUnit) -> u8 {
+    use mr_core::types::TimeUnit::*;
+    match u {
+        Second => 0,
+        Milli => 1,
+        Micro => 2,
+        Nano => 3,
+    }
+}
+
 fn hash_value(v: &Value, h: &mut DefaultHasher) {
     match v {
         Value::Null => 0u8.hash(h),
@@ -227,15 +237,17 @@ fn hash_value(v: &Value, h: &mut DefaultHasher) {
             7u8.hash(h);
             d.hash(h);
         }
+        // The unit is folded in as a small integer, not `format!("{u:?}")` — that was a
+        // heap allocation per row for a timestamp partition key, on this loop.
         Value::Timestamp(t, u) => {
             8u8.hash(h);
             t.hash(h);
-            format!("{u:?}").hash(h);
+            unit_tag(u).hash(h);
         }
         Value::Time(t, u) => {
             9u8.hash(h);
             t.hash(h);
-            format!("{u:?}").hash(h);
+            unit_tag(u).hash(h);
         }
         Value::Interval(i) => {
             10u8.hash(h);

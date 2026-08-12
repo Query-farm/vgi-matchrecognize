@@ -68,6 +68,9 @@ const CODEC_NONE: u8 = 0;
 /// prepended by `lz4_flex`.
 const CODEC_LZ4_FRAME: u8 = 1;
 
+/// Most executions one thread keeps a spool file open for. See `FILES`.
+const MAX_OPEN_SINK_FILES: usize = 32;
+
 /// Default age at which an orphaned spool directory is swept.
 const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
 
@@ -75,19 +78,29 @@ fn re(e: impl std::fmt::Display) -> RpcError {
     RpcError::runtime_error(e.to_string())
 }
 
-/// Bytes a sink writes uncompressed before it starts compressing.
-///
-/// Compression is worth CPU only when the bytes are going to hurt, and for a small query
-/// they never do — the whole spool stays in the page cache and is deleted seconds later.
-/// So a sink starts plain and switches once it has written this much, which costs a short
-/// query nothing and still compresses all but the first slice of a large one. The codec
-/// lives in each record's header, so a file may hold both kinds.
+/// Bytes a sink writes uncompressed before it starts compressing — **when compression is
+/// asked for at all**, which it is not by default. See [`compression`].
 const COMPRESS_AFTER_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Whether to compress spooled batches, given how much this sink has already written.
+/// Whether to compress spooled batches. **Opt-in**: `VGI_MR_SPOOL_COMPRESSION=lz4`.
 ///
-/// `VGI_MR_SPOOL_COMPRESSION` overrides the size rule: `lz4`/`on` compresses from the
-/// first record, `none`/`off` never compresses.
+/// It was briefly the size-triggered default, and that was wrong for a reason worth
+/// recording. The finalize phase decides how many shards it needs by comparing the
+/// spool's size on disk against a budget that means *the producer's in-memory peak*
+/// ([`crate::shard::budget_bytes`]). Those are the same number only while the spool is
+/// uncompressed. Compressing it makes the on-disk figure smaller than what the producer
+/// will hold, so the shard count comes out low by the compression ratio and peak memory
+/// runs 1.5-2.9x over budget — the budget stops binding, which is precisely what
+/// sharding exists to prevent.
+///
+/// The fix is for each record to carry its *uncompressed* payload length so `combine`
+/// can total that instead of file sizes; until then compression stays off by default,
+/// because a wrong memory bound is worse than a larger spool.
+///
+/// When it is on, the payload is compressed **whole** rather than through arrow's
+/// `IpcWriteOptions`. Arrow compresses each buffer separately — per column, per batch —
+/// and the split's ~205-row pieces made that catastrophic: reading shards back cost
+/// 346-507 ns/row against 20 for whole-record framing.
 ///
 /// Compression is applied to the **whole IPC payload as one blob**, not through Arrow's
 /// `IpcWriteOptions`. Arrow's scheme compresses each buffer separately — one per column,
@@ -105,11 +118,11 @@ fn compression(written: u64) -> u8 {
         .to_ascii_lowercase()
         .as_str()
     {
-        "lz4" | "on" | "1" => CODEC_LZ4_FRAME,
-        "none" | "off" | "0" => CODEC_NONE,
-        // Unset, or a typo: decide by size rather than failing a query over an
-        // environment variable.
-        _ if written >= COMPRESS_AFTER_BYTES => CODEC_LZ4_FRAME,
+        // Explicitly asked for: compress once past the threshold, so a short query still
+        // pays nothing.
+        "lz4" | "on" | "1" if written >= COMPRESS_AFTER_BYTES => CODEC_LZ4_FRAME,
+        "lz4" | "on" | "1" => CODEC_NONE,
+        // Anything else, including unset and typos, leaves it off.
         _ => CODEC_NONE,
     }
 }
@@ -154,6 +167,13 @@ struct SinkFile {
 thread_local! {
     /// Open spool files for this thread, keyed by execution scope. Thread-local so
     /// appending needs no lock, and so each file has exactly one writer.
+    ///
+    /// Bounded, because nothing here learns that an execution ended: `discard` runs in
+    /// whichever process owns the *producer*, and with a pooled transport that need not
+    /// be the process that sank the rows. Without a cap, a long-lived worker would hold
+    /// a file descriptor and a scope key for every execution it had ever served.
+    /// Dropping an entry is always safe — the next append reopens in append mode and
+    /// continues where it left off.
     static FILES: RefCell<HashMap<Vec<u8>, SinkFile>> = RefCell::new(HashMap::new());
     /// This thread's number, for its file name.
     static THREAD_NO: u64 = NEXT_THREAD_NO.fetch_add(1, Ordering::Relaxed);
@@ -233,6 +253,9 @@ pub fn append(scope: &[u8], batch: &RecordBatch, batch_index: Option<i64>) -> Re
     FILES.with(|files| {
         let mut files = files.borrow_mut();
         if !files.contains_key(scope) {
+            if files.len() >= MAX_OPEN_SINK_FILES {
+                files.clear();
+            }
             sweep_once();
             if fs::create_dir_all(&dir).is_err() {
                 return Ok(false);
