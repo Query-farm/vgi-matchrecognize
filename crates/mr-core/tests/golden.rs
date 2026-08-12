@@ -60,6 +60,7 @@ fn v_shape_one_row() {
         partition_by: vec!["symbol".into()],
         order_by: vec!["ts".into()],
         rows_all: false,
+        omit_empty_matches: false,
         after: "past last row".into(),
         step_budget: Some(1_000_000),
     };
@@ -109,6 +110,7 @@ fn login_fail_then_success_all_rows() {
         partition_by: vec!["uid".into()],
         order_by: vec!["ts".into()],
         rows_all: true,
+        omit_empty_matches: false,
         after: "past last row".into(),
         step_budget: Some(1_000_000),
     };

@@ -70,6 +70,7 @@ fn run_cfg(
         order_by: vec!["ts".into()],
         rows_all,
         after: "past last row".into(),
+        omit_empty_matches: false,
         step_budget: Some(1_000_000),
     };
     Plan::build(&cfg, &sch())

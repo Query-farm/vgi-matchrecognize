@@ -43,6 +43,7 @@ fn build_plan(batch: &RecordBatch, measures: &str, rows_all: bool) -> Plan {
         order_by: vec!["ts".into()],
         rows_all,
         after: "past last row".into(),
+        omit_empty_matches: false,
         step_budget: Some(1_000_000),
     };
     let pat = mr_core::pattern::parse(&cfg.pattern).unwrap();

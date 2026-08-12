@@ -99,6 +99,12 @@ impl<'a> Matcher<'a> {
     /// Find every match in the partition, advancing per AFTER MATCH SKIP. The
     /// outer loop advances the tape cursor by at least one row each iteration,
     /// so termination is guaranteed independently of the step budget.
+    ///
+    /// **Empty matches** (a pattern that matches zero rows at some position, e.g.
+    /// `B*` where the row cannot bind `B`) are real matches: they are reported and
+    /// they consume a match number, per SQL:2016. Since they span no rows, the
+    /// cursor advances by one so the scan still terminates. Whether they reach the
+    /// output is the caller's decision (SHOW / OMIT EMPTY MATCHES).
     pub fn find_all(&mut self) -> Result<Vec<Match>> {
         let mut matches = Vec::new();
         let mut i = 0usize;
@@ -106,10 +112,6 @@ impl<'a> Matcher<'a> {
             let mut binds: Vec<Bind> = Vec::new();
             let res = self.run(i, &mut binds)?;
             match res {
-                // Empty matches (zero bound rows) are not recorded or numbered
-                // (the spec omits them); the cursor still advances by one row so
-                // the loop always terminates.
-                Some(_) if binds.is_empty() => i += 1,
                 Some(end) => {
                     let m = Match {
                         match_number: self.match_number,

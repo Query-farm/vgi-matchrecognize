@@ -58,6 +58,23 @@ impl Pattern {
         }
     }
 
+    /// Whether this sub-pattern matches *exactly* zero rows on every branch — it
+    /// binds nothing and can never consume a row (`()`, `^`, `$`, and any
+    /// combination of those).
+    ///
+    /// Repeating such a sub-pattern is idempotent: `()*`, `^+` and `(){5,}` add
+    /// nothing beyond a single occurrence, which is what lets the parser collapse
+    /// an otherwise non-terminating epsilon loop into a bounded form.
+    pub fn always_empty(&self) -> bool {
+        match self {
+            Pattern::Empty | Pattern::Anchor(_) => true,
+            Pattern::Var(_) => false,
+            Pattern::Concat(items) => items.iter().all(Pattern::always_empty),
+            Pattern::Alt(branches) => branches.iter().all(Pattern::always_empty),
+            Pattern::Quant { inner, .. } => inner.always_empty(),
+        }
+    }
+
     /// Collect the set of pattern-variable names referenced, in first-seen order.
     pub fn variables(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -177,10 +194,23 @@ impl Parser {
             } else {
                 true
             };
-            if matches!(prim, Pattern::Anchor(_)) {
-                return Err(MrError::Pattern(
-                    "anchors (^ $) cannot be quantified".into(),
-                ));
+            // A sub-pattern that always matches exactly zero rows is idempotent
+            // under repetition, so collapse the quantifier to a bounded, equivalent
+            // form rather than emitting a loop that could never make progress.
+            // This is what makes `()*`, `^+`, `(){5,}` and `(B ()*)*` work.
+            if prim.always_empty() {
+                return Ok(if min == 0 {
+                    // Zero occurrences (empty) or one — `()?`, `^?`.
+                    Pattern::Quant {
+                        inner: Box::new(prim),
+                        min: 0,
+                        max: Some(1),
+                        greedy,
+                    }
+                } else {
+                    // At least one occurrence, and repeats add nothing.
+                    prim
+                });
             }
             if max.is_none() && prim.nullable() {
                 return Err(MrError::Pattern(
@@ -225,13 +255,19 @@ impl Parser {
 
     /// Parse the body of a `{...}` quantifier (the `{` already consumed).
     fn brace_quantifier(&mut self) -> Result<(usize, Option<usize>)> {
-        // Forms: {n} | {n,} | {n,m} | {,m}
+        // Forms: {n} | {n,} | {n,m} | {,m} | {,}
         let result = match self.peek() {
-            // {,m}
             Some(Tok::Comma) => {
                 self.next();
-                let m = self.expect_num()?;
-                (0, Some(m))
+                match self.peek() {
+                    // `{,}` — no bound at either end, i.e. the same as `*`.
+                    Some(Tok::RBrace) => (0, None),
+                    // {,m}
+                    _ => {
+                        let m = self.expect_num()?;
+                        (0, Some(m))
+                    }
+                }
             }
             Some(Tok::Num(_)) => {
                 let n = self.expect_num()?;

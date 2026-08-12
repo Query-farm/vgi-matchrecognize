@@ -86,6 +86,19 @@ fn plan_config(args: &Arguments) -> Result<PlanConfig> {
         "one" => false,
         other => return Err(ve(format!("rows must be 'one' or 'all', got '{other}'"))),
     };
+    let empty = args
+        .named_str("empty_matches")
+        .unwrap_or_else(|| "show".to_string())
+        .to_ascii_lowercase();
+    let omit_empty_matches = match empty.as_str() {
+        "omit" => true,
+        "show" => false,
+        other => {
+            return Err(ve(format!(
+                "empty_matches must be 'show' or 'omit', got '{other}'"
+            )))
+        }
+    };
     let after = args
         .named_str("after")
         .unwrap_or_else(|| "past last row".to_string());
@@ -98,6 +111,7 @@ fn plan_config(args: &Arguments) -> Result<PlanConfig> {
         partition_by,
         order_by,
         rows_all,
+        omit_empty_matches,
         after,
         step_budget,
     })
@@ -210,6 +224,17 @@ impl TableBufferingFunction for MatchRecognize {
                  is free-form text, not a fixed vocabulary of keywords.",
             ),
             ArgSpec::const_arg(
+                "empty_matches",
+                -1,
+                "varchar",
+                "Whether a match that binds no rows contributes an output row. Accepts exactly two \
+                 lowercase string values: 'show' (the default, SQL:2016 SHOW EMPTY MATCHES) or \
+                 'omit' (OMIT EMPTY MATCHES). It applies only when rows is 'all'; with rows 'one' \
+                 an empty match always reports a row, carrying NULL measures. Empty matches \
+                 consume a match number either way. The SQL:2016 phrases themselves are not \
+                 accepted — pass 'show' or 'omit'.",
+            ),
+            ArgSpec::const_arg(
                 "step_budget",
                 -1,
                 "int64",
@@ -281,7 +306,6 @@ impl TableBufferingFunction for MatchRecognize {
             store,
             tapes: tapes.into_iter(),
             output_schema: params.output_schema.clone(),
-            match_number: 1,
         }))
     }
 }
@@ -297,14 +321,13 @@ const TARGET_BATCH_ROWS: usize = 8192;
 /// batches of roughly [`TARGET_BATCH_ROWS`] rows.
 ///
 /// Only the rows of the partitions accumulated so far are ever materialized, not
-/// the whole result set. Partitions are visited in `partition_tapes` order, so
-/// MATCH_NUMBER runs continuously exactly as the all-at-once path numbers them.
+/// the whole result set. Each partition is numbered independently, so batching
+/// several into one output batch cannot affect MATCH_NUMBER.
 struct PartitionStream {
     plan: Plan,
     store: BatchRowStore,
     tapes: std::vec::IntoIter<(String, Vec<usize>)>,
     output_schema: SchemaRef,
-    match_number: i64,
 }
 
 impl TableProducer for PartitionStream {
@@ -314,9 +337,8 @@ impl TableProducer for PartitionStream {
         // overshoot the target — matches are never split across batches) or the
         // input is drained. Partitions yielding no matches simply add nothing.
         for (label, mut tape) in self.tapes.by_ref() {
-            self.match_number = self
-                .plan
-                .run_partition(&self.store, &label, &mut tape, self.match_number, &mut rows)
+            self.plan
+                .run_partition(&self.store, &label, &mut tape, &mut rows)
                 .map_err(ve)?;
             if rows.len() >= TARGET_BATCH_ROWS {
                 break;

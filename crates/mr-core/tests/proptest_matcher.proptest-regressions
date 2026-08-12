@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6b7d8eb6bf866852a9a5059b15eea272e2cdbad314f79eaaa1b9f74dc9b3fa57 # shrinks to pat = "((A)* | C B)", data = [1]
+cc 30eaacdf7a3478c78f56414c0a604cf52fbfc14f526c1f88d9a77e204a47216a # shrinks to pat = "((C)? | (B | A))", (dominant, len) = (1, 15699)

@@ -44,7 +44,9 @@ SELECT count(*), min(uid), max(uid) FROM mr.main.match_recognize(
 ----
 1	999	999
 
-# MATCH_NUMBER runs continuously across partition boundaries.
+# MATCH_NUMBER counts matches WITHIN a partition, so it restarts at 1 for each
+# one (SQL:2016) — and batching several partitions into one output batch must not
+# change that.
 query II
 SELECT uid, mn FROM mr.main.match_recognize(
        (SELECT * FROM (VALUES (1,1),(1,2),(2,1),(2,2),(3,1)) AS t(uid, ts)),
@@ -57,9 +59,9 @@ ORDER BY uid, mn;
 ----
 1	1
 1	2
-2	3
-2	4
-3	5
+2	1
+2	2
+3	1
 
 # Many partitions crossing the batch-coalescing threshold: every match survives
 # and the count is exact (100k partitions of 3 rows -> 100k matches).

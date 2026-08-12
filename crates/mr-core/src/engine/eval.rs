@@ -34,8 +34,22 @@ impl<'a> Frame<'a> {
     /// Evaluate a measure expression. `final_default` is FINAL for ONE ROW PER
     /// MATCH, RUNNING for ALL ROWS PER MATCH (overridable per-subexpr).
     pub fn eval_measure(&self, e: &Expr, final_default: bool) -> Result<Value> {
-        let cur = &self.binds[self.horizon - 1];
-        self.eval(e, cur.tape_pos, Some(cur.var.as_str()), final_default)
+        match self.horizon.checked_sub(1).and_then(|i| self.binds.get(i)) {
+            Some(cur) => self.eval(e, cur.tape_pos, Some(cur.var.as_str()), final_default),
+            // An empty match binds no rows, so it has no current row: every
+            // row-dependent reference is NULL (see `is_empty_match`). The tape
+            // position passed here is never read.
+            None => self.eval(e, 0, None, final_default),
+        }
+    }
+
+    /// Whether this frame describes an **empty match** — one that bound no rows.
+    ///
+    /// The standard still reports empty matches (they get a match number, and
+    /// `COUNT(*)` over one is 0), but nothing is bound, so there is no current row
+    /// for a column reference or a physical navigation to resolve against.
+    fn is_empty_match(&self) -> bool {
+        self.binds.is_empty()
     }
 
     /// Evaluate a DEFINE predicate (always RUNNING; current = last bind).
@@ -105,6 +119,15 @@ impl<'a> Frame<'a> {
                 days: *days,
                 nanos: *nanos,
             })),
+            Expr::Col(name) if self.is_empty_match() => {
+                // No current row to read from, so an empty match yields NULL for
+                // any column reference. Resolve the name anyway, so a typo is
+                // still an error rather than a silent NULL.
+                self.store
+                    .col_index(name)
+                    .ok_or_else(|| MrError::Eval(format!("unknown column '{name}'")))?;
+                Ok(Value::Null)
+            }
             Expr::Col(name) => self.col_value(name, cur_tp),
             // A bare `VAR.col` used outside a navigation/aggregate call is
             // shorthand for `LAST(VAR.col)` under the prevailing RUNNING/FINAL
@@ -200,6 +223,62 @@ impl<'a> Frame<'a> {
         }
     }
 
+    /// Where a physical navigation (`PREV`/`NEXT`) starts, what to read there, and
+    /// under which RUNNING/FINAL semantics — `None` when no such row exists.
+    ///
+    /// Navigation **nests**: `PREV(LAST(x), n)` means "find the row `LAST(x)`
+    /// designates, then step back `n` physical rows and read `x` there". So the
+    /// inner *logical* navigation picks the anchor and the outer *physical* offset
+    /// applies to it. Resolving the argument as a whole instead would silently
+    /// discard the offset, because `LAST` re-derives its own row from the frame.
+    ///
+    /// A bare `PREV(x, n)` anchors on the current row, and a bare qualifier
+    /// (`PREV(A.x, n)`) anchors on A's last row — the standard's shorthand for
+    /// `PREV(LAST(A.x), n)`.
+    fn nav_anchor<'e>(
+        &self,
+        arg: &'e Expr,
+        cur_tp: usize,
+        final_sem: bool,
+    ) -> Option<(usize, &'e Expr, bool)> {
+        match arg {
+            Expr::RunningFinal { final_, inner } => self.nav_anchor(inner, cur_tp, *final_),
+            Expr::Nav {
+                kind: kind @ (NavKind::First | NavKind::Last),
+                arg: inner,
+                offset,
+            } => {
+                let scope = self.scope(inner, final_sem);
+                let idx = match kind {
+                    NavKind::First => *offset,
+                    _ => scope.len().checked_sub(1 + *offset)?,
+                };
+                scope.get(idx).map(|b| (b.tape_pos, &**inner, final_sem))
+            }
+            // Nested physical navigation, e.g. `PREV(NEXT(x))`: resolve the inner
+            // one to a row, then let the caller apply the outer offset.
+            Expr::Nav {
+                kind,
+                arg: inner,
+                offset,
+            } => {
+                let (anchor, read, sem) = self.nav_anchor(inner, cur_tp, final_sem)?;
+                let tp = if *kind == NavKind::Prev {
+                    anchor.checked_sub(*offset)?
+                } else {
+                    anchor + offset
+                };
+                (tp < self.tape.len()).then_some((tp, read, sem))
+            }
+            _ => match dominant_qualifier(arg) {
+                Some(v) => self
+                    .last_bind_of(&v, final_sem)
+                    .map(|tp| (tp, arg, final_sem)),
+                None => Some((cur_tp, arg, final_sem)),
+            },
+        }
+    }
+
     fn eval_nav(
         &self,
         kind: NavKind,
@@ -209,36 +288,26 @@ impl<'a> Frame<'a> {
         final_sem: bool,
     ) -> Result<Value> {
         match kind {
+            // Physical navigation from an empty match has no row to start from.
+            NavKind::Prev | NavKind::Next if self.is_empty_match() => Ok(Value::Null),
             NavKind::Prev | NavKind::Next => {
-                // Physical navigation. An unqualified argument (`PREV(price)`)
-                // steps from the current row; a qualified one (`PREV(A.price, n)`)
-                // steps from the last row bound to that variable — the standard's
-                // `PREV(LAST(A.price), n)` — and is NULL when nothing is bound.
-                let qual = dominant_qualifier(arg);
-                let anchor = match &qual {
-                    Some(v) => match self.last_bind_of(v, final_sem) {
-                        Some(tp) => tp,
-                        None => return Ok(Value::Null),
-                    },
-                    None => cur_tp,
+                // Physical navigation applies its offset to an *anchor* row, then
+                // reads there. See `nav_anchor` for how the anchor is chosen.
+                let Some((anchor, read, sem)) = self.nav_anchor(arg, cur_tp, final_sem) else {
+                    return Ok(Value::Null);
                 };
                 let target = if kind == NavKind::Prev {
                     anchor.checked_sub(offset)
                 } else {
-                    let t = anchor + offset;
-                    if t < self.tape.len() {
-                        Some(t)
-                    } else {
-                        None
-                    }
+                    Some(anchor + offset)
                 };
                 match target {
                     Some(tp) if tp < self.tape.len() => {
-                        // Pin `cur_var` to the qualifier so reading the column at
-                        // the navigated row is a physical read, rather than
-                        // resolving to LAST all over again.
-                        let v = qual.or_else(|| self.var_at_tp(tp, final_sem));
-                        self.eval(arg, tp, v.as_deref(), final_sem)
+                        // Pin `cur_var` to the qualifier so reading a qualified
+                        // column at the navigated row is a physical read, rather
+                        // than resolving to LAST all over again.
+                        let v = dominant_qualifier(read).or_else(|| self.var_at_tp(tp, sem));
+                        self.eval(read, tp, v.as_deref(), sem)
                     }
                     _ => Ok(Value::Null),
                 }

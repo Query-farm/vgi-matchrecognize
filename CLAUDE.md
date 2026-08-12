@@ -113,8 +113,19 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
   `LAST(A.col)` under the prevailing RUNNING/FINAL semantics (NULL if `A` is
   unbound); `eval` reads it directly only when the row being evaluated is itself
   bound to `A`, which is how nav/aggregate scopes pin their row.
-- Empty matches (zero bound rows) are omitted from output and don't consume a
-  match number.
+- Empty matches (zero bound rows) ARE reported and DO consume a match number, per
+  SQL:2016 — one row positioned on the row the match sits on, with every measure
+  evaluated over an empty frame (`CLASSIFIER()`/navigation NULL, `COUNT(*)` 0).
+  `empty_matches := 'omit'` drops them under `rows := 'all'`. `Frame` treats
+  `binds.is_empty()` as the empty-match marker.
+- `MATCH_NUMBER()` counts matches **within a partition**, so `run_partition`
+  restarts numbering at 1 for each one.
+- Navigation nests: `PREV(LAST(x), n)` anchors on the row `LAST(x)` designates and
+  then applies the physical offset (`Frame::nav_anchor`). Resolving the argument
+  as a whole would discard the offset.
+- A quantified sub-pattern that always matches zero rows (`()*`, `^+`, `(){5,}`)
+  is collapsed at parse time to a bounded equivalent — repetition of nothing is
+  idempotent — which is what keeps the VM from epsilon-looping.
 - An unbounded quantifier (`*`, `+`, `{n,}`) over a **nullable** sub-pattern is
   rejected at compile (it would epsilon-loop); use a bounded form instead.
 

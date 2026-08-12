@@ -40,6 +40,7 @@ fn cfg(pattern: &str, define: &str, measures: &str, budget: Option<i64>) -> Plan
         partition_by: vec![],
         order_by: vec!["x".into()],
         rows_all: false,
+        omit_empty_matches: false,
         after: "past last row".into(),
         step_budget: budget,
     }

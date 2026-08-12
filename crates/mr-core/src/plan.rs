@@ -52,6 +52,10 @@ pub struct PlanConfig {
     pub order_by: Vec<String>,
     /// `true` = ALL ROWS PER MATCH, `false` = ONE ROW PER MATCH.
     pub rows_all: bool,
+    /// ALL ROWS PER MATCH **OMIT EMPTY MATCHES**: drop the row an empty match
+    /// would contribute. Ignored for ONE ROW PER MATCH, which always reports
+    /// empty matches. Default `false` (SQL:2016 SHOW EMPTY MATCHES).
+    pub omit_empty_matches: bool,
     /// Raw AFTER MATCH SKIP string (`"past last row"`, `"to first A"`, …).
     pub after: String,
     /// Per-partition matcher step budget. `None` scales it with the partition's
@@ -90,6 +94,7 @@ pub struct Plan {
     partition_by: Vec<String>,
     order_by: Vec<OrderKey>,
     rows_all: bool,
+    omit_empty_matches: bool,
     after: AfterSkip,
     step_budget: Option<i64>,
     /// Auto `match_number` column emitted (ALL ROWS, not shadowed by a measure).
@@ -187,6 +192,7 @@ impl Plan {
             partition_by: cfg.partition_by.clone(),
             order_by,
             rows_all: cfg.rows_all,
+            omit_empty_matches: cfg.omit_empty_matches,
             after,
             step_budget: cfg.step_budget,
             auto_match_number,
@@ -213,9 +219,8 @@ impl Plan {
     /// instead, so only one partition's rows are live at a time.
     pub fn run(&self, store: &dyn RowStore) -> Result<Vec<Vec<Value>>> {
         let mut out = Vec::new();
-        let mut match_number = 1i64;
         for (label, mut tape) in self.partition_tapes(store)? {
-            match_number = self.run_partition(store, &label, &mut tape, match_number, &mut out)?;
+            self.run_partition(store, &label, &mut tape, &mut out)?;
         }
         Ok(out)
     }
@@ -230,17 +235,17 @@ impl Plan {
         self.partitions(store)
     }
 
-    /// Sort, match, and emit one partition, appending its rows to `out`. Returns
-    /// the match number the next partition should start from, so that streaming
-    /// partition-by-partition numbers matches exactly as [`Plan::run`] does.
+    /// Sort, match, and emit one partition, appending its rows to `out`.
+    ///
+    /// Partitions are independent: `MATCH_NUMBER()` counts matches *within* a
+    /// partition, so every partition starts again at 1 (SQL:2016).
     pub fn run_partition(
         &self,
         store: &dyn RowStore,
         label: &str,
         tape: &mut [usize],
-        first_match_number: i64,
         out: &mut Vec<Vec<Value>>,
-    ) -> Result<i64> {
+    ) -> Result<()> {
         self.sort_tape(store, tape)?;
         let mut matcher = Matcher::new(
             &self.program,
@@ -251,13 +256,20 @@ impl Plan {
             self.step_budget
                 .unwrap_or_else(|| auto_step_budget(tape.len())),
             label,
-            first_match_number,
+            1,
         );
         let matches = matcher.find_all()?;
         for m in &matches {
-            // Empty matches (zero bound rows) emit no output, per the spec's
-            // "omit empty matches" behavior — for both ONE ROW and ALL ROWS.
             if m.binds.is_empty() {
+                // An empty match produces exactly one output row (SQL:2016 SHOW
+                // EMPTY MATCHES, the default), positioned at the row where it
+                // occurred, with every measure evaluated over an empty match.
+                // ALL ROWS PER MATCH OMIT EMPTY MATCHES drops it; ONE ROW PER
+                // MATCH always reports it.
+                if self.rows_all && self.omit_empty_matches {
+                    continue;
+                }
+                out.push(self.emit_empty_row(store, tape, m)?);
                 continue;
             }
             if self.rows_all {
@@ -268,7 +280,7 @@ impl Plan {
                 out.push(self.emit_one_row(store, tape, m)?);
             }
         }
-        Ok(matcher.next_match_number())
+        Ok(())
     }
 
     fn emit_one_row(
@@ -291,6 +303,48 @@ impl Plan {
         }
         for meas in &self.measures {
             let v = frame.eval_measure(&meas.expr, true)?;
+            row.push(crate::engine::valops::coerce(v, meas.ty)?);
+        }
+        Ok(row)
+    }
+
+    /// One output row for an **empty match**: the universal columns come from the
+    /// row the match sits on, while every measure sees a match with no rows bound
+    /// (so `CLASSIFIER()` and navigation are NULL, `COUNT(*)` is 0, and
+    /// `MATCH_NUMBER()` still reports the number the empty match consumed).
+    fn emit_empty_row(
+        &self,
+        store: &dyn RowStore,
+        tape: &[usize],
+        m: &crate::engine::Match,
+    ) -> Result<Vec<Value>> {
+        let frame = Frame {
+            store,
+            tape,
+            binds: &m.binds,
+            horizon: 0,
+            match_number: m.match_number,
+        };
+        let mut row = Vec::with_capacity(self.output_columns.len());
+        for c in &self.partition_by {
+            row.push(self.col_at(store, tape, m.start, c)?);
+        }
+        if self.rows_all {
+            for key in &self.order_by {
+                row.push(self.col_at(store, tape, m.start, &key.col)?);
+            }
+            if self.auto_match_number {
+                row.push(Value::Int(m.match_number));
+            }
+            if self.auto_classifier {
+                // No row is bound, so there is no classifier.
+                row.push(Value::Null);
+            }
+        }
+        for meas in &self.measures {
+            // FINAL for ONE ROW PER MATCH, RUNNING for ALL ROWS — the same default
+            // the non-empty paths use. Over an empty match the two coincide.
+            let v = frame.eval_measure(&meas.expr, !self.rows_all)?;
             row.push(crate::engine::valops::coerce(v, meas.ty)?);
         }
         Ok(row)

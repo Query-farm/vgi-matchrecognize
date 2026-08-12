@@ -41,6 +41,7 @@ mr.match_recognize(
     define       := '{…}',      -- JSON: { "VAR": "<boolean predicate>", … }
     measures     := '{…}',      -- JSON object/array of output expressions
     rows         := 'one'|'all',-- ONE ROW PER MATCH (default) | ALL ROWS PER MATCH
+    empty_matches := 'show'|'omit', -- SHOW (default) / OMIT EMPTY MATCHES
     after        := '…',        -- AFTER MATCH SKIP mode (default 'past last row')
     step_budget  := 5000000     -- per-partition backtracking guard (optional;
                                 --   omit to scale it with the partition size)
@@ -164,6 +165,24 @@ while unqualified `PREV(price)` steps from the current row.
   `match_number BIGINT`, `classifier VARCHAR` (auto, unless a measure shadows
   them), then one column per measure.
 
+> **Deviation from Trino/Oracle.** Under `ALL ROWS PER MATCH` they emit *every*
+> input column and no automatic `match_number`/`classifier`; we emit the
+> partition and order columns plus the two automatic ones. Project any other input
+> column through a measure (`{"value": "value"}`) if you need it.
+
+## Matches, empty matches, and match numbers
+
+`MATCH_NUMBER()` counts matches **within a partition** — it restarts at 1 for each
+partition, as SQL:2016 specifies.
+
+An **empty match** — a pattern that legitimately matches zero rows at a position,
+e.g. `B*` where the row cannot bind `B` — is a real match: it contributes one
+output row positioned on the row it sits on, and it consumes a match number.
+Every measure over it sees a match with nothing bound, so `CLASSIFIER()` and the
+navigation functions are NULL and `COUNT(*)` is 0. Pass
+`empty_matches := 'omit'` (only meaningful with `rows := 'all'`) to drop those
+rows, matching SQL:2016 `OMIT EMPTY MATCHES`; `rows := 'one'` always reports them.
+
 Measure **types are inferred** from the input Arrow schema at bind time:
 `MATCH_NUMBER()`/`COUNT(...)` → `BIGINT`, `CLASSIFIER()` → `VARCHAR`,
 `FIRST`/`LAST`/`PREV`/`NEXT`/`MIN`/`MAX`/aggregate-of-column → that column's
@@ -249,7 +268,18 @@ type-lattice corners (route those through the explicit `type` override).
 cargo test --workspace          # mr-core unit + proptest, mr-worker integration
 cargo build --release           # build the worker binary
 ./run_tests.sh                  # haybarn SQLLogic end-to-end suite
+./test/trino/port.sh            # re-port Trino's row-pattern suite (needs a Trino checkout)
 ```
+
+## Conformance
+
+103 assertions ported from Trino's `MATCH_RECOGNIZE` test suite run as part of the
+end-to-end suite (`test/sql/trino_conformance.test`); of the 135 cases expressible
+on this surface, **none produce a wrong answer** — the remainder error cleanly on
+features we do not implement (arbitrary scalar/aggregate functions, subqueries in
+`DEFINE`/`MEASURES`, `SUBSET`, `PERMUTE`, `{- … -}`). See
+[`test/trino/README.md`](test/trino/README.md) for the full tally, the bugs the
+port found, and how to regenerate it.
 
 ## License
 

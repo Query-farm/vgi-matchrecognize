@@ -63,6 +63,7 @@ fn cfg(
         order_by: vec![order.into()],
         rows_all,
         after: "past last row".into(),
+        omit_empty_matches: false,
         step_budget: Some(1_000_000),
     }
 }
@@ -240,6 +241,7 @@ fn one_vs_all_rows_schema() {
         order_by: vec!["ts".into()],
         rows_all,
         after: "past last row".into(),
+        omit_empty_matches: false,
         step_budget: Some(1_000_000),
     };
     // ONE ROW: [sym, n] one row.

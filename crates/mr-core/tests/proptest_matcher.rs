@@ -58,6 +58,7 @@ proptest! {
             partition_by: vec![],
             order_by: vec!["x".into()],
             rows_all: false,
+        omit_empty_matches: false,
             after: "past last row".into(),
             step_budget: Some(200_000),
         };
@@ -111,6 +112,7 @@ proptest! {
             partition_by: vec![],
             order_by: vec!["x".into()],
             rows_all: false,
+        omit_empty_matches: false,
             after: "past last row".into(),
             step_budget: Some(2_000_000),
         };
@@ -123,11 +125,13 @@ proptest! {
             match plan.run(&store) {
                 Ok(rows) => {
                     prop_assert!(rows.len() <= n);
-                    // Each match reports at least one bound row (empty matches are
-                    // omitted), and no match can exceed the partition.
+                    // No match can bind more rows than the partition holds. Zero is
+                    // legitimate: an empty match reports COUNT(*) = 0, and a pattern
+                    // whose preferred branch is nullable (`(C)? | ...`) matches
+                    // empty at every position.
                     for r in &rows {
                         if let Value::Int(cnt) = r[1] {
-                            prop_assert!(cnt >= 1 && cnt <= n as i64,
+                            prop_assert!((0..=n as i64).contains(&cnt),
                                 "match row count {cnt} out of range for {n} rows");
                         }
                     }
