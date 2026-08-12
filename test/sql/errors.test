@@ -29,3 +29,48 @@ statement error
 SELECT mr.main.explain_pattern('(A');
 ----
 pattern
+
+# A pattern error quotes the source text, not a Rust token name.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1)) AS t(ts)),
+       order_by := ['ts'], pattern := 'A (B | C D', define := '{}');
+----
+expected ')'
+
+# A measure error names the measure it came from, not just the fault.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 10)) AS t(ts, price)),
+       order_by := ['ts'], pattern := 'A', define := '{}',
+       measures := '{"x":"LAST(price)","y":"LSAT(price)"}');
+----
+measures['y']
+
+# A DEFINE predicate is type-checked at bind: a non-boolean one can never bind a
+# row, and used to return zero rows with no error at all.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 10), (2, 8)) AS t(ts, price)),
+       order_by := ['ts'], pattern := 'A B+', define := '{"B":"price"}');
+----
+must be BOOLEAN
+
+# Likewise a type mismatch, which three-valued logic turned into a silent
+# empty result rather than an error.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS t(ts, sym)),
+       order_by := ['ts'], pattern := 'A B+', define := $${"B":"sym > 3"}$$);
+----
+define['B']
+
+# An unknown column in DEFINE is a *bind* error even when no row would ever
+# reach the predicate — one input row cannot match 'A B', so this used to
+# succeed with zero rows and fail only on larger inputs.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 10)) AS t(ts, price)),
+       order_by := ['ts'], pattern := 'A B', define := '{"B":"prcie < PREV(price)"}');
+----
+unknown column 'prcie'

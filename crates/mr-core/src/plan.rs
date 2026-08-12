@@ -132,7 +132,7 @@ impl Plan {
 
         // DEFINE. Only real pattern variables may be defined, but a predicate may
         // reference subsets.
-        let define_map = parse_define(&cfg.define_json, &vars, &labels)?;
+        let define_map = parse_define(&cfg.define_json, &vars, &labels, schema)?;
         let mut define: Vec<Option<Expr>> = vec![None; label_set.len()];
         for (name, expr) in define_map {
             if let Some(id) = label_set.id_of(&name) {
@@ -869,7 +869,12 @@ fn parse_after(s: &str, vars: &[String], labels: &LabelSet) -> Result<AfterSkip>
     )))
 }
 
-fn parse_define(json: &str, vars: &[String], labels: &[String]) -> Result<HashMap<String, Expr>> {
+fn parse_define(
+    json: &str,
+    vars: &[String],
+    labels: &[String],
+    schema: &dyn BindSchema,
+) -> Result<HashMap<String, Expr>> {
     let trimmed = json.trim();
     let map: serde_json::Map<String, serde_json::Value> = if trimmed.is_empty() {
         serde_json::Map::new()
@@ -888,11 +893,52 @@ fn parse_define(json: &str, vars: &[String], labels: &[String]) -> Result<HashMa
                 "define variable '{k}' does not appear in the pattern"
             ))
         })?;
-        let mut expr = parse_expr(pred)?;
-        canonicalize_vars(&mut expr, labels)?;
+        // Everything from here on names the key it came from, since the parser
+        // and the inferencer see one predicate and cannot say which it was.
+        let ctx = format!("define['{k}']");
+        let expr = (|| -> Result<Expr> {
+            let mut expr = parse_expr(pred)?;
+            canonicalize_vars(&mut expr, labels)?;
+            check_predicate(&expr, schema)?;
+            Ok(expr)
+        })()
+        .map_err(|e| e.with_context(&ctx))?;
         out.insert(var, expr);
     }
     Ok(out)
+}
+
+/// Type-check a DEFINE predicate at bind time.
+///
+/// MEASURES have always been inferred (their types *are* the output schema), but
+/// DEFINE was only parsed — so a predicate that could never be true was a silent
+/// empty result rather than an error. All three of these used to return zero rows
+/// and no message:
+///
+/// ```text
+/// define := {"B": "price"}                 -- not a predicate at all
+/// define := {"B": "sym > 3"}               -- VARCHAR compared with INTEGER
+/// define := {"B": "prcie < PREV(price)"}   -- typo; only ever an error if evaluated
+/// ```
+///
+/// The third is the reason this is a bind check and not a runtime one: an unknown
+/// column raised `MrError::Eval` from inside the matcher, so whether the query
+/// failed at all depended on whether the predicate was ever reached — it would
+/// pass on a small sample and fail in production, or quietly match nothing.
+///
+/// `Ty::Null` is accepted: a predicate that is statically NULL (`NULL`, or a
+/// comparison against it) is never true, but it is well-formed SQL and the
+/// three-valued logic in `eval` handles it.
+fn check_predicate(expr: &Expr, schema: &dyn BindSchema) -> Result<()> {
+    let ty = infer(expr, schema)?;
+    if ty == Ty::Boolean || ty == Ty::Null {
+        Ok(())
+    } else {
+        Err(MrError::Infer(format!(
+            "a DEFINE predicate must be BOOLEAN, but this one is {ty}; it can never bind a row \
+             (write a comparison, e.g. `price < PREV(price)`)"
+        )))
+    }
 }
 
 /// Collect every column name `e` reads, appending to `out` without duplicates.
@@ -1100,12 +1146,19 @@ fn parse_measures(
                     .get("expr")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| MrError::Bind(format!("measures[{i}] needs an 'expr'")))?;
-                let mut expr = parse_expr(expr_s)?;
-                canonicalize_vars(&mut expr, vars)?;
-                let ty = match obj.get("type").and_then(|v| v.as_str()) {
-                    Some(t) => parse_type_name(t)?,
-                    None => resolve_measure_ty(&expr, schema, &name)?,
-                };
+                // Named by its `as`, not by its index: that is what the user has
+                // in front of them, and what the output column will be called.
+                let ctx = format!("measures['{name}']");
+                let (expr, ty) = (|| -> Result<(Expr, Ty)> {
+                    let mut expr = parse_expr(expr_s)?;
+                    canonicalize_vars(&mut expr, vars)?;
+                    let ty = match obj.get("type").and_then(|v| v.as_str()) {
+                        Some(t) => parse_type_name(t)?,
+                        None => resolve_measure_ty(&expr, schema, &name)?,
+                    };
+                    Ok((expr, ty))
+                })()
+                .map_err(|e| e.with_context(&ctx))?;
                 measures.push(Measure { name, expr, ty });
             }
         }
@@ -1115,9 +1168,14 @@ fn parse_measures(
                 let expr_s = v.as_str().ok_or_else(|| {
                     MrError::Bind(format!("measures['{name}'] must be a string expression"))
                 })?;
-                let mut expr = parse_expr(expr_s)?;
-                canonicalize_vars(&mut expr, vars)?;
-                let ty = resolve_measure_ty(&expr, schema, &name)?;
+                let ctx = format!("measures['{name}']");
+                let (expr, ty) = (|| -> Result<(Expr, Ty)> {
+                    let mut expr = parse_expr(expr_s)?;
+                    canonicalize_vars(&mut expr, vars)?;
+                    let ty = resolve_measure_ty(&expr, schema, &name)?;
+                    Ok((expr, ty))
+                })()
+                .map_err(|e| e.with_context(&ctx))?;
                 measures.push(Measure { name, expr, ty });
             }
         }
@@ -1130,13 +1188,18 @@ fn parse_measures(
     Ok(measures)
 }
 
+/// The static type of a measure, or a bind error pointing at the type override.
+///
+/// The caller adds the `measures['name']` prefix (see [`MrError::with_context`]),
+/// so the message here does not repeat the name — only the escape hatch, which
+/// has to spell out the array form because that is the only place a `type` may
+/// be written.
 fn resolve_measure_ty(expr: &Expr, schema: &dyn BindSchema, name: &str) -> Result<Ty> {
     let ty = infer(expr, schema)?;
     if ty == Ty::Null {
         return Err(MrError::Infer(format!(
-            "could not infer a type for measure '{name}' (it resolves to NULL); supply an \
-             explicit type via the array form, e.g. {{\"as\":\"{name}\",\"expr\":\"…\",\
-             \"type\":\"DOUBLE\"}}"
+            "could not infer a type (it resolves to NULL); supply an explicit type via the array \
+             form, e.g. {{\"as\":\"{name}\",\"expr\":\"…\",\"type\":\"DOUBLE\"}}"
         )));
     }
     Ok(ty)

@@ -233,7 +233,10 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                  Measure output types are inferred at bind time with an explicit type-override \
                  escape hatch. Also provides `explain_pattern()` (pretty-print a compiled pattern) \
                  and a browsable `after_match_skip_modes` reference view. Pure local compute: no \
-                 network, no secrets, nothing on disk."
+                 network calls and no secrets or credentials of any kind. Matching a pattern needs \
+                 the whole partition, so the input relation is buffered to temporary files under \
+                 the system temp directory (mode 0700, about 24 bytes per row) and deleted once \
+                 the result has been read; nothing is sent anywhere."
                     .to_string(),
             ),
             (

@@ -1,5 +1,8 @@
 //! Tokenizer for the PATTERN clause (a regular expression over variables).
 
+use std::fmt;
+
+use crate::diag::point_at;
 use crate::error::{MrError, Result};
 
 /// A PATTERN token.
@@ -33,65 +36,108 @@ pub enum Tok {
     Dollar,
 }
 
-/// Tokenize a pattern string. Whitespace separates and is otherwise ignored.
+/// How a token reads back to the user: the source text it was written as, with
+/// no surrounding quotes (callers add them). Never the Rust variant name — a
+/// message saying `expected RParen` asks the reader to know our AST.
+impl fmt::Display for Tok {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Tok::Var(v) => write!(f, "{v}"),
+            Tok::Num(n) => write!(f, "{n}"),
+            Tok::Pipe => f.write_str("|"),
+            Tok::LParen => f.write_str("("),
+            Tok::RParen => f.write_str(")"),
+            Tok::Star => f.write_str("*"),
+            Tok::Plus => f.write_str("+"),
+            Tok::Question => f.write_str("?"),
+            Tok::LBrace => f.write_str("{"),
+            Tok::RBrace => f.write_str("}"),
+            Tok::Comma => f.write_str(","),
+            Tok::Caret => f.write_str("^"),
+            Tok::Dollar => f.write_str("$"),
+        }
+    }
+}
+
+/// Tokenize a pattern string, discarding the source positions.
 pub fn lex(src: &str) -> Result<Vec<Tok>> {
+    lex_spanned(src).map(|(toks, _)| toks)
+}
+
+/// Tokenize a pattern string, returning each token's starting **character**
+/// index alongside it, so the parser can point a caret at what it rejected.
+///
+/// Whitespace separates and is otherwise ignored. The two vectors are always
+/// the same length and are indexed together.
+pub fn lex_spanned(src: &str) -> Result<(Vec<Tok>, Vec<usize>)> {
     let mut toks = Vec::new();
+    let mut spans = Vec::new();
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0;
+    // Every `push` below records the position the token started at. Keeping it
+    // in one closure means a new token form cannot silently arrive without one.
+    macro_rules! push {
+        ($tok:expr, $at:expr) => {{
+            toks.push($tok);
+            spans.push($at);
+        }};
+    }
     while i < chars.len() {
         let c = chars[i];
+        let at = i;
         match c {
             c if c.is_whitespace() => {
                 i += 1;
             }
             '|' => {
-                toks.push(Tok::Pipe);
+                push!(Tok::Pipe, at);
                 i += 1;
             }
             '(' => {
-                toks.push(Tok::LParen);
+                push!(Tok::LParen, at);
                 i += 1;
             }
             ')' => {
-                toks.push(Tok::RParen);
+                push!(Tok::RParen, at);
                 i += 1;
             }
             '*' => {
-                toks.push(Tok::Star);
+                push!(Tok::Star, at);
                 i += 1;
             }
             '+' => {
-                toks.push(Tok::Plus);
+                push!(Tok::Plus, at);
                 i += 1;
             }
             '?' => {
-                toks.push(Tok::Question);
+                push!(Tok::Question, at);
                 i += 1;
             }
             '{' => {
-                toks.push(Tok::LBrace);
+                push!(Tok::LBrace, at);
                 i += 1;
             }
             '}' => {
-                toks.push(Tok::RBrace);
+                push!(Tok::RBrace, at);
                 i += 1;
             }
             ',' => {
-                toks.push(Tok::Comma);
+                push!(Tok::Comma, at);
                 i += 1;
             }
             '^' => {
-                toks.push(Tok::Caret);
+                push!(Tok::Caret, at);
                 i += 1;
             }
             '$' => {
-                toks.push(Tok::Dollar);
+                push!(Tok::Dollar, at);
                 i += 1;
             }
             '-' if i + 1 < chars.len() && chars[i + 1] == '}' => {
-                return Err(MrError::Pattern(
-                    "exclusion syntax `{- ... -}` is not supported in v1 (v1.1 non-goal)".into(),
-                ));
+                return Err(MrError::Pattern(format!(
+                    "exclusion syntax `{{- ... -}}` is not supported in v1 (v1.1 non-goal){}",
+                    point_at(src, at)
+                )));
             }
             c if c.is_ascii_digit() => {
                 let start = i;
@@ -100,9 +146,12 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                 }
                 let s: String = chars[start..i].iter().collect();
                 let n = s.parse::<usize>().map_err(|_| {
-                    MrError::Pattern(format!("quantifier count '{s}' is out of range"))
+                    MrError::Pattern(format!(
+                        "quantifier count '{s}' is out of range{}",
+                        point_at(src, at)
+                    ))
                 })?;
-                toks.push(Tok::Num(n));
+                push!(Tok::Num(n), at);
             }
             '"' => {
                 // A double-quoted label is case-sensitive: `"b"` is a different
@@ -111,9 +160,10 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                 let mut s = String::new();
                 loop {
                     if i >= chars.len() {
-                        return Err(MrError::Pattern(
-                            "unterminated double-quoted pattern variable".into(),
-                        ));
+                        return Err(MrError::Pattern(format!(
+                            "unterminated double-quoted pattern variable{}",
+                            point_at(src, at)
+                        )));
                     }
                     if chars[i] == '"' {
                         if i + 1 < chars.len() && chars[i + 1] == '"' {
@@ -128,9 +178,12 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                     i += 1;
                 }
                 if s.is_empty() {
-                    return Err(MrError::Pattern("empty pattern variable name".into()));
+                    return Err(MrError::Pattern(format!(
+                        "empty pattern variable name{}",
+                        point_at(src, at)
+                    )));
                 }
-                toks.push(Tok::Var(s));
+                push!(Tok::Var(s), at);
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
@@ -138,14 +191,15 @@ pub fn lex(src: &str) -> Result<Vec<Tok>> {
                     i += 1;
                 }
                 let s: String = chars[start..i].iter().collect();
-                toks.push(Tok::Var(s.to_ascii_uppercase()));
+                push!(Tok::Var(s.to_ascii_uppercase()), at);
             }
             other => {
                 return Err(MrError::Pattern(format!(
-                    "unexpected character '{other}' in pattern"
+                    "unexpected character '{other}' in pattern{}",
+                    point_at(src, at)
                 )));
             }
         }
     }
-    Ok(toks)
+    Ok((toks, spans))
 }

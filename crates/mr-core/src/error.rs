@@ -24,6 +24,32 @@ pub enum MrError {
 }
 
 impl MrError {
+    /// Prefix this error's message with the clause and key it came from, keeping
+    /// the variant (and so the category label) intact.
+    ///
+    /// `define` and `measures` hold one expression per key, and the parser that
+    /// reads them knows nothing about which one it was handed — so
+    /// "unknown function 'lsat'" arrives with no way to tell which of a dozen
+    /// measures contains it. `plan` re-attaches that context on the way out:
+    ///
+    /// ```text
+    /// match_recognize bind error: measures['y']: unknown function 'lsat'; …
+    /// ```
+    ///
+    /// The prefix goes in front of the whole message, so a trailing caret
+    /// rendering (see [`crate::diag`]) still lines up under its own source line.
+    pub fn with_context(self, ctx: &str) -> MrError {
+        let wrap = |m: String| format!("{ctx}: {m}");
+        match self {
+            MrError::Pattern(m) => MrError::Pattern(wrap(m)),
+            MrError::Expr(m) => MrError::Expr(wrap(m)),
+            MrError::Infer(m) => MrError::Infer(wrap(m)),
+            MrError::Bind(m) => MrError::Bind(wrap(m)),
+            MrError::Eval(m) => MrError::Eval(wrap(m)),
+            MrError::StepBudget(m) => MrError::StepBudget(wrap(m)),
+        }
+    }
+
     /// Short machine-stable category label (used in messages/tests).
     pub fn kind(&self) -> &'static str {
         match self {

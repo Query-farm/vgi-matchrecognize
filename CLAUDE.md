@@ -145,6 +145,35 @@ by itself, since the relation still has to be read back to match it.
 
 - All algorithms live in `mr-core` with unit + property tests; the worker is a
   thin adapter. The pure core is testable with `VecRowStore` — no IPC, no DuckDB.
+- **DEFINE predicates are type-checked at bind** (`plan.rs::check_predicate`), not
+  just parsed. They used to be, and the three failures that produced were all
+  *silent empty results*: a non-boolean predicate (`{"B":"price"}`), a mistyped
+  comparison (`{"B":"sym > 3"}` — three-valued logic makes every row not-true), and
+  an unknown column, which raised `MrError::Eval` from inside the matcher and so
+  only failed **if a row ever reached the predicate** — passing on a dev sample and
+  failing in production. `Ty::Null` is accepted (a statically-NULL predicate is
+  well-formed). Do not relax this to a runtime check; `tests/bind_diagnostics.rs`
+  pins it, and `ordinary_predicates_still_bind` there is the guard against making
+  `infer` stricter than `eval`.
+- **Errors from `define`/`measures` carry their key** via `MrError::with_context`,
+  applied in `parse_define`/`parse_measures`. The expression parser is handed one
+  string and cannot name it, so anything new added inside those per-key loops must
+  go **inside** the wrapping closure or it loses the prefix. Measures are named by
+  their `as`, not their index — that is what the output column is called.
+- **Parse errors never print a Rust token name.** Both lexers have `Display for Tok`
+  and a `lex_spanned` returning a character index per token; both parsers carry
+  `src` + `spans` and raise through `err_at`/`err_here`, which append
+  `diag::point_at` (source line + caret). `{tok:?}` in a user-facing message is a
+  regression — `bind_diagnostics.rs` asserts no `RParen`/`Tok::`/`Some(` leaks.
+  Positions are **char** indices, not bytes, since the caret is aligned by counting
+  characters.
+- **`Ty` has a `Display` giving the DuckDB spelling** (`BIGINT`, not `Int64`), and
+  every message naming a type uses `{}`, not `{:?}` — the same reason as the tokens
+  above: `Varchar` is not a word anyone can write in SQL. The spellings round-trip
+  through `parse_type_name`, which is what makes a type quoted in an error
+  pasteable into the `type` override; `every_rendered_type_name_parses_back` pins
+  that. `Value` (runtime) and `AggKind` are still `{:?}` in a few eval-path
+  messages — the same class, not yet done.
 - **`vgi-lint` greps argument descriptions, so wording is load-bearing.** Two rules
   bite in `argument_specs()`: VGI313 fires when a description contains its own
   declared type name — which made the word "any" unusable in `define`/`subset` the

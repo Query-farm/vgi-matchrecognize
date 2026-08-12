@@ -21,6 +21,7 @@
 //!
 //! [`RowStore`]: engine::RowStore
 
+pub mod diag;
 pub mod engine;
 pub mod error;
 pub mod expr;

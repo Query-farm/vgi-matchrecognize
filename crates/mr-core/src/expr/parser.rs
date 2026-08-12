@@ -2,7 +2,8 @@
 //! language. Produces the [`Expr`] AST.
 
 use super::ast::{AggArg, AggKind, BinOp, Expr, NavKind};
-use super::lexer::{lex, Tok};
+use super::lexer::{lex_spanned, Tok};
+use crate::diag::point_at;
 use crate::error::{MrError, Result};
 use crate::types::{TimeUnit, Ty};
 
@@ -21,8 +22,29 @@ const BP_UNARY: u8 = 7;
 /// expressions nest a handful of levels; this reports a clean error instead.
 const MAX_DEPTH: u32 = 128;
 
+/// How a token reads inside an error message: its source text in quotes, or a
+/// phrase for the end of input.
+fn found(t: Option<&Tok>) -> String {
+    match t {
+        Some(t) => format!("'{t}'"),
+        None => "end of input".to_string(),
+    }
+}
+
+/// The same, for the keyword-lookahead sites that work in `Option<String>`.
+fn found_kw(kw: Option<&str>) -> String {
+    match kw {
+        Some(k) => format!("'{k}'"),
+        None => "end of input".to_string(),
+    }
+}
+
 struct Parser {
+    /// The expression as written, kept so an error can point a caret into it.
+    src: String,
     toks: Vec<Tok>,
+    /// Starting character index of each token, indexed alongside `toks`.
+    spans: Vec<usize>,
     pos: usize,
     depth: u32,
 }
@@ -37,6 +59,26 @@ impl Parser {
             )));
         }
         Ok(())
+    }
+
+    /// Character index token `i` starts at; one past the end of the source for
+    /// the position after the last token, which is where "found end of input"
+    /// wants its caret.
+    fn span(&self, i: usize) -> usize {
+        self.spans
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| self.src.chars().count())
+    }
+
+    /// An expression error pointing at token `i`.
+    fn err_at(&self, i: usize, msg: impl std::fmt::Display) -> MrError {
+        MrError::Expr(format!("{msg}{}", point_at(&self.src, self.span(i))))
+    }
+
+    /// An expression error pointing at the token about to be read.
+    fn err_here(&self, msg: impl std::fmt::Display) -> MrError {
+        self.err_at(self.pos, msg)
     }
 
     fn peek(&self) -> Option<&Tok> {
@@ -56,10 +98,13 @@ impl Parser {
     }
 
     fn expect(&mut self, t: &Tok) -> Result<()> {
+        let at = self.pos;
         match self.next() {
             Some(ref got) if got == t => Ok(()),
-            Some(got) => Err(MrError::Expr(format!("expected {t:?}, found {got:?}"))),
-            None => Err(MrError::Expr(format!("expected {t:?}, found end of input"))),
+            other => Err(self.err_at(
+                at,
+                format!("expected '{t}', found {}", found(other.as_ref())),
+            )),
         }
     }
 
@@ -180,8 +225,9 @@ impl Parser {
                             negated,
                         })
                     }
-                    other => Err(MrError::Expr(format!(
-                        "expected NULL after IS [NOT], found {other:?}"
+                    other => Err(self.err_here(format!(
+                        "expected NULL after IS [NOT], found {}",
+                        found_kw(other)
                     ))),
                 }
             }
@@ -202,8 +248,9 @@ impl Parser {
                                 self.next();
                             }
                             other => {
-                                return Err(MrError::Expr(format!(
-                                    "expected AND in BETWEEN, found {other:?}"
+                                return Err(self.err_here(format!(
+                                    "expected AND in BETWEEN, found {}",
+                                    found_kw(other)
                                 )))
                             }
                         }
@@ -235,10 +282,10 @@ impl Parser {
                             negated,
                         })
                     }
-                    other => Err(MrError::Expr(format!("unexpected operator '{other}'"))),
+                    other => Err(self.err_here(format!("unexpected operator '{other}'"))),
                 }
             }
-            other => Err(MrError::Expr(format!("unexpected operator '{other}'"))),
+            other => Err(self.err_here(format!("unexpected operator '{other}'"))),
         }
     }
 
@@ -287,8 +334,9 @@ impl Parser {
             }
             Some(Tok::Ident(name)) => self.parse_ident(name),
             Some(Tok::QuotedIdent(name)) => self.parse_quoted_ident(name),
-            other => Err(MrError::Expr(format!(
-                "unexpected token {other:?} where an expression was expected"
+            other => Err(self.err_here(format!(
+                "expected an expression, found {}",
+                found(other.as_ref())
             ))),
         }
     }
@@ -326,9 +374,8 @@ impl Parser {
                         self.next();
                     }
                     other => {
-                        return Err(MrError::Expr(format!(
-                            "expected AS in CAST, found {other:?}"
-                        )))
+                        return Err(self
+                            .err_here(format!("expected AS in CAST, found {}", found_kw(other))))
                     }
                 }
                 let ty = self.parse_ty()?;
@@ -443,17 +490,23 @@ impl Parser {
                 self.next();
                 if matches!(self.peek(), Some(Tok::Dot)) {
                     self.next();
+                    let at = self.pos;
                     match self.next() {
                         Some(Tok::Ident(col)) => Ok(Expr::Qualified(raw.to_ascii_uppercase(), col)),
                         Some(Tok::QuotedIdent(col)) => {
                             Ok(Expr::Qualified(raw.to_ascii_uppercase(), col))
                         }
-                        Some(Tok::Star) => Err(MrError::Expr(
-                            "`A.*` is only valid as the argument to COUNT(...)".into(),
+                        Some(Tok::Star) => {
+                            Err(self
+                                .err_at(at, "`A.*` is only valid as the argument to COUNT(...)"))
+                        }
+                        other => Err(self.err_at(
+                            at,
+                            format!(
+                                "expected a column name after '{raw}.', found {}",
+                                found(other.as_ref())
+                            ),
                         )),
-                        other => Err(MrError::Expr(format!(
-                            "expected a column name after '{raw}.', found {other:?}"
-                        ))),
                     }
                 } else {
                     Ok(Expr::Col(raw))
@@ -469,16 +522,21 @@ impl Parser {
         self.next();
         if matches!(self.peek(), Some(Tok::Dot)) {
             self.next();
+            let at = self.pos;
             match self.next() {
                 Some(Tok::Ident(col)) | Some(Tok::QuotedIdent(col)) => {
                     Ok(Expr::Qualified(raw, col))
                 }
-                Some(Tok::Star) => Err(MrError::Expr(
-                    "`A.*` is only valid as the argument to COUNT(...)".into(),
+                Some(Tok::Star) => {
+                    Err(self.err_at(at, "`A.*` is only valid as the argument to COUNT(...)"))
+                }
+                other => Err(self.err_at(
+                    at,
+                    format!(
+                        "expected a column name after '\"{raw}\".', found {}",
+                        found(other.as_ref())
+                    ),
                 )),
-                other => Err(MrError::Expr(format!(
-                    "expected a column name after '\"{raw}\".', found {other:?}"
-                ))),
             }
         } else {
             Ok(Expr::Col(raw))
@@ -490,12 +548,17 @@ impl Parser {
         let arg = self.parse_expr(0)?;
         let offset = if matches!(self.peek(), Some(Tok::Comma)) {
             self.next();
+            let at = self.pos;
             match self.next() {
                 Some(Tok::Int(n)) if n >= 0 => n as usize,
                 other => {
-                    return Err(MrError::Expr(format!(
-                        "navigation offset must be a non-negative integer, found {other:?}"
-                    )))
+                    return Err(self.err_at(
+                        at,
+                        format!(
+                            "navigation offset must be a non-negative integer, found {}",
+                            found(other.as_ref())
+                        ),
+                    ))
                 }
             }
         } else {
@@ -520,23 +583,26 @@ impl Parser {
         let arg = if matches!(self.peek(), Some(Tok::RParen)) {
             // `count()` is the same as `count(*)`, as SQL:2016 and Trino allow.
             if kind != AggKind::Count {
-                return Err(MrError::Expr(format!(
+                return Err(self.err_here(format!(
                     "{kind:?}() needs an argument; only COUNT() may be empty"
                 )));
             }
             AggArg::Star
         } else if matches!(self.peek(), Some(Tok::Star)) {
+            let at = self.pos;
             self.next();
             if kind != AggKind::Count {
-                return Err(MrError::Expr(format!(
-                    "{kind:?}(*) is not valid; only COUNT(*) is allowed"
-                )));
+                return Err(self.err_at(
+                    at,
+                    format!("{kind:?}(*) is not valid; only COUNT(*) is allowed"),
+                ));
             }
             AggArg::Star
         } else if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)))
             && matches!(self.peek_at(1), Some(Tok::Dot))
             && matches!(self.peek_at(2), Some(Tok::Star))
         {
+            let at = self.pos;
             let var = match self.next() {
                 Some(Tok::Ident(v)) => v.to_ascii_uppercase(),
                 // A quoted label keeps its exact spelling.
@@ -546,9 +612,10 @@ impl Parser {
             self.next(); // dot
             self.next(); // star
             if kind != AggKind::Count {
-                return Err(MrError::Expr(format!(
-                    "{kind:?}({var}.*) is not valid; only COUNT(A.*) is allowed"
-                )));
+                return Err(self.err_at(
+                    at,
+                    format!("{kind:?}({var}.*) is not valid; only COUNT(A.*) is allowed"),
+                ));
             }
             AggArg::QualStar(var)
         } else {
@@ -559,24 +626,33 @@ impl Parser {
     }
 
     fn parse_interval(&mut self) -> Result<Expr> {
+        let count_at = self.pos;
         let n = match self.next() {
             Some(Tok::Int(n)) => n,
-            Some(Tok::Str(s)) => s
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| MrError::Expr(format!("invalid INTERVAL count '{s}'")))?,
+            Some(Tok::Str(ref s)) => match s.trim().parse::<i64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    return Err(self.err_at(count_at, format!("invalid INTERVAL count '{s}'")))
+                }
+            },
             other => {
-                return Err(MrError::Expr(format!(
-                    "expected a count after INTERVAL, found {other:?}"
-                )))
+                return Err(self.err_at(
+                    count_at,
+                    format!(
+                        "expected a count after INTERVAL, found {}",
+                        found(other.as_ref())
+                    ),
+                ))
             }
         };
+        let unit_at = self.pos;
         let unit = match self.next() {
             Some(Tok::Ident(u)) => u.to_ascii_uppercase(),
             other => {
-                return Err(MrError::Expr(format!(
-                    "expected an INTERVAL unit, found {other:?}"
-                )))
+                return Err(self.err_at(
+                    unit_at,
+                    format!("expected an INTERVAL unit, found {}", found(other.as_ref())),
+                ))
             }
         };
         let (months, days, nanos): (i32, i32, i64) = match unit.trim_end_matches('S') {
@@ -590,9 +666,7 @@ impl Parser {
             "MILLISECOND" => (0, 0, n * 1_000_000),
             "MICROSECOND" => (0, 0, n * 1_000),
             other => {
-                return Err(MrError::Expr(format!(
-                    "unsupported INTERVAL unit '{other}'"
-                )))
+                return Err(self.err_at(unit_at, format!("unsupported INTERVAL unit '{other}'")))
             }
         };
         Ok(Expr::Interval {
@@ -604,12 +678,14 @@ impl Parser {
 
     /// Parse a SQL type name into a [`Ty`].
     fn parse_ty(&mut self) -> Result<Ty> {
+        let name_at = self.pos;
         let name = match self.next() {
             Some(Tok::Ident(s)) => s.to_ascii_uppercase(),
             other => {
-                return Err(MrError::Expr(format!(
-                    "expected a type name, found {other:?}"
-                )))
+                return Err(self.err_at(
+                    name_at,
+                    format!("expected a type name, found {}", found(other.as_ref())),
+                ))
             }
         };
         match name.as_str() {
@@ -649,35 +725,39 @@ impl Parser {
             "TIMESTAMP" | "DATETIME" => Ok(Ty::Timestamp(TimeUnit::Micro)),
             "TIME" => Ok(Ty::Time(TimeUnit::Micro)),
             "INTERVAL" => Ok(Ty::Interval),
-            other => Err(MrError::Expr(format!("unknown type name '{other}'"))),
+            other => Err(self.err_at(name_at, format!("unknown type name '{other}'"))),
         }
     }
 
     fn expect_int(&mut self) -> Result<i64> {
+        let at = self.pos;
         match self.next() {
             Some(Tok::Int(n)) => Ok(n),
-            other => Err(MrError::Expr(format!(
-                "expected an integer, found {other:?}"
-            ))),
+            other => Err(self.err_at(
+                at,
+                format!("expected an integer, found {}", found(other.as_ref())),
+            )),
         }
     }
 }
 
 /// Parse a DEFINE / MEASURES expression string into an [`Expr`] AST.
 pub fn parse(src: &str) -> Result<Expr> {
-    let toks = lex(src)?;
+    let (toks, spans) = lex_spanned(src)?;
     if toks.is_empty() {
         return Err(MrError::Expr("empty expression".into()));
     }
     let mut p = Parser {
+        src: src.to_string(),
         toks,
+        spans,
         pos: 0,
         depth: 0,
     };
     let e = p.parse_expr(0)?;
     if p.pos != p.toks.len() {
-        return Err(MrError::Expr(format!(
-            "unexpected trailing tokens starting at {:?}",
+        return Err(p.err_here(format!(
+            "unexpected trailing input starting at '{}'",
             p.toks[p.pos]
         )));
     }
@@ -686,15 +766,17 @@ pub fn parse(src: &str) -> Result<Expr> {
 
 /// Parse a standalone SQL type name (used for the `type` override on measures).
 pub fn parse_type_name(src: &str) -> Result<Ty> {
-    let toks = lex(src)?;
+    let (toks, spans) = lex_spanned(src)?;
     let mut p = Parser {
+        src: src.to_string(),
         toks,
+        spans,
         pos: 0,
         depth: 0,
     };
     let ty = p.parse_ty()?;
     if p.pos != p.toks.len() {
-        return Err(MrError::Expr(format!("trailing tokens in type '{src}'")));
+        return Err(p.err_here(format!("trailing tokens in type '{src}'")));
     }
     Ok(ty)
 }

@@ -197,6 +197,16 @@ bind a variable; `measures` computes the output columns.
 DEFINE predicates are always **RUNNING**: they see only the rows matched so far,
 which is what lets a predicate refer back to the match in progress.
 
+Both clauses are **type-checked at bind**, before any data is read: a predicate
+must be BOOLEAN, and every column and pattern variable it names must exist. A
+predicate that could never be true — `{"B": "price"}`, or `{"B": "sym > 3"}`
+comparing a VARCHAR with an integer — is an error rather than an empty result,
+and the error names the key it came from:
+
+```text
+match_recognize type-inference error: define['B']: cannot compare VARCHAR with BIGINT
+```
+
 **A bare `A.price` means `LAST(A.price)`** under the prevailing RUNNING/FINAL
 horizon — the last row bound to `A`, or NULL if `A` has not bound one yet. So
 match-dependent predicates read the way you would write them:

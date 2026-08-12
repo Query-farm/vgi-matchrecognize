@@ -50,7 +50,7 @@ pub fn infer(expr: &Expr, schema: &dyn BindSchema) -> Result<Ty> {
             if t.is_numeric() || t == Ty::Null {
                 Ok(t)
             } else {
-                Err(MrError::Infer(format!("cannot negate a {t:?} value")))
+                Err(MrError::Infer(format!("cannot negate a {t} value")))
             }
         }
         Expr::Not(e) => expect_bool(e, schema, "NOT"),
@@ -87,7 +87,7 @@ fn expect_bool(e: &Expr, schema: &dyn BindSchema, ctx: &str) -> Result<Ty> {
         Ok(Ty::Boolean)
     } else {
         Err(MrError::Infer(format!(
-            "{ctx} requires a BOOLEAN operand, got {t:?}"
+            "{ctx} requires a BOOLEAN operand, got {t}"
         )))
     }
 }
@@ -112,10 +112,10 @@ fn infer_agg(kind: AggKind, arg: &AggArg, schema: &dyn BindSchema) -> Result<Ty>
             match kind {
                 AggKind::Sum => inner
                     .sum_ty()
-                    .ok_or_else(|| MrError::Infer(format!("SUM of non-numeric {inner:?}"))),
+                    .ok_or_else(|| MrError::Infer(format!("SUM of non-numeric {inner}"))),
                 AggKind::Avg => inner
                     .avg_ty()
-                    .ok_or_else(|| MrError::Infer(format!("AVG of non-numeric {inner:?}"))),
+                    .ok_or_else(|| MrError::Infer(format!("AVG of non-numeric {inner}"))),
                 // A list of whatever the argument is; an empty match yields an
                 // empty list, so the element type still comes from the argument.
                 AggKind::ArrayAgg => Ok(Ty::List(Box::new(inner))),
@@ -135,7 +135,7 @@ fn infer_binary(op: BinOp, lhs: &Expr, rhs: &Expr, schema: &dyn BindSchema) -> R
             for (t, side) in [(l, "left"), (r, "right")] {
                 if t != Ty::Boolean && t != Ty::Null {
                     return Err(MrError::Infer(format!(
-                        "logical operator requires BOOLEAN operands, {side} is {t:?}"
+                        "logical operator requires BOOLEAN operands, {side} is {t}"
                     )));
                 }
             }
@@ -147,7 +147,7 @@ fn infer_binary(op: BinOp, lhs: &Expr, rhs: &Expr, schema: &dyn BindSchema) -> R
             if comparable(&l, &r) {
                 Ok(Ty::Boolean)
             } else {
-                Err(MrError::Infer(format!("cannot compare {l:?} with {r:?}")))
+                Err(MrError::Infer(format!("cannot compare {l} with {r}")))
             }
         }
         Concat => Ok(Ty::Varchar),
@@ -212,17 +212,17 @@ fn arith_div(l: Ty, r: Ty) -> Result<Ty> {
     if (l.is_numeric() || l == Ty::Null) && (r.is_numeric() || r == Ty::Null) {
         Ok(Ty::Double)
     } else {
-        Err(MrError::Infer(format!("cannot divide {l:?} by {r:?}")))
+        Err(MrError::Infer(format!("cannot divide {l} by {r}")))
     }
 }
 
 fn numeric_promote(l: Ty, r: Ty, sym: &str) -> Result<Ty> {
     if (l.is_numeric() || l == Ty::Null) && (r.is_numeric() || r == Ty::Null) {
         l.unify(&r)
-            .ok_or_else(|| MrError::Infer(format!("cannot apply '{sym}' to {l:?} and {r:?}")))
+            .ok_or_else(|| MrError::Infer(format!("cannot apply '{sym}' to {l} and {r}")))
     } else {
         Err(MrError::Infer(format!(
-            "cannot apply '{sym}' to {l:?} and {r:?}"
+            "cannot apply '{sym}' to {l} and {r}"
         )))
     }
 }

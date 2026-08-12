@@ -4,6 +4,8 @@
 //! Keeping this Arrow-free lets the whole inference pass be unit-tested with a
 //! plain `name -> Ty` map and no Arrow/VGI machinery.
 
+use std::fmt;
+
 /// Time resolution for temporal types (mirrors Arrow's `TimeUnit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimeUnit {
@@ -50,6 +52,41 @@ pub enum Ty {
     /// column. Unifies with anything; a measure that resolves to `Null` with no
     /// `type` override is a bind error.
     Null,
+}
+
+/// The DuckDB spelling of this type — what a user would write in a `CAST`, and
+/// what the `type` override on a measure accepts.
+///
+/// Type names reach users through every inference error ("cannot compare
+/// VARCHAR with BIGINT"), so they must be SQL, not the Rust variant names:
+/// `Varchar`/`Int64` name our AST rather than anything the reader can write.
+/// The spellings here match the `Ty` -> DuckDB column of the table above, and
+/// round-trip through `expr::parser::parse_type_name`.
+impl fmt::Display for Ty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Ty::Boolean => f.write_str("BOOLEAN"),
+            Ty::Int64 => f.write_str("BIGINT"),
+            Ty::HugeInt => f.write_str("HUGEINT"),
+            Ty::Double => f.write_str("DOUBLE"),
+            Ty::Decimal(p, s) => write!(f, "DECIMAL({p},{s})"),
+            Ty::Varchar => f.write_str("VARCHAR"),
+            Ty::Date => f.write_str("DATE"),
+            // DuckDB spells the non-microsecond resolutions with a suffix, and
+            // plain `TIMESTAMP` for microseconds.
+            Ty::Timestamp(u) => match u {
+                TimeUnit::Second => f.write_str("TIMESTAMP_S"),
+                TimeUnit::Milli => f.write_str("TIMESTAMP_MS"),
+                TimeUnit::Micro => f.write_str("TIMESTAMP"),
+                TimeUnit::Nano => f.write_str("TIMESTAMP_NS"),
+            },
+            // TIME has one spelling in DuckDB whatever the underlying unit.
+            Ty::Time(_) => f.write_str("TIME"),
+            Ty::Interval => f.write_str("INTERVAL"),
+            Ty::List(elem) => write!(f, "{elem}[]"),
+            Ty::Null => f.write_str("NULL"),
+        }
+    }
 }
 
 impl Ty {

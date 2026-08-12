@@ -11,7 +11,8 @@
 //!              | '{' n ',' m '}' | '{' ',' m '}') '?'?
 //! ```
 
-use super::lexer::{lex, Tok};
+use super::lexer::{lex_spanned, Tok};
+use crate::diag::point_at;
 use crate::error::{MrError, Result};
 
 /// A partition-edge anchor.
@@ -131,8 +132,21 @@ fn permutations(order: &[usize], at: usize, emit: &mut impl FnMut(&[usize])) {
     }
 }
 
+/// How a token reads inside an error message: its source text in quotes, or a
+/// phrase for the end of input.
+fn found(t: Option<&Tok>) -> String {
+    match t {
+        Some(t) => format!("'{t}'"),
+        None => "end of pattern".to_string(),
+    }
+}
+
 struct Parser {
+    /// The pattern as written, kept so an error can point a caret into it.
+    src: String,
     toks: Vec<Tok>,
+    /// Starting character index of each token, indexed alongside `toks`.
+    spans: Vec<usize>,
     pos: usize,
     depth: u32,
 }
@@ -149,6 +163,26 @@ impl Parser {
         Ok(())
     }
 
+    /// Character index token `i` starts at; one past the end of the source for
+    /// the position after the last token, which is where "found end of pattern"
+    /// wants its caret.
+    fn span(&self, i: usize) -> usize {
+        self.spans
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| self.src.chars().count())
+    }
+
+    /// A pattern error pointing at token `i`.
+    fn err_at(&self, i: usize, msg: impl std::fmt::Display) -> MrError {
+        MrError::Pattern(format!("{msg}{}", point_at(&self.src, self.span(i))))
+    }
+
+    /// A pattern error pointing at the token about to be read.
+    fn err_here(&self, msg: impl std::fmt::Display) -> MrError {
+        self.err_at(self.pos, msg)
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
@@ -162,12 +196,13 @@ impl Parser {
     }
 
     fn expect(&mut self, t: &Tok) -> Result<()> {
+        let at = self.pos;
         match self.next() {
             Some(ref got) if got == t => Ok(()),
-            Some(got) => Err(MrError::Pattern(format!("expected {t:?}, found {got:?}"))),
-            None => Err(MrError::Pattern(format!(
-                "expected {t:?}, found end of pattern"
-            ))),
+            other => Err(self.err_at(
+                at,
+                format!("expected '{t}', found {}", found(other.as_ref())),
+            )),
         }
     }
 
@@ -314,28 +349,38 @@ impl Parser {
                 }
             }
             other => {
-                return Err(MrError::Pattern(format!(
-                    "malformed quantifier, expected a number or ',' after '{{', found {other:?}"
+                return Err(self.err_here(format!(
+                    "malformed quantifier, expected a number or ',' after '{{', found {}",
+                    found(other)
                 )))
             }
         };
+        // The `{` is already consumed, so point the bound error at the whole
+        // quantifier rather than at whatever token happens to follow it.
+        let opening = self.pos;
         self.expect(&Tok::RBrace)?;
         if let (lo, Some(hi)) = result {
             if hi < lo {
-                return Err(MrError::Pattern(format!(
-                    "quantifier upper bound {hi} is less than lower bound {lo}"
-                )));
+                return Err(self.err_at(
+                    opening,
+                    format!("quantifier upper bound {hi} is less than lower bound {lo}"),
+                ));
             }
         }
         Ok(result)
     }
 
     fn expect_num(&mut self) -> Result<usize> {
+        let at = self.pos;
         match self.next() {
             Some(Tok::Num(n)) => Ok(n),
-            other => Err(MrError::Pattern(format!(
-                "expected a number in quantifier, found {other:?}"
-            ))),
+            other => Err(self.err_at(
+                at,
+                format!(
+                    "expected a number in quantifier, found {}",
+                    found(other.as_ref())
+                ),
+            )),
         }
     }
 
@@ -401,6 +446,7 @@ impl Parser {
                 return self.permute();
             }
         }
+        let at = self.pos;
         match self.next() {
             Some(Tok::Var(v)) => Ok(Pattern::Var(v)),
             Some(Tok::Caret) => Ok(Pattern::Anchor(Anchor::Start)),
@@ -410,28 +456,34 @@ impl Parser {
                 self.expect(&Tok::RParen)?;
                 Ok(inner)
             }
-            other => Err(MrError::Pattern(format!(
-                "expected a variable, '(', '^', or '$', found {other:?}"
-            ))),
+            other => Err(self.err_at(
+                at,
+                format!(
+                    "expected a variable, '(', '^', or '$', found {}",
+                    found(other.as_ref())
+                ),
+            )),
         }
     }
 }
 
 /// Parse a PATTERN string into a [`Pattern`] AST.
 pub fn parse(src: &str) -> Result<Pattern> {
-    let toks = lex(src)?;
+    let (toks, spans) = lex_spanned(src)?;
     if toks.is_empty() {
         return Err(MrError::Pattern("pattern is empty".into()));
     }
     let mut p = Parser {
+        src: src.to_string(),
         toks,
+        spans,
         pos: 0,
         depth: 0,
     };
     let pat = p.alternation()?;
     if p.pos != p.toks.len() {
-        return Err(MrError::Pattern(format!(
-            "unexpected trailing tokens starting at {:?}",
+        return Err(p.err_here(format!(
+            "unexpected trailing input starting at '{}'",
             p.toks[p.pos]
         )));
     }
