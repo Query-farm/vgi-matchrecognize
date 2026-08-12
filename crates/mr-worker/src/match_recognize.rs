@@ -161,6 +161,10 @@ fn projection(plan: &Plan, input_schema: &SchemaRef) -> Vec<usize> {
 /// is perfectly safe. See `crates/mr-wasm/src/lib.rs`, which selects it.
 pub(crate) fn storage_backend_ok(configured: Option<&str>, multi_process: bool) -> Result<()> {
     let is_memory = configured.is_some_and(|v| v.eq_ignore_ascii_case("memory"));
+    // A local spool carries the buffered batches across processes on its own, so the
+    // SDK store only has to hold the small control records — but those matter too
+    // (the schemas the finalize phase replays), so `memory` stays refused when the
+    // phases can land in different processes.
     if is_memory && multi_process {
         return Err(ve(
             "match_recognize: VGI_WORKER_SHARED_STORAGE=memory cannot be used with a buffering \
@@ -390,6 +394,7 @@ impl TableBufferingFunction for MatchRecognize {
         let store = BatchRowStore::new(projected_schema, batches);
         let tapes = plan.partition_tapes(&store).map_err(ve)?;
         Ok(Box::new(PartitionStream {
+            scope: state.scope.clone(),
             plan,
             store,
             tapes: tapes.into_iter(),
@@ -416,6 +421,21 @@ struct PartitionStream {
     store: BatchRowStore,
     tapes: std::vec::IntoIter<(String, Vec<usize>)>,
     output_schema: SchemaRef,
+    /// The execution's storage scope, so the local spool can be deleted when this
+    /// producer goes away.
+    scope: Vec<u8>,
+}
+
+impl Drop for PartitionStream {
+    /// Delete the execution's spooled batches.
+    ///
+    /// Fires on normal end-of-stream *and* on cancellation (DuckDB stopping early,
+    /// e.g. a LIMIT), which is the only teardown hook a buffering producer gets. A
+    /// query that dies before finalize never reaches this, which is why the spool also
+    /// sweeps stale directories on first use.
+    fn drop(&mut self) {
+        crate::spool::discard(&self.scope);
+    }
 }
 
 impl TableProducer for PartitionStream {

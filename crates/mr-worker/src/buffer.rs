@@ -118,6 +118,13 @@ pub fn append_batch(
     batch: &RecordBatch,
     batch_index: Option<i64>,
 ) -> Result<()> {
+    // Prefer the local spool: the SDK store's append is ~20x the cost of serialising
+    // the batch, for a payload that is only ever written once and read back once. It
+    // declines (rather than failing) where a local file cannot work, and finalize
+    // reads both sources, so a mixed run is fine.
+    if crate::spool::append(scope, batch, batch_index)? {
+        return Ok(());
+    }
     // Absent index sorts before every real one, and the sort below is stable, so a
     // run without indices keeps arrival order — exactly the old behaviour.
     let mut record = batch_index.unwrap_or(i64::MIN).to_le_bytes().to_vec();
@@ -151,16 +158,19 @@ pub fn append_batch(
 pub fn read_batches(storage: &SharedStorage, state: &FinalizeState) -> Result<Vec<RecordBatch>> {
     let scope = &state.scope;
     let mut indexed: Vec<(i64, RecordBatch)> = Vec::new();
-    let mut buffered_rows = 0usize;
+    // The local spool first, then the SDK log. Which sink used which is not recorded
+    // anywhere: reading both and merging on the batch index is simpler than a mode
+    // flag, and it means a sink that fell back mixes with one that did not.
+    let spooled = crate::spool::read_all(scope)?;
+    let spooled_rows: usize = spooled.iter().map(|(_, b)| b.num_rows()).sum();
+    indexed.extend(spooled);
     for bytes in scan_log(storage, scope, NS_BATCHES) {
         if bytes.len() < 8 {
             return Err(re("match_recognize: truncated buffered batch record"));
         }
         let (head, payload) = bytes.split_at(8);
         let index = i64::from_le_bytes(head.try_into().expect("8 bytes"));
-        let b = ipc::read_batch(payload)?;
-        buffered_rows += b.num_rows();
-        indexed.push((index, b));
+        indexed.push((index, ipc::read_batch(payload)?));
     }
     // Restore the input order. Batches arrive in whatever order a parallel sink
     // produced them, so without this the buffered relation is in arrival order and
@@ -168,8 +178,12 @@ pub fn read_batches(storage: &SharedStorage, state: &FinalizeState) -> Result<Ve
     // A stable sort keeps arrival order among equal indices.
     indexed.sort_by_key(|(index, _)| *index);
     let batches: Vec<RecordBatch> = indexed.into_iter().map(|(_, b)| b).collect();
+    let buffered_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-    let mut expected_rows = 0usize;
+    // Row-count records exist only for batches that went through the SDK store; the
+    // spool needs none, because a file write reports its own failure and every record
+    // is length-prefixed, so loss there cannot be silent.
+    let mut expected_rows = spooled_rows;
     for bytes in scan_log(storage, scope, NS_ROWS) {
         let n: [u8; 8] = bytes
             .as_slice()

@@ -187,5 +187,86 @@ fn finalize_errors_when_sinks_ran_but_nothing_was_buffered() {
     assert_eq!(back.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
 
     store.clear(&scope);
+    // `append_batch` prefers the local spool, and only a producer's Drop deletes it.
+    mr_worker::spool::discard(&scope);
     let _ = std::fs::remove_file(&path);
+}
+
+/// The local spool round-trips what it is given, including from several threads at
+/// once — each writes its own file, so there is no interleaving and no lock.
+#[test]
+fn spool_round_trips_including_concurrent_writers() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use mr_worker::spool;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let batch = |from: i64, n: i64| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((from..from + n).collect::<Vec<_>>()))
+                    as arrow_array::ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    // Sequential: batch indices are preserved, not positions.
+    let scope = format!("spool-seq-{}", std::process::id()).into_bytes();
+    for i in 0..5i64 {
+        assert!(
+            spool::append(&scope, &batch(i * 10, 3), Some(i)).unwrap(),
+            "the spool should be available on this platform"
+        );
+    }
+    let mut back = spool::read_all(&scope).unwrap();
+    back.sort_by_key(|(i, _)| *i);
+    assert_eq!(back.len(), 5);
+    assert_eq!(
+        back.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    assert_eq!(back.iter().map(|(_, b)| b.num_rows()).sum::<usize>(), 15);
+    spool::discard(&scope);
+    assert!(
+        spool::read_all(&scope).unwrap().is_empty(),
+        "discard removes it"
+    );
+
+    // Concurrent: 8 threads x 50 batches, each thread on its own file.
+    let scope = format!("spool-conc-{}", std::process::id()).into_bytes();
+    const THREADS: i64 = 8;
+    const PER: i64 = 50;
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let scope = scope.clone();
+            let schema = schema.clone();
+            s.spawn(move || {
+                for k in 0..PER {
+                    let b = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int64Array::from(vec![t, k])) as arrow_array::ArrayRef],
+                    )
+                    .unwrap();
+                    spool::append(&scope, &b, Some(t * PER + k)).unwrap();
+                }
+            });
+        }
+    });
+    let back = spool::read_all(&scope).unwrap();
+    assert_eq!(back.len(), (THREADS * PER) as usize, "no records lost");
+    let mut seen: Vec<i64> = back.iter().map(|(i, _)| *i).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        (THREADS * PER) as usize,
+        "no torn or duplicated records"
+    );
+    assert_eq!(
+        back.iter().map(|(_, b)| b.num_rows()).sum::<usize>(),
+        (THREADS * PER * 2) as usize
+    );
+    spool::discard(&scope);
 }
