@@ -137,6 +137,7 @@ A regular expression over **pattern variables**, not characters:
 | Reluctant     | `A+?`, `A*?`, `A{2,}?`            | match as few rows as possible |
 | Grouping      | `(A B)+`                          | quantify or alternate a sub-pattern |
 | Anchors       | `^A`, `A$`                        | partition start / end |
+| Permutation   | `PERMUTE(A, B, C)`                | A, B and C in any order — the alternation of every permutation, preferring the order written |
 
 Unquoted variable names are case-insensitive and canonicalize to upper case. A
 **double-quoted** name is case-sensitive, so `"b"` and `b` are different variables
@@ -150,9 +151,9 @@ bind a variable; `measures` computes the output columns.
 | | you can write |
 |---|---|
 | Columns | `price`, `A.price`, `"My Col"` |
-| Navigation | `PREV`/`NEXT`/`FIRST`/`LAST(expr[, n])` |
+| Navigation | `PREV`/`NEXT`/`FIRST`/`LAST(expr[, n])`; `LAG`/`LEAD` are accepted as Snowflake spells `PREV`/`NEXT` |
 | Aggregates | `SUM` `COUNT` `AVG` `MIN` `MAX` `ARRAY_AGG` `ARBITRARY`, plus `COUNT(*)`, `COUNT()`, `COUNT(A.*)` |
-| Match info | `CLASSIFIER([label])`, `MATCH_NUMBER()` |
+| Match info | `CLASSIFIER([label])`, `MATCH_NUMBER()`, `MATCH_SEQUENCE_NUMBER()` (the row's 1-based position in its match) |
 | Horizon | `RUNNING` / `FINAL` |
 | Operators | arithmetic, comparison, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `BETWEEN`, `IN`, `\|\|`, `CAST`/`::` |
 | Scalars | `abs` `ceil` `floor` `round` `sqrt` `lower` `upper` `trim` `ltrim` `rtrim` `length` `coalesce` `nullif` `greatest` `least` |
@@ -411,19 +412,30 @@ session is bounded by the budget, not by the OS stack. Deeply nested
 
 ## Conformance
 
-**132 assertions ported from Trino's `MATCH_RECOGNIZE` test suite** run as part of
-the end-to-end suite (`test/sql/trino_conformance.test`). Of the 150 cases
-expressible on this surface, **none produces a wrong answer**: the remaining 18
-error cleanly on features we do not implement — subqueries in `DEFINE`/`MEASURES`,
-two-argument aggregates (`max_by`), a few scalar functions, and the `ALL ROWS`
-column layout above.
+Checked against three other implementations, all inside the end-to-end suite:
 
-Still unimplemented: `PERMUTE`, pattern exclusion `{- … -}`, `WITH UNMATCHED ROWS`,
-and some exotic temporal/`INTERVAL` type-lattice corners (route those through the
-explicit `type` override).
+- **Trino** — 132 assertions ported from its `MATCH_RECOGNIZE` test suite
+  (`test/sql/trino_conformance.test`). Of the 150 cases expressible on this surface,
+  **none produces a wrong answer**; the remaining 18 error cleanly on features we do
+  not implement (subqueries in `DEFINE`/`MEASURES`, two-argument aggregates such as
+  `max_by`, a few scalar functions, and the `ALL ROWS` column layout above).
+  [`test/trino/README.md`](test/trino/README.md) has the tally and how to regenerate it.
+- **Apache Flink** — the portable cases from its `MatchRecognizeITCase`
+  (`test/sql/flink_conformance.test`), which add logical offsets at large indices,
+  aggregates over expressions in `DEFINE`, NULL handling, and multi-key ordering with
+  mixed directions. We agree with Flink on all of them but one, where we report an
+  extra match that SQL:2016 requires and Flink's non-backtracking NFA misses; that
+  case carries the analysis inline. Flink's own documentation lists the standard
+  features it omits, several of which we support (pattern groups, alternation, anchors,
+  `SUBSET`, physical `PREV`/`NEXT`, `ALL ROWS PER MATCH`).
+- **Snowflake** — its documented worked example reproduced exactly, plus coverage of
+  the features reading those docs turned up (`test/sql/snowflake_conformance.test`).
+  Three of them are now supported: `PERMUTE`, `MATCH_SEQUENCE_NUMBER()`, and
+  `LAG`/`LEAD` as spellings of `PREV`/`NEXT`.
 
-[`test/trino/README.md`](test/trino/README.md) has the full tally, the bugs the
-port found, and how to regenerate it.
+Still unimplemented: pattern exclusion `{- … -}`, `WITH UNMATCHED ROWS`, and some
+exotic temporal/`INTERVAL` type-lattice corners (route those through the explicit
+`type` override).
 
 ## Build & test
 

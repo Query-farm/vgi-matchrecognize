@@ -347,11 +347,14 @@ impl Parser {
                     inner: Box::new(inner),
                 })
             }
-            "PREV" | "NEXT" | "FIRST" | "LAST" => {
+            // `LAG`/`LEAD` are how Snowflake spells physical navigation inside
+            // MATCH_RECOGNIZE; SQL:2016 (and Trino, and Oracle) call it PREV/NEXT.
+            // Accepting both means a query can be moved between them unedited.
+            "PREV" | "LAG" | "NEXT" | "LEAD" | "FIRST" | "LAST" => {
                 self.next();
                 let nav = match kw.as_str() {
-                    "PREV" => NavKind::Prev,
-                    "NEXT" => NavKind::Next,
+                    "PREV" | "LAG" => NavKind::Prev,
+                    "NEXT" | "LEAD" => NavKind::Next,
                     "FIRST" => NavKind::First,
                     _ => NavKind::Last,
                 };
@@ -397,6 +400,21 @@ impl Parser {
                 self.expect(&Tok::LParen)?;
                 self.expect(&Tok::RParen)?;
                 Ok(Expr::MatchNumber)
+            }
+            // Snowflake's `MATCH_SEQUENCE_NUMBER()`: the 1-based position of this row
+            // within its match. That is exactly a RUNNING `COUNT(*)`, so it is sugar
+            // rather than a new capability — but it is what a Snowflake query says.
+            "MATCH_SEQUENCE_NUMBER" => {
+                self.next();
+                self.expect(&Tok::LParen)?;
+                self.expect(&Tok::RParen)?;
+                Ok(Expr::RunningFinal {
+                    final_: false,
+                    inner: Box::new(Expr::Agg {
+                        kind: AggKind::Count,
+                        arg: AggArg::Star,
+                    }),
+                })
             }
             _ if matches!(self.peek_at(1), Some(Tok::LParen)) => {
                 // Not a keyword, but applied to an argument list: a scalar

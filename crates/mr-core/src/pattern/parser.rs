@@ -106,6 +106,31 @@ impl Pattern {
 /// Real patterns nest a handful of levels; this reports a clean error instead.
 const MAX_DEPTH: u32 = 128;
 
+/// Most arguments `PERMUTE` accepts. The expansion is factorial — 6 is already 720
+/// alternatives — so this is a guard against a one-line pattern becoming a huge
+/// program, not a limit anyone writing SQL by hand will meet.
+const MAX_PERMUTE_ARGS: usize = 6;
+
+/// Every permutation of `order`, in lexicographic order of the original positions,
+/// handed to `emit` one at a time.
+///
+/// Lexicographic order is the point: it is the preference order the standard gives
+/// `PERMUTE`, so the first permutation that matches is the one that must win.
+fn permutations(order: &[usize], at: usize, emit: &mut impl FnMut(&[usize])) {
+    if at == order.len() {
+        emit(order);
+        return;
+    }
+    // Choosing the smallest remaining element first, and rebuilding rather than
+    // swapping, keeps the emitted sequence lexicographic.
+    for i in at..order.len() {
+        let mut rotated = order.to_vec();
+        let picked = rotated.remove(i);
+        rotated.insert(at, picked);
+        permutations(&rotated, at + 1, emit);
+    }
+}
+
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
@@ -315,7 +340,67 @@ impl Parser {
     }
 
     /// primary := VAR | '(' alternation ')' | '^' | '$'
+    /// `PERMUTE(p1, p2, …)` — matches its arguments in any order.
+    ///
+    /// Desugared here into the alternation of every permutation, which is what the
+    /// standard defines it as. The branch order matters and is not arbitrary: SQL:2016
+    /// says the permutations are tried in lexicographic order of the *argument
+    /// positions*, so `PERMUTE(A, B)` prefers `A B` over `B A`, and that preference is
+    /// what decides which match wins. Emitting them in that order makes the existing
+    /// alternation machinery produce the right answer with no matcher changes.
+    ///
+    /// Capped at [`MAX_PERMUTE_ARGS`] arguments, because the expansion is factorial:
+    /// 6 arguments are already 720 branches, and a cap gives a clear error instead of
+    /// a pattern that compiles into something enormous.
+    fn permute(&mut self) -> Result<Pattern> {
+        self.next(); // PERMUTE
+        self.expect(&Tok::LParen)?;
+        self.enter()?;
+        let mut args = Vec::new();
+        loop {
+            args.push(self.alternation()?);
+            match self.peek() {
+                Some(Tok::Comma) => {
+                    self.next();
+                }
+                _ => break,
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        self.depth -= 1;
+        if args.len() < 2 {
+            return Err(MrError::Pattern(
+                "PERMUTE needs at least two arguments".into(),
+            ));
+        }
+        if args.len() > MAX_PERMUTE_ARGS {
+            return Err(MrError::Pattern(format!(
+                "PERMUTE takes at most {MAX_PERMUTE_ARGS} arguments (it expands to every \
+                 permutation of them, so {} would be {} alternatives)",
+                args.len(),
+                (1..=args.len()).product::<usize>()
+            )));
+        }
+        let mut branches: Vec<Pattern> = Vec::new();
+        let order: Vec<usize> = (0..args.len()).collect();
+        permutations(&order, 0, &mut |perm| {
+            branches.push(Pattern::Concat(
+                perm.iter().map(|&i| args[i].clone()).collect(),
+            ));
+        });
+        Ok(Pattern::Alt(branches))
+    }
+
     fn primary(&mut self) -> Result<Pattern> {
+        // `PERMUTE(A, B, ...)` before the plain-variable case, since it lexes as a
+        // variable followed by `(`.
+        if let Some(Tok::Var(v)) = self.peek() {
+            if v.eq_ignore_ascii_case("PERMUTE")
+                && self.toks.get(self.pos + 1) == Some(&Tok::LParen)
+            {
+                return self.permute();
+            }
+        }
         match self.next() {
             Some(Tok::Var(v)) => Ok(Pattern::Var(v)),
             Some(Tok::Caret) => Ok(Pattern::Anchor(Anchor::Start)),

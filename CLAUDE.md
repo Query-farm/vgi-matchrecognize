@@ -203,6 +203,15 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
   idempotent — which is what keeps the VM from epsilon-looping.
 - An unbounded quantifier (`*`, `+`, `{n,}`) over a **nullable** sub-pattern is
   rejected at compile (it would epsilon-loop); use a bounded form instead.
+- `PERMUTE(a, b, …)` is desugared in the **parser** into the alternation of every
+  permutation, so the matcher needs no notion of it. Branch order is load-bearing:
+  SQL:2016 tries permutations in lexicographic order of the argument positions, which
+  is what makes `PERMUTE(A, B)` prefer `A B`. Capped at 6 arguments (720 branches).
+- Cross-dialect spellings are accepted where they mean the same thing: `LAG`/`LEAD`
+  for `PREV`/`NEXT`, `MATCH_SEQUENCE_NUMBER()` for a RUNNING `COUNT(*)` (both
+  Snowflake), `LIST` for `ARRAY_AGG` and `ANY_VALUE` for `ARBITRARY`. Conformance
+  suites for Trino, Flink and Snowflake all live in `test/sql/*_conformance.test`;
+  the Flink one documents the single case where we deliberately differ.
 
 ## Environment knobs
 

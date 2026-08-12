@@ -1,0 +1,169 @@
+# name: test/sql/snowflake_conformance.test
+# description: MATCH_RECOGNIZE cases and features taken from Snowflake's documentation.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# Source: https://docs.snowflake.com/en/user-guide/match-recognize-introduction
+#
+# Snowflake's documented surface overlaps ours closely, and reading it turned up four
+# things we did not have. Three are now supported and covered below: PERMUTE,
+# MATCH_SEQUENCE_NUMBER(), and LAG/LEAD as spellings of PREV/NEXT. The fourth,
+# exclusion syntax `{- ... -}`, is not — see the end of this file.
+
+# ---------------------------------------------------------------------------
+# The documentation's worked example, verbatim, including its expected output.
+#
+# An independent oracle for: PARTITION BY, AFTER MATCH SKIP TO LAST <var> (which is
+# what makes the two matches overlap on 2020-10-04), COUNT(*) against
+# COUNT(<var>.*), and MATCH_NUMBER.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE stock_price_history (company TEXT, price_date DATE, price INT);
+
+statement ok
+INSERT INTO stock_price_history VALUES
+  ('ABCD','2020-10-01',50),('ABCD','2020-10-02',36),('ABCD','2020-10-03',39),
+  ('ABCD','2020-10-04',42),('ABCD','2020-10-05',30),('ABCD','2020-10-06',47),
+  ('ABCD','2020-10-07',71),('ABCD','2020-10-08',80),('ABCD','2020-10-09',75),
+  ('ABCD','2020-10-10',63);
+
+query TITTIII
+SELECT * FROM mr.match_recognize(
+  (SELECT company, price_date, price FROM stock_price_history),
+  partition_by := ['company'], order_by := ['price_date'],
+  pattern := 'row_before_decrease row_with_price_decrease+ row_with_price_increase+',
+  define := '{"row_with_price_decrease":"price < PREV(price)","row_with_price_increase":"price > PREV(price)"}',
+  measures := '{"match_number":"MATCH_NUMBER()","start_date":"FIRST(price_date)","end_date":"LAST(price_date)","rows_in_sequence":"COUNT(*)","num_decreases":"COUNT(row_with_price_decrease.*)","num_increases":"COUNT(row_with_price_increase.*)"}',
+  after := 'to last row_with_price_increase')
+ORDER BY company, match_number;
+----
+ABCD	1	2020-10-01	2020-10-04	4	1	2
+ABCD	2	2020-10-04	2020-10-08	5	1	3
+
+# The same query written the way Snowflake spells navigation — LAG instead of PREV.
+# Same answer, since they are the same operation under a different name.
+query TITTIII
+SELECT * FROM mr.match_recognize(
+  (SELECT company, price_date, price FROM stock_price_history),
+  partition_by := ['company'], order_by := ['price_date'],
+  pattern := 'row_before_decrease row_with_price_decrease+ row_with_price_increase+',
+  define := '{"row_with_price_decrease":"price < LAG(price)","row_with_price_increase":"price > LAG(price)"}',
+  measures := '{"match_number":"MATCH_NUMBER()","start_date":"FIRST(price_date)","end_date":"LAST(price_date)","rows_in_sequence":"COUNT(*)","num_decreases":"COUNT(row_with_price_decrease.*)","num_increases":"COUNT(row_with_price_increase.*)"}',
+  after := 'to last row_with_price_increase')
+ORDER BY company, match_number;
+----
+ABCD	1	2020-10-01	2020-10-04	4	1	2
+ABCD	2	2020-10-04	2020-10-08	5	1	3
+
+# LEAD is NEXT: on the last row of the partition it has nothing to read, so NULL.
+query II
+SELECT nxt, prv FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1,10),(2,20),(3,30)) t(i,p)),
+  order_by := ['i'], pattern := 'X+', define := '{}',
+  measures := '{"nxt":"LEAD(p)","prv":"LAG(p)"}', rows := 'all');
+----
+20	NULL
+30	10
+NULL	20
+
+# ---------------------------------------------------------------------------
+# PERMUTE — matches its arguments in any order.
+#
+# The expansion is the alternation of every permutation, and the *order* of those
+# alternatives is not cosmetic: SQL:2016 tries them in lexicographic order of the
+# argument positions, so `PERMUTE(X, Y)` prefers `X Y` over `Y X`. explain_pattern
+# shows the desugaring.
+# ---------------------------------------------------------------------------
+query I
+SELECT mr.explain_pattern('PERMUTE(A, B)');
+----
+((A · B) | (B · A))
+
+# Snowflake's own PERMUTE example, which also shows quantified arguments surviving it.
+query I
+SELECT mr.explain_pattern('PERMUTE(UP{2}, DOWN+)');
+----
+(((UP){2}greedy · (DOWN)+greedy) | ((DOWN)+greedy · (UP){2}greedy))
+
+# Data ordered a, b, b, a: the first match takes the arguments in order, the second in
+# the other order — which is the whole point of the operator.
+query IT
+SELECT match_number, cls FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1,'a'),(2,'b'),(3,'b'),(4,'a')) t(i,n)),
+  order_by := ['i'], pattern := 'PERMUTE(X, Y)',
+  define := '{"X":"n = ''a''","Y":"n = ''b''"}',
+  measures := '{"match_number":"MATCH_NUMBER()","cls":"array_agg(CLASSIFIER())"}');
+----
+1	[X, Y]
+2	[Y, X]
+
+# Three-way permutation: 6 alternatives, and the preference order still decides.
+query T
+SELECT cls FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1,'c'),(2,'a'),(3,'b')) t(i,n)),
+  order_by := ['i'], pattern := 'PERMUTE(X, Y, Z)',
+  define := '{"X":"n = ''a''","Y":"n = ''b''","Z":"n = ''c''"}',
+  measures := '{"cls":"array_agg(CLASSIFIER())"}');
+----
+[Z, X, Y]
+
+# Guard rails: the expansion is factorial, so the argument count is capped, and one
+# argument is not a permutation of anything.
+statement error
+SELECT mr.explain_pattern('PERMUTE(A)');
+----
+at least two arguments
+
+statement error
+SELECT mr.explain_pattern('PERMUTE(A, B, C, D, E, F, G)');
+----
+at most 6 arguments
+
+# ---------------------------------------------------------------------------
+# MATCH_SEQUENCE_NUMBER() — the 1-based position of a row within its match.
+#
+# Sugar for a RUNNING COUNT(*), but it is what a Snowflake query says, and under
+# ALL ROWS PER MATCH it restarts per match rather than running on.
+# ---------------------------------------------------------------------------
+query III
+SELECT match_number, seq, p FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1,10),(2,20),(3,5),(4,10)) t(i,p)),
+  order_by := ['i'], pattern := 'X Y',
+  define := '{"Y":"p > PREV(p)"}',
+  measures := '{"match_number":"MATCH_NUMBER()","seq":"MATCH_SEQUENCE_NUMBER()","p":"p"}',
+  rows := 'all');
+----
+1	1	10
+1	2	20
+2	1	5
+2	2	10
+
+# ---------------------------------------------------------------------------
+# `{,limit}` — an upper bound with no lower one, which the documentation lists
+# alongside `{n,m}`. `X{,3}` over four rows takes three then one.
+# ---------------------------------------------------------------------------
+query II
+SELECT match_number, n FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1,1),(2,2),(3,3),(4,4)) t(i,p)),
+  order_by := ['i'], pattern := 'X{,3}', define := '{"X":"p > 0"}',
+  measures := '{"match_number":"MATCH_NUMBER()","n":"COUNT(*)"}');
+----
+1	3
+2	1
+
+# ---------------------------------------------------------------------------
+# NOT SUPPORTED: exclusion syntax, `PATTERN ({- A -} B)`.
+#
+# Rows matched by an excluded part still participate in the match but are left out of
+# ALL ROWS PER MATCH output. Neither we nor Flink implement it. Pinned as an error so
+# the message stays a clear "unsupported" rather than a confusing parse failure, and
+# so this file records the gap.
+# ---------------------------------------------------------------------------
+statement error
+SELECT mr.explain_pattern('{- A -} B');
+----
+pattern error

@@ -1,0 +1,190 @@
+# name: test/sql/flink_conformance.test
+# description: MATCH_RECOGNIZE cases ported from Apache Flink's MatchRecognizeITCase.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# Ported by hand from Flink 2.x:
+#   flink-table/flink-table-planner/src/test/java/org/apache/flink/table/planner/
+#     runtime/batch/sql/MatchRecognizeITCase.java
+#   .../runtime/stream/sql/MatchRecognizeITCase.scala   (same cases, streaming)
+#
+# The data and the expected rows are Flink's; only the syntax is translated (its
+# MATCH_RECOGNIZE clause becomes our function call, and its backtick-quoted labels
+# become SQL double-quoted ones). Every case below agrees with Flink exactly, except
+# `logical_offsets`, which is called out and explained where it appears.
+#
+# Flink's implementation is a documented *subset* of SQL:2016 — its own "Known
+# Limitations" list excludes pattern groups, alternation, anchors, PERMUTE, exclusion,
+# SUBSET, physical PREV/NEXT offsets, and ALL ROWS PER MATCH entirely — so these cases
+# are narrower than the Trino ones in trino_conformance.test. What they add is
+# coverage of *logical* offsets with large indices, aggregates over expressions in
+# DEFINE, NULL handling, and multi-key ordering with mixed directions.
+#
+# Not portable, and why:
+#   testSimplePatternInProcTime / InEventTime  proctime()/rowtime() and watermarks;
+#                                             the pattern half is ported below
+#   testTimeConstraint                        PATTERN ... WITHIN INTERVAL — a Flink
+#                                             extension, explicitly not SQL standard
+#   testMatchRecognizeAppliedToWindowedGrouping,
+#   testWindowedGroupingAppliedToMatchRecognize,
+#   ...OnLtzRowtime                           TUMBLE windows and MATCH_ROWTIME()
+#   testAccessingCurrentTime                  CURRENT_TIMESTAMP inside MEASURES
+#   testUserDefinedFunctions,
+#   testAggregates (in part)                  Flink UDFs (weightedAvg)
+#   testCodeSplitsAreProperlyGenerated        asserts on Flink's generated Java
+#   testPartitionByWithParallelSource         ported; its point (source parallelism)
+#                                             does not apply to us
+
+# ---------------------------------------------------------------------------
+# testSimplePatternInProcTime / testSimplePatternInEventTime
+#
+# The pattern half of both. Note the label names Flink chose deliberately: `A"`
+# contains a double quote, and the middle one is a lowercase `l` (written l in
+# the Java source) which canonicalises to L. Ours keeps the same distinction —
+# double-quoted labels are case-sensitive and take "" as an escaped quote.
+# ---------------------------------------------------------------------------
+query III
+SELECT aid, bid, cid FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1,'a'),(2,'z'),(3,'b'),(4,'c'),(5,'d'),(6,'a'),(7,'b'),(8,'c'),(9,'h')) t(id,name)),
+  order_by := ['id'], pattern := '"A""" L C',
+  define := '{"A\"":"name = ''a''","L":"name = ''b''","C":"name = ''c''"}',
+  measures := '{"aid":"\"A\"\"\".id","bid":"L.id","cid":"C.id"}');
+----
+6	7	8
+
+# ---------------------------------------------------------------------------
+# testSimplePatternWithNulls
+#
+# A wholly-NULL column read through a qualified reference and through LAST(), plus a
+# NULL row (id 5, 9) that breaks the A B C run. Flink's assert selects the columns
+# out of order — aid, bNull, cid, aNull — which is kept here.
+# ---------------------------------------------------------------------------
+query IIII
+SELECT aid, bNull, cid, aNull FROM mr.match_recognize(
+  (SELECT id, name, CAST(nullField AS VARCHAR) AS nullField
+   FROM (VALUES (1,'a',NULL),(2,'b',NULL),(3,'c',NULL),(4,'d',NULL),(5,NULL,NULL),
+                (6,'a',NULL),(7,'b',NULL),(8,'c',NULL),(9,NULL,NULL)) t(id,name,nullField)),
+  order_by := ['id'], pattern := 'A B C',
+  define := '{"A":"name = ''a'' AND nullField IS NULL","B":"name = ''b'' AND LAST(A.nullField) IS NULL","C":"name = ''c''"}',
+  measures := '{"aid":"A.id","aNull":"A.nullField","bNull":"LAST(B.nullField)","cid":"C.id"}');
+----
+1	NULL	3	NULL
+6	NULL	8	NULL
+
+# ---------------------------------------------------------------------------
+# testEventsAreProperlyOrdered
+#
+# ORDER BY with three keys and mixed directions. The data is arranged so that each of
+# the three keys, taken in turn, is what rejects an otherwise-matching a/b/c run —
+# only the last three rows match, and only if all three keys sort correctly. Flink's
+# timestamps are replaced by the equivalent integers.
+# ---------------------------------------------------------------------------
+query III
+SELECT aid, bid, cid FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (2,12,1,'a',1),(1,11,2,'b',2),(3,10,3,'c',3),
+                         (4,8,4,'a',4),(4,9,5,'b',5),(5,7,6,'c',6),
+                         (6,6,8,'a',7),(6,6,7,'b',8),(8,4,9,'c',9),
+                         (9,3,10,'a',10),(10,2,11,'b',11),(11,1,12,'c',12))
+        t(ts,secondaryOrder,ternaryOrder,name,id)),
+  order_by := ['ts', 'secondaryOrder DESC', 'ternaryOrder ASC'], pattern := 'A B C',
+  define := '{"A":"name = ''a''","B":"name = ''b''","C":"name = ''c''"}',
+  measures := '{"aid":"A.id","bid":"B.id","cid":"C.id"}');
+----
+10	11	12
+
+# ---------------------------------------------------------------------------
+# testLogicalOffsets — WE DELIBERATELY DIFFER FROM FLINK HERE.
+#
+# Flink expects one row, `6,7,8,33,33`. We report that match *and* an earlier one at
+# tstamps 1..3, because SQL:2016 requires the greedy `DOWN{2,}` to give rows back when
+# what follows cannot match:
+#
+#   rows 1..3 are prices 19, 17, 13. DOWN takes all three greedily; UP then needs
+#   `price < FIRST(DOWN.price)` = 19 at row 4 (price 20), which fails. Backtracking
+#   one row leaves DOWN = {19, 17} — still satisfying {2,} — and UP = row 3, where
+#   13 < 19 holds. That is a match, and it starts before the one Flink reports.
+#
+# Flink's engine is an NFA that does not give rows back, and its documentation says so
+# in effect: "It is not possible to use a greedy quantifier for the last variable of a
+# pattern". Our quantifier semantics are pinned instead against Trino, which
+# implements the standard's preference order — all 132 cases in
+# trino_conformance.test pass, 32 of them from testPatternQuantifiers.
+#
+# So this case is kept as a *documented divergence*: the expectation below is ours.
+# ---------------------------------------------------------------------------
+query IIIII
+SELECT * FROM mr.match_recognize(
+  (SELECT * FROM (VALUES ('ACME',1,19,1),('ACME',2,17,2),('ACME',3,13,3),('ACME',4,20,4),
+                         ('ACME',5,20,5),('ACME',6,26,6),('ACME',7,20,7),('ACME',8,25,8))
+        t(symbol,tstamp,price,tax)),
+  order_by := ['tstamp'], pattern := 'DOWN{2,} UP',
+  define := '{"DOWN":"price < LAST(DOWN.price, 1) OR LAST(DOWN.price, 1) IS NULL","UP":"price < FIRST(DOWN.price)"}',
+  measures := '{"start_tstamp":"FIRST(DOWN.tstamp)","bottom_tstamp":"LAST(DOWN.tstamp)","end_tstamp":"UP.tstamp","bottom_total":"FIRST(DOWN.price + DOWN.tax + 1)","end_total":"UP.price + UP.tax"}');
+----
+1	2	3	21	16
+6	7	8	33	33
+
+# ---------------------------------------------------------------------------
+# testLogicalOffsetsWithStarVariable
+#
+# FIRST(x, n) and LAST(x, n) for every n from 0 to 7 over an 8-row match, all
+# unqualified — so the scope is the whole match rather than one label ("star
+# variable"). The DEFINE for UP also compares against three different offsets.
+# ---------------------------------------------------------------------------
+query IIIIIIIIIIIIIIII
+SELECT * FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1,'ACME',1,20),(2,'ACME',2,19),(3,'ACME',3,18),(4,'ACME',4,17),
+                         (5,'ACME',5,16),(6,'ACME',6,15),(7,'ACME',7,14),(8,'ACME',8,20))
+        t(id,symbol,tstamp,price)),
+  order_by := ['tstamp'], pattern := '"DOWN"""{2,} UP',
+  define := '{"DOWN\"":"price < LAST(price, 1) OR LAST(price, 1) IS NULL","UP":"price = FIRST(price) AND price > FIRST(price, 3) AND price = LAST(price, 7)"}',
+  measures := '{"id0":"FIRST(id, 0)","id1":"FIRST(id, 1)","id2":"FIRST(id, 2)","id3":"FIRST(id, 3)","id4":"FIRST(id, 4)","id5":"FIRST(id, 5)","id6":"FIRST(id, 6)","id7":"FIRST(id, 7)","id8":"LAST(id, 0)","id9":"LAST(id, 1)","id10":"LAST(id, 2)","id11":"LAST(id, 3)","id12":"LAST(id, 4)","id13":"LAST(id, 5)","id14":"LAST(id, 6)","id15":"LAST(id, 7)"}');
+----
+1	2	3	4	5	6	7	8	8	7	6	5	4	3	2	1
+
+# ---------------------------------------------------------------------------
+# testLogicalOffsetOutsideOfRangeInMeasures
+#
+# An offset past the end of the match is NULL, not an error.
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM mr.match_recognize(
+  (SELECT * FROM (VALUES ('ACME',1,19,1),('ACME',2,17,2),('ACME',3,13,3),('ACME',4,20,4)) t(symbol,tstamp,price,tax)),
+  order_by := ['tstamp'], pattern := 'DOWN{2,} UP',
+  define := '{"DOWN":"price < LAST(DOWN.price, 1) OR LAST(DOWN.price, 1) IS NULL","UP":"price > LAST(DOWN.price)"}',
+  measures := '{"first":"FIRST(DOWN.price)","last":"LAST(DOWN.price)","nullPrice":"FIRST(DOWN.price, 5)"}');
+----
+19	13	NULL
+
+# ---------------------------------------------------------------------------
+# testAggregatesWithNullInputs
+#
+# The distinction between COUNT(*), COUNT(<column>), COUNT(<label>.<column>) and
+# COUNT(<label>.<column>) over NULLs, alongside a running SUM in DEFINE that decides
+# how far A extends.
+# ---------------------------------------------------------------------------
+query IIIIII
+SELECT * FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1,'a',10),(2,'z',10),(3,'b',NULL),(4,'c',NULL),(5,'d',3),
+                         (6,'c',3),(7,'c',3),(8,'c',3),(9,'c',2)) t(id,name,price)),
+  order_by := ['id'], pattern := 'A+ C',
+  define := '{"A":"SUM(A.price) < 30","C":"C.name = ''c''"}',
+  measures := '{"sumA":"SUM(A.price)","countAId":"COUNT(A.id)","countAPrice":"COUNT(A.price)","countAll":"COUNT(*)","countAllPrice":"COUNT(price)","endId":"LAST(id)"}');
+----
+29	7	5	8	6	8
+
+# ---------------------------------------------------------------------------
+# testPartitionByWithParallelSource
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM mr.match_recognize(
+  (SELECT * FROM (VALUES ('ACME',1,19,1),('ACME',2,17,2),('ACME',3,13,3),('ACME',4,20,4)) t(symbol,ts,price,tax)),
+  partition_by := ['symbol'], order_by := ['ts'], pattern := 'DOWN UP',
+  define := '{"DOWN":"DOWN.price = 13","UP":"UP.price = 20"}',
+  measures := '{"bottom_tax":"DOWN.tax","end_tax":"UP.tax"}');
+----
+ACME	3	4
