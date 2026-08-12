@@ -93,6 +93,32 @@ mr.match_recognize(
 ) -> TABLE
 ```
 
+### `order_by` is the matching order, not the output order
+
+`order_by` is required, and it is not presentation — it defines the sequence the
+pattern is matched against, so it decides *which rows match at all*. The same three
+rows, one pattern:
+
+```sql
+-- order_by := ['ts']       -> DOWN+ finds a falling run: 2 rows, prices 8 then 6
+-- order_by := ['ts DESC']  -> the same rows now rise, so DOWN+ finds nothing
+pattern := 'DOWN+', define := '{"DOWN": "price < PREV(price)"}'
+```
+
+`PREV`, `NEXT`, `FIRST`, `LAST` and the very idea of "a run" are defined relative to
+it, which is why SQL:2016 makes `ORDER BY` mandatory inside `MATCH_RECOGNIZE` too.
+
+It is also **not** interchangeable with an `ORDER BY` in the input subquery. That
+one is a performance hint (see [Operating notes](#operating-notes)) which we cannot
+rely on, because nothing guarantees the order a table function receives its rows in;
+`order_by` is the declaration of what the pattern means. Write both if you want the
+speedup, and expect them to name the same columns.
+
+As for the output: within a partition, rows come out in `order_by` order. **Across**
+partitions the order is whatever the input happened to arrive in, and is not
+guaranteed — add your own `ORDER BY` to the outer query if you need the result
+ordered.
+
 Also: `mr.explain_pattern(p) -> VARCHAR` pretty-prints a compiled pattern (handy
 for checking greediness, no data access), and `mr.main.after_match_skip_modes` is a
 browsable list of the `after` modes. The worker's build version is the catalog's

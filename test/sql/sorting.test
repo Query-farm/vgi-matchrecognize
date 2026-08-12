@@ -78,3 +78,27 @@ SELECT CASE WHEN count(*) = 0 THEN 'PASS' ELSE 'FAIL' END
 FROM (SELECT * FROM got EXCEPT SELECT * FROM want);
 ----
 PASS
+
+# order_by is the matching order, not presentation: reversing it changes which rows
+# match at all. Same three rows, same pattern, opposite direction -> no match.
+query III
+SELECT n, first_p, last_p
+FROM mr.match_recognize(
+       (SELECT * FROM (VALUES (1,10),(2,8),(3,6)) AS t(ts, price)),
+       order_by := ['ts'],
+       pattern  := 'DOWN+',
+       define   := '{"DOWN":"price < PREV(price)"}',
+       measures := '{"n":"COUNT(*)","first_p":"FIRST(price)","last_p":"LAST(price)"}');
+----
+2	8	6
+
+query I
+SELECT count(*)
+FROM mr.match_recognize(
+       (SELECT * FROM (VALUES (1,10),(2,8),(3,6)) AS t(ts, price)),
+       order_by := ['ts DESC'],
+       pattern  := 'DOWN+',
+       define   := '{"DOWN":"price < PREV(price)"}',
+       measures := '{"n":"COUNT(*)"}');
+----
+0
