@@ -1,0 +1,107 @@
+# name: test/sql/unsigned.test
+# description: UBIGINT round-trips — values above i64::MAX survive as keys, measures and aggregates.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# The headline case. UInt64 used to be folded into BIGINT and read with `as
+# i64`, so u64::MAX came back as -1.
+query T
+SELECT m::VARCHAR FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 18446744073709551615::UBIGINT)) AS t(id, u)),
+       order_by := ['id'], pattern := 'A', define := '{}',
+       measures := '{"m":"LAST(u)"}');
+----
+18446744073709551615
+
+# ... and it comes back as UBIGINT, not as something else that happens to print
+# the same. Both the passthrough partition key and the measure.
+query TT
+SELECT typeof(u), typeof(m) FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 18446744073709551615::UBIGINT)) AS t(id, u)),
+       partition_by := ['u'], order_by := ['id'], pattern := 'A', define := '{}',
+       measures := '{"m":"LAST(u)"}');
+----
+UBIGINT	UBIGINT
+
+# u64::MAX and u64::MAX - 1 are the same f64, so a comparison routed through
+# floats made them one group.
+query I
+SELECT count(*) FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 18446744073709551615::UBIGINT),
+                              (2, 18446744073709551614::UBIGINT)) AS t(id, u)),
+       partition_by := ['u'], order_by := ['id'], pattern := 'A', define := '{}',
+       measures := '{"n":"COUNT(*)"}');
+----
+2
+
+# An order key straddling 2^63, over enough rows to take the packed-key sort
+# path (the threshold is 256). Under an i64 reading the upper half is negative
+# and sorts first.
+query TT
+SELECT lo::VARCHAR, hi::VARCHAR FROM mr.main.match_recognize(
+       -- Cast before adding: DuckDB would otherwise do the addition in INT64
+       -- and overflow, which is the same hazard on its side of the boundary.
+       (SELECT i AS id, 9223372036854775608::UBIGINT + i::UBIGINT AS u FROM range(0, 300) AS r(i)),
+       order_by := ['u'], pattern := 'A+', define := '{}',
+       measures := '{"lo":"FIRST(u)","hi":"LAST(u)"}');
+----
+9223372036854775608	9223372036854775907
+
+# A UBIGINT above i64::MAX against a negative BIGINT: neither type contains the
+# other, so this is only right if the comparison widens to 128 bits.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 18446744073709551615::UBIGINT, -1::BIGINT),
+                              (2, 0::UBIGINT, 5::BIGINT)) AS t(id, u, v)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"u > v"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+1
+
+# SUM widens to HUGEINT, so u64::MAX + 1 is representable rather than an
+# overflow, and it must get there exactly rather than via f64. HUGEINT is
+# carried over Arrow as Decimal128(38,0), which is how DuckDB names it back —
+# that mapping is pre-existing and applies to SUM of any integer type.
+query TT
+SELECT s::VARCHAR, typeof(s) FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 18446744073709551615::UBIGINT), (2, 1::UBIGINT)) AS t(id, u)),
+       order_by := ['id'], pattern := 'A+', define := '{}',
+       measures := '{"s":"SUM(u)"}');
+----
+18446744073709551616	DECIMAL(38,0)
+
+# AVG stays DOUBLE, as it does for every other integer type.
+query T
+SELECT typeof(a) FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 4::UBIGINT), (2, 6::UBIGINT)) AS t(id, u)),
+       order_by := ['id'], pattern := 'A+', define := '{}',
+       measures := '{"a":"AVG(u)"}');
+----
+DOUBLE
+
+# MIN/MAX keep the unsigned type and pick the true extreme.
+query TT
+SELECT lo::VARCHAR, hi::VARCHAR FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 18446744073709551614::UBIGINT),
+                              (2, 18446744073709551615::UBIGINT),
+                              (3, 7::UBIGINT)) AS t(id, u)),
+       order_by := ['id'], pattern := 'A+', define := '{}',
+       measures := '{"lo":"MIN(u)","hi":"MAX(u)"}');
+----
+7	18446744073709551615
+
+# The narrower unsigned widths stay BIGINT — they fit i64 exactly, so widening
+# them too would change their output type for no correctness gain.
+query T
+SELECT typeof(m) FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 42::UINTEGER)) AS t(id, n)),
+       order_by := ['id'], pattern := 'A', define := '{}',
+       measures := '{"m":"LAST(n)"}');
+----
+BIGINT

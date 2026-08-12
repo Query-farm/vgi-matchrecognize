@@ -90,9 +90,14 @@ pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 /// `as_f64` — a pre-existing precision wart, not widened here.
 fn cmp_ints(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
-        (Value::Int(_) | Value::HugeInt(_), Value::Int(_) | Value::HugeInt(_)) => {
-            Some(a.as_i128()?.cmp(&b.as_i128()?))
-        }
+        // Across signedness too: an i64 and a u64 share no Rust integer type,
+        // but i128 contains both ranges exactly, so `Int(-1)` vs
+        // `UInt(u64::MAX)` orders correctly rather than through f64 (where both
+        // u64::MAX and u64::MAX - 1 are the same value).
+        (
+            Value::Int(_) | Value::UInt(_) | Value::HugeInt(_),
+            Value::Int(_) | Value::UInt(_) | Value::HugeInt(_),
+        ) => Some(a.as_i128()?.cmp(&b.as_i128()?)),
         _ => None,
     }
 }
@@ -180,6 +185,7 @@ pub fn to_string(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
+        Value::UInt(i) => i.to_string(),
         Value::HugeInt(i) => i.to_string(),
         Value::Double(d) => d.to_string(),
         Value::Decimal(u, s) => format_decimal(*u, *s),
@@ -416,6 +422,12 @@ pub fn negate(v: &Value) -> Result<Value> {
     match v {
         Value::Null => Ok(Value::Null),
         Value::Int(i) => Ok(Value::Int(-i)),
+        // Negating an unsigned value leaves the unsigned range, so it widens —
+        // see the matching rule in `infer`, which types `-u` as HUGEINT so the
+        // static type and the runtime value agree. (DuckDB wraps here instead;
+        // this is a deliberate divergence, in the same spirit as the documented
+        // Flink one.)
+        Value::UInt(i) => Ok(Value::HugeInt(-(*i as i128))),
         Value::HugeInt(i) => Ok(Value::HugeInt(-i)),
         Value::Double(d) => Ok(Value::Double(-d)),
         Value::Decimal(u, s) => Ok(Value::Decimal(-u, *s)),
@@ -492,6 +504,7 @@ pub fn coerce(v: Value, ty: &Ty) -> Result<Value> {
             .ok_or_else(|| MrError::Eval(format!("cannot cast {v:?} to BOOLEAN"))),
         Ty::Int64 => match &v {
             Value::Int(_) => Ok(v),
+            Value::UInt(u) => Ok(Value::Int(*u as i64)),
             Value::HugeInt(i) => Ok(Value::Int(*i as i64)),
             Value::Double(d) => Ok(Value::Int(*d as i64)),
             Value::Decimal(u, s) => Ok(Value::Int((*u / pow10(*s)) as i64)),
@@ -502,6 +515,28 @@ pub fn coerce(v: Value, ty: &Ty) -> Result<Value> {
                 .map(Value::Int)
                 .map_err(|_| MrError::Eval(format!("cannot cast '{s}' to BIGINT"))),
             _ => Err(MrError::Eval(format!("cannot cast {v:?} to BIGINT"))),
+        },
+        // A negative value is not a UBIGINT, and `as u64` on one is
+        // 18446744073709551615 — the exact corruption this type exists to
+        // remove — so it is an error, as it is in DuckDB. The `Str` arm is the
+        // escape hatch for a literal above i64::MAX, which the expression lexer
+        // cannot tokenize: `CAST('18446744073709551615' AS UBIGINT)`.
+        Ty::UInt64 => match &v {
+            Value::UInt(_) => Ok(v),
+            Value::Int(i) => u64::try_from(*i)
+                .map(Value::UInt)
+                .map_err(|_| MrError::Eval(format!("{i} is out of range for UBIGINT"))),
+            Value::HugeInt(i) => u64::try_from(*i)
+                .map(Value::UInt)
+                .map_err(|_| MrError::Eval(format!("{i} is out of range for UBIGINT"))),
+            Value::Double(d) if *d >= 0.0 && *d <= u64::MAX as f64 => Ok(Value::UInt(*d as u64)),
+            Value::Bool(b) => Ok(Value::UInt(*b as u64)),
+            Value::Str(s) => s
+                .trim()
+                .parse::<u64>()
+                .map(Value::UInt)
+                .map_err(|_| MrError::Eval(format!("cannot cast '{s}' to UBIGINT"))),
+            _ => Err(MrError::Eval(format!("cannot cast {v:?} to UBIGINT"))),
         },
         Ty::HugeInt => v
             .as_i128()

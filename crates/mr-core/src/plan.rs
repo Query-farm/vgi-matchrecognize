@@ -554,7 +554,10 @@ impl Plan {
     ) -> Option<Vec<(String, Vec<usize>)>> {
         let [ci] = *idxs else { return None };
         let ty = store.col_ty(ci);
-        if !matches!(ty, Ty::Int64 | Ty::Date | Ty::Timestamp(_) | Ty::Time(_)) {
+        if !matches!(
+            ty,
+            Ty::Int64 | Ty::UInt64 | Ty::Date | Ty::Timestamp(_) | Ty::Time(_)
+        ) {
             return None;
         }
         let n = store.num_rows();
@@ -565,6 +568,14 @@ impl Plan {
             let key = match (&cell, &ty) {
                 (Value::Null, _) => None,
                 (Value::Int(v), Ty::Int64) => Some(*v),
+                // Grouping needs equality, not ordering, and `as i64` is a
+                // bijection on the bit pattern — so a u64 hashes and compares
+                // exactly right here even though it would *sort* wrong. Sound
+                // only because the arm is gated on the column's declared type,
+                // so Int and UInt keys can never share the map; the label and
+                // the output value both come from the sampled `Value` below,
+                // never from this key.
+                (Value::UInt(v), Ty::UInt64) => Some(*v as i64),
                 (Value::Date(v), Ty::Date) => Some(*v as i64),
                 (Value::Timestamp(v, u), Ty::Timestamp(want)) if u == want => Some(*v),
                 (Value::Time(v, u), Ty::Time(want)) if u == want => Some(*v),
@@ -687,8 +698,36 @@ const MIN_ROWS_FOR_KEY_SORT: usize = 256;
 /// enum. That covers `BIGINT`, `DATE`, `TIMESTAMP` and `TIME`, which is what
 /// `ORDER BY` almost always names. Everything else fixed-width keeps its `Value`.
 enum KeyCol {
-    Ints { vals: Vec<i64>, null: Vec<bool> },
+    Ints {
+        vals: Vec<i64>,
+        null: Vec<bool>,
+    },
+    /// `UBIGINT`. Its own buffer rather than a bias-encoded `i64`: the encoding
+    /// would be sound (`vals` is only ever compared, never read back), but
+    /// sorting is where this project's bugs have lived, and an invisible
+    /// transform between the column and the comparator is the wrong trade for
+    /// zero bytes saved.
+    UInts {
+        vals: Vec<u64>,
+        null: Vec<bool>,
+    },
     Vals(Vec<Value>),
+}
+
+/// NULL placement for a packed column, shared by every packed variant.
+///
+/// `None` means both rows are present and the caller should compare values.
+/// Placement is **absolute**: `nulls_first` says where NULLs land in the final
+/// order, so `DESC` must not flip them — which is why this is factored out
+/// rather than copied per variant.
+fn null_ord(a_null: bool, b_null: bool, nulls_first: bool) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::*;
+    match (a_null, b_null) {
+        (true, true) => Some(Equal),
+        (true, false) => Some(if nulls_first { Less } else { Greater }),
+        (false, true) => Some(if nulls_first { Greater } else { Less }),
+        (false, false) => None,
+    }
 }
 
 impl KeyCol {
@@ -708,6 +747,11 @@ impl KeyCol {
     /// before 2020 when the rescale overflowed). Those columns fall back to the
     /// `Value` comparator, which handles the mixed case exactly.
     fn read_ints(store: &dyn RowStore, tape: &[usize], ci: usize, ty: &Ty) -> Option<KeyCol> {
+        // UBIGINT gets its own reader: u64 ordering is not i64 ordering above
+        // 2^63, so it cannot share this buffer.
+        if matches!(ty, Ty::UInt64) {
+            return KeyCol::read_uints(store, tape, ci);
+        }
         if !matches!(ty, Ty::Int64 | Ty::Date | Ty::Timestamp(_) | Ty::Time(_)) {
             return None;
         }
@@ -738,41 +782,52 @@ impl KeyCol {
         Some(KeyCol::Ints { vals, null })
     }
 
+    /// Read a `UBIGINT` column as packed `u64`s, on the same terms as
+    /// [`KeyCol::read_ints`]: `None` if any value disagrees with the declared
+    /// type, so a column that is not uniformly what it claims drops to the
+    /// `Value` comparator.
+    fn read_uints(store: &dyn RowStore, tape: &[usize], ci: usize) -> Option<KeyCol> {
+        let mut vals = Vec::with_capacity(tape.len());
+        let mut null = Vec::with_capacity(tape.len());
+        for &r in tape {
+            match store.cell(r, ci) {
+                Value::UInt(v) => {
+                    vals.push(v);
+                    null.push(false);
+                }
+                Value::Null => {
+                    // The placeholder is never compared — `null` gates it.
+                    vals.push(0);
+                    null.push(true);
+                }
+                _ => return None,
+            }
+        }
+        Some(KeyCol::UInts { vals, null })
+    }
+
     /// Order two rows of this column. Identical to
     /// [`valops::cmp_for_sort`](crate::engine::valops::cmp_for_sort), including the
     /// rule that NULL placement is *absolute*: `nulls_first` says where NULLs land in
     /// the final order, so `DESC` must not flip them.
     fn cmp_at(&self, a: usize, b: usize, desc: bool, nulls_first: bool) -> std::cmp::Ordering {
-        use std::cmp::Ordering::*;
-        match self {
-            KeyCol::Ints { vals, null } => match (null[a], null[b]) {
-                (true, true) => Equal,
-                (true, false) => {
-                    if nulls_first {
-                        Less
-                    } else {
-                        Greater
-                    }
-                }
-                (false, true) => {
-                    if nulls_first {
-                        Greater
-                    } else {
-                        Less
-                    }
-                }
-                (false, false) => {
-                    let ord = vals[a].cmp(&vals[b]);
-                    if desc {
-                        ord.reverse()
-                    } else {
-                        ord
-                    }
-                }
+        let packed = match self {
+            KeyCol::Ints { vals, null } => match null_ord(null[a], null[b], nulls_first) {
+                Some(ord) => return ord,
+                None => vals[a].cmp(&vals[b]),
+            },
+            KeyCol::UInts { vals, null } => match null_ord(null[a], null[b], nulls_first) {
+                Some(ord) => return ord,
+                None => vals[a].cmp(&vals[b]),
             },
             KeyCol::Vals(vals) => {
-                crate::engine::valops::cmp_for_sort(&vals[a], &vals[b], desc, nulls_first)
+                return crate::engine::valops::cmp_for_sort(&vals[a], &vals[b], desc, nulls_first)
             }
+        };
+        if desc {
+            packed.reverse()
+        } else {
+            packed
         }
     }
 }
@@ -783,6 +838,7 @@ fn fixed_width(ty: &Ty) -> bool {
     match ty {
         Ty::Boolean
         | Ty::Int64
+        | Ty::UInt64
         | Ty::HugeInt
         | Ty::Double
         | Ty::Decimal(_, _)

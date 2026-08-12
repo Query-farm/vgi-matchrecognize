@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     ArrayRef, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, TimestampMicrosecondArray,
+    StringArray, TimestampMicrosecondArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use mr_core::engine::{valops, RowStore};
@@ -75,6 +75,26 @@ fn int64_keys_agree() {
         None,
     ]));
     assert_agrees("Int64", &store_of("k", a));
+}
+
+/// `UBIGINT`. The values straddle 2^63 on purpose: that is where the two
+/// readings of the same bits diverge, so a typed arm accidentally written with
+/// `Int64Type` sorts the upper half first and fails here. `u64::MAX` and
+/// `u64::MAX - 1` are additionally the same f64, which catches an `as_f64`
+/// fallback on the materializing side.
+#[test]
+fn uint64_keys_agree() {
+    let a: ArrayRef = Arc::new(UInt64Array::from(vec![
+        Some(0),
+        None,
+        Some(u64::MAX),
+        Some(u64::MAX - 1),
+        Some(i64::MAX as u64),
+        Some(i64::MAX as u64 + 1),
+        Some(1),
+        None,
+    ]));
+    assert_agrees("UInt64", &store_of("k", a));
 }
 
 #[test]

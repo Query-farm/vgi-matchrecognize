@@ -170,6 +170,9 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
     match sig {
         Sig::NumericSame => match &args[0] {
             Value::Int(i) => Ok(Value::Int(i.wrapping_abs())),
+            // abs of an unsigned value is itself, and stays UBIGINT — which is
+            // what `result_ty`'s `args[0].clone()` promises, and what DuckDB does.
+            Value::UInt(u) => Ok(Value::UInt(*u)),
             Value::HugeInt(i) => Ok(Value::HugeInt(i.wrapping_abs())),
             Value::Double(d) => Ok(Value::Double(d.abs())),
             Value::Decimal(v, s) => Ok(Value::Decimal(v.wrapping_abs(), *s)),
@@ -184,6 +187,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
             // floating and scaled-decimal cases actually move.
             match &args[0] {
                 Value::Int(i) => Ok(Value::Int(*i)),
+                Value::UInt(u) => Ok(Value::UInt(*u)),
                 Value::HugeInt(i) => Ok(Value::HugeInt(*i)),
                 Value::Double(d) => Ok(Value::Double(match name {
                     "ceil" | "ceiling" => d.ceil(),

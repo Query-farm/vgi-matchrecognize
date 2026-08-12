@@ -47,7 +47,14 @@ pub fn infer(expr: &Expr, schema: &dyn BindSchema) -> Result<Ty> {
         Expr::RunningFinal { inner, .. } => infer(inner, schema),
         Expr::Neg(e) => {
             let t = infer(e, schema)?;
-            if t.is_numeric() || t == Ty::Null {
+            // Negating an unsigned value leaves the unsigned range, so `-u` is
+            // HUGEINT rather than UBIGINT. Returning the operand type unchanged
+            // would type it UBIGINT and then fail at `coerce` on every negative
+            // result — a bind-time-valid expression that could never evaluate.
+            // `valops::negate` produces the matching HugeInt.
+            if t == Ty::UInt64 {
+                Ok(Ty::HugeInt)
+            } else if t.is_numeric() || t == Ty::Null {
                 Ok(t)
             } else {
                 Err(MrError::Infer(format!("cannot negate a {t} value")))

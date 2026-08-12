@@ -21,6 +21,7 @@ pub enum TimeUnit {
 /// |-------------------|-----------------------------|------------------|
 /// | `Boolean`         | `Boolean`                   | `BOOLEAN`        |
 /// | `Int64`           | `Int64`                     | `BIGINT`         |
+/// | `UInt64`          | `UInt64`                    | `UBIGINT`        |
 /// | `HugeInt`         | `Decimal128(38, 0)`         | `HUGEINT`/`DECIMAL`|
 /// | `Double`          | `Float64`                   | `DOUBLE`         |
 /// | `Decimal(p, s)`   | `Decimal128(p, s)`          | `DECIMAL(p,s)`   |
@@ -38,6 +39,11 @@ pub enum TimeUnit {
 pub enum Ty {
     Boolean,
     Int64,
+    /// `UBIGINT`. Its own variant rather than a widening to `Int64`, because a
+    /// `u64` above `i64::MAX` has no `i64` representation — casting one is the
+    /// corruption this exists to prevent. The narrower unsigned widths
+    /// (`UTINYINT`..`UINTEGER`) all fit `i64` exactly and stay `Int64`.
+    UInt64,
     HugeInt,
     Double,
     Decimal(u8, i8),
@@ -67,6 +73,7 @@ impl fmt::Display for Ty {
         match self {
             Ty::Boolean => f.write_str("BOOLEAN"),
             Ty::Int64 => f.write_str("BIGINT"),
+            Ty::UInt64 => f.write_str("UBIGINT"),
             Ty::HugeInt => f.write_str("HUGEINT"),
             Ty::Double => f.write_str("DOUBLE"),
             Ty::Decimal(p, s) => write!(f, "DECIMAL({p},{s})"),
@@ -90,16 +97,16 @@ impl fmt::Display for Ty {
 }
 
 impl Ty {
-    /// Whether this is an integer-family type (`BIGINT`).
+    /// Whether this is an integer-family type (`BIGINT` / `UBIGINT`).
     pub fn is_integer(&self) -> bool {
-        matches!(self, Ty::Int64)
+        matches!(self, Ty::Int64 | Ty::UInt64)
     }
 
     /// Whether this is any numeric type (integer / hugeint / double / decimal).
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
-            Ty::Int64 | Ty::HugeInt | Ty::Double | Ty::Decimal(_, _)
+            Ty::Int64 | Ty::UInt64 | Ty::HugeInt | Ty::Double | Ty::Decimal(_, _)
         )
     }
 
@@ -110,6 +117,20 @@ impl Ty {
 
     /// Rank in the numeric promotion lattice: `Int64 < HugeInt < Double`.
     /// `Decimal` is handled separately (never silently joins binary floats).
+    ///
+    /// **`UInt64` deliberately has no rank.** A rank is a claim about
+    /// *containment* — `unify` takes whichever side ranks higher — and `u64` and
+    /// `i64` contain neither the other: `u64::MAX` is not an `i64` and `-1` is
+    /// not a `u64`. Every value one could give it is wrong in a different way:
+    /// sharing rank 0 makes `unify` depend on argument order, so `u + v` and
+    /// `v + u` would type differently; ranking it above or below `Int64`
+    /// reintroduces the wrapping this type exists to prevent, one level up.
+    ///
+    /// So `UInt64`'s joins are spelled out explicitly in [`Ty::unify`] *before*
+    /// the rank fallback, and leaving it `None` here is the safety net: a pair
+    /// that reaches this fallback with a `UInt64` in it yields `None`, i.e. a
+    /// clean bind error rather than a silently wrong type. Do not "tidy" this by
+    /// giving it a rank.
     fn numeric_rank(&self) -> Option<u8> {
         match self {
             Ty::Int64 => Some(0),
@@ -148,9 +169,27 @@ impl Ty {
         // A decimal combined with an integer family stays decimal (give it
         // headroom for the integer part).
         if let (Decimal(p, s), o) | (o, Decimal(p, s)) = (self, other) {
-            if matches!(o, Int64 | HugeInt) {
+            if matches!(o, Int64 | UInt64 | HugeInt) {
                 return Some(Decimal((*p).max(20), *s));
             }
+        }
+        // UBIGINT's joins, before the rank fallback — it has no rank, and see
+        // `numeric_rank` for why it must not be given one. The or-pattern makes
+        // these commutative by construction, the same shape the Decimal arm
+        // above uses.
+        if let (UInt64, o) | (o, UInt64) = (self, other) {
+            return match o {
+                // i128 holds every i64 and every u64 exactly, so it is the only
+                // lossless join of the two. (DuckDB agrees: UBIGINT + BIGINT is
+                // HUGEINT.)
+                Int64 | HugeInt => Some(HugeInt),
+                // Lossy past 2^53, exactly as `Int64` joined with `Double`
+                // already is.
+                Double => Some(Double),
+                // `UInt64 ⊔ UInt64` is caught by the `self == other` arm above;
+                // anything else does not unify.
+                _ => None,
+            };
         }
         // Pure numeric lattice.
         if let (Some(a), Some(b)) = (self.numeric_rank(), other.numeric_rank()) {
@@ -164,7 +203,9 @@ impl Ty {
     /// `DECIMAL(38, s)`.
     pub fn sum_ty(&self) -> Option<Ty> {
         match self {
-            Ty::Int64 | Ty::HugeInt => Some(Ty::HugeInt),
+            // UBIGINT sums into HUGEINT like BIGINT does: i128 holds any
+            // realistic number of u64s, and it is what DuckDB returns.
+            Ty::Int64 | Ty::UInt64 | Ty::HugeInt => Some(Ty::HugeInt),
             Ty::Double => Some(Ty::Double),
             Ty::Decimal(_, s) => Some(Ty::Decimal(38, *s)),
             _ => None,
@@ -174,7 +215,7 @@ impl Ty {
     /// AVG widening: numeric -> DOUBLE (DECIMAL -> `DECIMAL(38, max(s,4))`).
     pub fn avg_ty(&self) -> Option<Ty> {
         match self {
-            Ty::Int64 | Ty::HugeInt | Ty::Double => Some(Ty::Double),
+            Ty::Int64 | Ty::UInt64 | Ty::HugeInt | Ty::Double => Some(Ty::Double),
             Ty::Decimal(_, s) => Some(Ty::Decimal(38, (*s).max(4))),
             _ => None,
         }

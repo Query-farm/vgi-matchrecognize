@@ -10,7 +10,12 @@ pub fn arrow_to_ty(dt: &DataType) -> Option<Ty> {
     use DataType::*;
     Some(match dt {
         Boolean => Ty::Boolean,
-        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Ty::Int64,
+        // The narrower unsigned widths all fit i64 exactly, so they widen into
+        // BIGINT as the signed ones do. UInt64 does *not*: a value above
+        // i64::MAX has no i64 representation, and `as i64` on one wraps
+        // negative — which corrupted comparison, ordering and output alike.
+        Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 => Ty::Int64,
+        UInt64 => Ty::UInt64,
         Float16 | Float32 | Float64 => Ty::Double,
         Utf8 | LargeUtf8 | Utf8View => Ty::Varchar,
         Date32 | Date64 => Ty::Date,
@@ -28,6 +33,7 @@ pub fn ty_to_arrow(ty: &Ty) -> DataType {
     match ty {
         Ty::Boolean => DataType::Boolean,
         Ty::Int64 => DataType::Int64,
+        Ty::UInt64 => DataType::UInt64,
         Ty::HugeInt => DataType::Decimal128(38, 0),
         Ty::Double => DataType::Float64,
         Ty::Decimal(p, s) => DataType::Decimal128(*p, *s),

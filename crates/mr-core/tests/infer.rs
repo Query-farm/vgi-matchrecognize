@@ -30,6 +30,7 @@ fn sch() -> Sch {
     cols.insert("ts".into(), Ty::Timestamp(TimeUnit::Micro));
     cols.insert("d".into(), Ty::Date);
     cols.insert("rate".into(), Ty::Decimal(10, 4));
+    cols.insert("u".into(), Ty::UInt64);
     Sch {
         cols,
         vars: vec!["A".into(), "B".into(), "START".into(), "DOWN".into()],
@@ -128,4 +129,58 @@ fn uninferable_and_errors() {
     assert!(infer(&parse("name + price").unwrap(), &sch()).is_err());
     // qualifier that isn't a pattern variable.
     assert!(infer(&parse("Z.price").unwrap(), &sch()).is_err());
+}
+
+/// The `UBIGINT` corner of the promotion lattice.
+///
+/// `u64` and `i64` contain neither the other, so `UInt64` deliberately has no
+/// `numeric_rank` and its joins are explicit arms. The commutativity check at
+/// the end is the cheap guard against someone "tidying" that into a rank: every
+/// wrong rank makes `unify` order-dependent or lossy, and the order-dependent
+/// case is the one no single example would catch.
+#[test]
+fn unsigned_lattice() {
+    assert_eq!(ty("u"), Ty::UInt64);
+    assert_eq!(ty("u + u"), Ty::UInt64);
+    // Mixing signedness has no lossless narrower answer than 128 bits.
+    assert_eq!(ty("u + price"), Ty::HugeInt);
+    assert_eq!(ty("price + u"), Ty::HugeInt);
+    assert_eq!(ty("u + amount"), Ty::Double);
+    assert_eq!(ty("u / u"), Ty::Double);
+    assert_eq!(ty("u > price"), Ty::Boolean);
+    // Aggregates.
+    assert_eq!(ty("SUM(u)"), Ty::HugeInt);
+    assert_eq!(ty("AVG(u)"), Ty::Double);
+    assert_eq!(ty("MIN(u)"), Ty::UInt64);
+    assert_eq!(ty("COUNT(u)"), Ty::Int64);
+    assert_eq!(ty("array_agg(u)"), Ty::List(Box::new(Ty::UInt64)));
+    // Negation leaves the unsigned range, so it widens.
+    assert_eq!(ty("-u"), Ty::HugeInt);
+    // Scalar functions keep it.
+    assert_eq!(ty("abs(u)"), Ty::UInt64);
+    // Casts, both directions.
+    assert_eq!(ty("CAST(price AS UBIGINT)"), Ty::UInt64);
+    assert_eq!(ty("CAST(u AS BIGINT)"), Ty::Int64);
+    // The narrower unsigned widths are BIGINT, not UBIGINT.
+    assert_eq!(ty("CAST(price AS UINTEGER)"), Ty::Int64);
+}
+
+/// `unify` must be commutative for every numeric pair. A rank shared with
+/// `Int64` would make `u + v` and `v + u` produce different output column
+/// types for the same query.
+#[test]
+fn unify_is_commutative_over_the_numeric_lattice() {
+    let tys = [
+        Ty::Int64,
+        Ty::UInt64,
+        Ty::HugeInt,
+        Ty::Double,
+        Ty::Decimal(10, 2),
+        Ty::Null,
+    ];
+    for a in &tys {
+        for b in &tys {
+            assert_eq!(a.unify(b), b.unify(a), "unify({a}, {b}) is not commutative");
+        }
+    }
 }

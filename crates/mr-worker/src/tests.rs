@@ -222,3 +222,142 @@ fn a_varchar_list_argument_reads_the_same_at_either_width() {
         );
     }
 }
+
+/// UBIGINT survives the whole Arrow -> engine -> Arrow round trip, as a
+/// `UBIGINT` column rather than a `BIGINT` one holding a negative number.
+///
+/// This is the assertion that `arrow_in::cell_value`, `schema::ty_to_arrow` and
+/// `arrow_out::build_column` all agree — the partition key here never goes
+/// through `valops::coerce`, so `build_column` is the only thing between the
+/// stored value and the batch.
+#[test]
+fn ubigint_round_trips_through_arrow() {
+    use arrow_array::UInt64Array;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("u", DataType::UInt64, false),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![u64::MAX, u64::MAX])),
+            Arc::new(Int64Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+
+    let cfg = PlanConfig {
+        pattern: "A+".into(),
+        define_json: "{}".into(),
+        subset_json: String::new(),
+        measures_json: Some(r#"{"m":"LAST(u)"}"#.into()),
+        partition_by: vec!["u".into()],
+        order_by: vec!["id".into()],
+        rows_all: false,
+        omit_empty_matches: false,
+        after: "past last row".into(),
+        step_budget: Some(1_000_000),
+    };
+    let plan = Plan::build(
+        &cfg,
+        &ArrowBindSchema::new(schema.clone(), vec!["A".into()]),
+    )
+    .unwrap();
+
+    // Both the passthrough partition key and the measure are UBIGINT.
+    let fields: Vec<_> = plan
+        .output_columns()
+        .iter()
+        .map(|c| output_field(&c.name, &c.ty))
+        .collect();
+    assert_eq!(fields[0].data_type(), &DataType::UInt64, "partition key");
+    assert_eq!(fields[1].data_type(), &DataType::UInt64, "measure");
+
+    let store = BatchRowStore::single(batch);
+    let rows = plan.run(&store).unwrap();
+    let out = build_batch(Arc::new(Schema::new(fields)), plan.output_columns(), &rows).unwrap();
+
+    assert_eq!(out.num_rows(), 1);
+    for col in 0..2 {
+        assert_eq!(
+            out.column(col)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("a UInt64 column")
+                .value(0),
+            u64::MAX,
+            "column {col} must survive as u64::MAX, not wrap to -1"
+        );
+    }
+}
+
+/// The deliberate asymmetry: only `UInt64` needs its own type. Everything
+/// narrower fits `i64` exactly, and widening it too would change those columns'
+/// output type for no correctness gain.
+#[test]
+fn schema_maps_unsigned_widths_asymmetrically() {
+    use crate::schema::{arrow_to_ty, ty_to_arrow};
+    use mr_core::types::Ty;
+
+    assert_eq!(arrow_to_ty(&DataType::UInt64), Some(Ty::UInt64));
+    assert_eq!(arrow_to_ty(&DataType::UInt32), Some(Ty::Int64));
+    assert_eq!(arrow_to_ty(&DataType::UInt16), Some(Ty::Int64));
+    assert_eq!(arrow_to_ty(&DataType::UInt8), Some(Ty::Int64));
+    assert_eq!(ty_to_arrow(&Ty::UInt64), DataType::UInt64);
+}
+
+/// `SUM(UBIGINT)` is HUGEINT, which is emitted as `Decimal128(38, 0)` — and it
+/// must get there exactly, not via the `as_f64` fallback in `to_i128`.
+#[test]
+fn sum_over_ubigint_emits_an_exact_decimal128() {
+    use arrow_array::{Decimal128Array, UInt64Array};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("u", DataType::UInt64, false),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![u64::MAX, 1])),
+            Arc::new(Int64Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+
+    let cfg = PlanConfig {
+        pattern: "A+".into(),
+        define_json: "{}".into(),
+        subset_json: String::new(),
+        measures_json: Some(r#"{"s":"SUM(u)"}"#.into()),
+        partition_by: vec![],
+        order_by: vec!["id".into()],
+        rows_all: false,
+        omit_empty_matches: false,
+        after: "past last row".into(),
+        step_budget: Some(1_000_000),
+    };
+    let plan = Plan::build(
+        &cfg,
+        &ArrowBindSchema::new(schema.clone(), vec!["A".into()]),
+    )
+    .unwrap();
+    let fields: Vec<_> = plan
+        .output_columns()
+        .iter()
+        .map(|c| output_field(&c.name, &c.ty))
+        .collect();
+    assert_eq!(fields[0].data_type(), &DataType::Decimal128(38, 0));
+
+    let rows = plan.run(&BatchRowStore::single(batch)).unwrap();
+    let out = build_batch(Arc::new(Schema::new(fields)), plan.output_columns(), &rows).unwrap();
+    assert_eq!(
+        out.column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("a Decimal128 column")
+            .value(0),
+        u64::MAX as i128 + 1
+    );
+}

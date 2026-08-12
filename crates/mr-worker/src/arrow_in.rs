@@ -141,6 +141,12 @@ impl RowStore for BatchRowStore {
                 .as_primitive::<Int32Type>()
                 .value(ra)
                 .cmp(&ab.as_primitive::<Int32Type>().value(rb)),
+            // Compared as u64: above 2^63 the i64 reading of these bits is
+            // negative, so the typed path would disagree with `cmp_for_sort`.
+            DataType::UInt64 => aa
+                .as_primitive::<UInt64Type>()
+                .value(ra)
+                .cmp(&ab.as_primitive::<UInt64Type>().value(rb)),
             DataType::Date32 => aa
                 .as_primitive::<Date32Type>()
                 .value(ra)
@@ -212,7 +218,9 @@ fn cell_value(arr: &dyn Array, row: usize) -> Value {
         DataType::UInt8 => Value::Int(arr.as_primitive::<UInt8Type>().value(row) as i64),
         DataType::UInt16 => Value::Int(arr.as_primitive::<UInt16Type>().value(row) as i64),
         DataType::UInt32 => Value::Int(arr.as_primitive::<UInt32Type>().value(row) as i64),
-        DataType::UInt64 => Value::Int(arr.as_primitive::<UInt64Type>().value(row) as i64),
+        // Unsigned, not `as i64`: a UBIGINT above i64::MAX wrapped negative,
+        // which corrupted every comparison, sort and output value it touched.
+        DataType::UInt64 => Value::UInt(arr.as_primitive::<UInt64Type>().value(row)),
         DataType::Float32 => Value::Double(arr.as_primitive::<Float32Type>().value(row) as f64),
         DataType::Float64 => Value::Double(arr.as_primitive::<Float64Type>().value(row)),
         DataType::Utf8 => Value::Str(arr.as_string::<i32>().value(row).to_string()),

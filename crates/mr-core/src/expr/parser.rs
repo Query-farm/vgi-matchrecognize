@@ -713,6 +713,10 @@ impl Parser {
             "BIGINT" | "INT" | "INTEGER" | "INT8" | "INT4" | "INT2" | "SMALLINT" | "TINYINT" => {
                 Ok(Ty::Int64)
             }
+            "UBIGINT" | "UINT64" => Ok(Ty::UInt64),
+            // The narrower unsigned widths all fit i64 exactly, so a cast to
+            // them is a cast to BIGINT — the same reading INT/SMALLINT get above.
+            "UTINYINT" | "USMALLINT" | "UINTEGER" | "UINT8" | "UINT16" | "UINT32" => Ok(Ty::Int64),
             "HUGEINT" => Ok(Ty::HugeInt),
             "DOUBLE" | "FLOAT" | "FLOAT8" | "FLOAT4" | "REAL" => Ok(Ty::Double),
             "DECIMAL" | "NUMERIC" => {

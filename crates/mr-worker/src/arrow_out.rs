@@ -7,7 +7,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array,
     IntervalMonthDayNanoArray, RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
 };
 use arrow_buffer::{IntervalMonthDayNano, OffsetBuffer};
 use arrow_schema::{Field, SchemaRef};
@@ -46,6 +46,11 @@ fn build_column(ty: &Ty, rows: &[Vec<Value>], j: usize) -> Result<ArrayRef> {
                 .collect::<BooleanArray>(),
         ),
         Ty::Int64 => Arc::new(rows.iter().map(|r| to_i64(&r[j])).collect::<Int64Array>()),
+        // This is the *only* guard on the primary UBIGINT path: partition and
+        // order-by key columns are pushed straight from the store without going
+        // through `valops::coerce`, so nothing else stands between a
+        // `Value::UInt` and the output batch.
+        Ty::UInt64 => Arc::new(rows.iter().map(|r| to_u64(&r[j])).collect::<UInt64Array>()),
         Ty::HugeInt => {
             let v: Vec<Option<i128>> = rows.iter().map(|r| to_i128(&r[j])).collect();
             Arc::new(
@@ -173,8 +178,29 @@ fn build_time(rows: &[Vec<Value>], j: usize, u: TimeUnit) -> ArrayRef {
 fn to_i64(v: &Value) -> Option<i64> {
     match v {
         Value::Int(i) => Some(*i),
+        // Out of range becomes NULL rather than a wrapped negative — the file's
+        // convention is `None` for anything it cannot represent.
+        Value::UInt(u) => i64::try_from(*u).ok(),
         Value::HugeInt(i) => Some(*i as i64),
         Value::Bool(b) => Some(*b as i64),
+        _ => None,
+    }
+}
+
+/// A `UBIGINT` cell. `None` (i.e. NULL) for anything outside `u64`, never a
+/// wrap: a negative rendered as 18446744073709551615 is exactly the corruption
+/// this column type was added to prevent.
+///
+/// `Value::Int` turns up here legitimately — an integer literal in a measure
+/// evaluates to one, and `valops::coerce` has already rejected the negative
+/// case for every measure column. This is the backstop for the columns that
+/// bypass coercion entirely.
+fn to_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::UInt(u) => Some(*u),
+        Value::Int(i) => u64::try_from(*i).ok(),
+        Value::HugeInt(i) => u64::try_from(*i).ok(),
+        Value::Bool(b) => Some(*b as u64),
         _ => None,
     }
 }
@@ -182,6 +208,10 @@ fn to_i64(v: &Value) -> Option<i64> {
 fn to_i128(v: &Value) -> Option<i128> {
     match v {
         Value::Int(i) => Some(*i as i128),
+        // Exact. Without this arm a UBIGINT landing in a HUGEINT column — which
+        // is what `SUM(u)` produces — would round-trip through the `as_f64`
+        // fallback below and lose everything past 2^53.
+        Value::UInt(u) => Some(*u as i128),
         Value::HugeInt(i) => Some(*i),
         _ => v.as_f64().map(|f| f as i128),
     }
@@ -190,6 +220,9 @@ fn to_i128(v: &Value) -> Option<i128> {
 fn to_decimal(v: &Value, scale: i8) -> Option<i128> {
     match v {
         Value::Decimal(u, s) => Some(rescale(*u, *s, scale)),
+        // Exact, for the same reason as `to_i128`: the `as_f64` fallback below
+        // would quietly truncate a large UBIGINT.
+        Value::UInt(u) => Some(rescale(*u as i128, 0, scale)),
         Value::Null => None,
         other => other
             .as_f64()
@@ -222,6 +255,9 @@ fn display(v: &Value) -> String {
     match v {
         Value::Bool(b) => b.to_string(),
         Value::Int(i) => i.to_string(),
+        // Without this arm a UBIGINT reaching a VARCHAR column rendered as the
+        // literal text `UInt(42)` via the `{other:?}` fallback.
+        Value::UInt(u) => u.to_string(),
         Value::HugeInt(i) => i.to_string(),
         Value::Double(d) => d.to_string(),
         Value::Str(s) => s.clone(),

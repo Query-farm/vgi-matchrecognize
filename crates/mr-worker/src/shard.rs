@@ -343,6 +343,13 @@ fn hash_value(v: &Value, h: &mut DefaultHasher) {
             3u8.hash(h);
             i.hash(h);
         }
+        // Its own tag rather than Int's: a collision would only cost a wasted
+        // shard entry (rows are regrouped by the real comparator inside the
+        // shard), but the tags exist to say what the bytes mean.
+        Value::UInt(u) => {
+            12u8.hash(h);
+            u.hash(h);
+        }
         Value::Double(d) => {
             4u8.hash(h);
             d.to_bits().hash(h);

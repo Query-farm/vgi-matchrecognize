@@ -21,8 +21,13 @@ pub enum Value {
     /// SQL NULL (the unknown). 3-valued logic applies.
     Null,
     Bool(bool),
-    /// Integer family (any width), widened to i64.
+    /// Integer family (any signed width), widened to i64.
     Int(i64),
+    /// `UBIGINT`. Kept unsigned rather than widened into `Int`, because a `u64`
+    /// above `i64::MAX` has no `i64` representation — `as i64` on one wraps
+    /// negative, which is the bug this variant exists to remove. The narrower
+    /// unsigned widths all fit `i64` exactly and arrive as `Int`.
+    UInt(u64),
     /// 128-bit integer (HUGEINT, e.g. integer SUM).
     HugeInt(i128),
     Double(f64),
@@ -54,6 +59,7 @@ impl Value {
             Value::Bool(b) => Some(*b),
             Value::Null => None,
             Value::Int(v) => Some(*v != 0),
+            Value::UInt(v) => Some(*v != 0),
             _ => None,
         }
     }
@@ -62,6 +68,7 @@ impl Value {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(v) => Some(*v as f64),
+            Value::UInt(v) => Some(*v as f64),
             Value::HugeInt(v) => Some(*v as f64),
             Value::Double(v) => Some(*v),
             Value::Decimal(u, s) => Some(*u as f64 / 10f64.powi(*s as i32)),
@@ -70,9 +77,14 @@ impl Value {
     }
 
     /// Integer value as i128, if this value is an integer family.
+    ///
+    /// i128 contains every `i64` and every `u64` exactly, which is what lets
+    /// signed and unsigned values be compared and added without either side
+    /// losing range.
     pub fn as_i128(&self) -> Option<i128> {
         match self {
             Value::Int(v) => Some(*v as i128),
+            Value::UInt(v) => Some(*v as i128),
             Value::HugeInt(v) => Some(*v),
             _ => None,
         }
