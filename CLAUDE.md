@@ -53,9 +53,15 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     `run`: one partition at a time, threading the match number across calls.
 - **`crates/mr-worker`** — thin Arrow/VGI adapter:
   - `match_recognize.rs` — the `TableBufferingFunction` (`on_bind` / `process` /
-    `combine` / `finalize_producer`); buffers each batch into `storage`, then
-    builds the `Plan` and returns a `PartitionStream` producer that matches one
-    partition per step, coalescing output into ~8k-row batches.
+    `combine` / `finalize_producer`); spools each batch, then builds the `Plan` and
+    returns a `PartitionStream` producer that matches a *chunk* of partitions on
+    several threads, emitting them in partition order in ~8k-row batches.
+  - `spool.rs` — the buffered batches: one append-only Arrow-IPC file per sink thread
+    under `$TMPDIR`, bypassing the SDK store (which cost 93.5 ns/row against 4.3 to
+    serialise). One `write()` per `process()` call — there is no end-of-input hook to
+    flush a userspace buffer at.
+  - `shard.rs` — splits the spool by partition key when it exceeds the finalize memory
+    budget, so peak memory tracks a shard rather than the relation.
   - `arrow_in.rs` — a `RowStore` over the buffered `RecordBatch`es, addressed as
     one contiguous row space (deliberately **not** concatenated — a merged copy
     would double peak memory for no gain).
@@ -69,12 +75,13 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
 
 1. **Buffer-all, then compute.** Row pattern matching is intrinsically a
    whole-partition operation, so `match_recognize` is a `TableBufferingFunction`
-   (Sink+Source), the `vgi-match` idiom: `process` buffers each Arrow batch into
-   cross-process `storage` (on disk as Arrow IPC — the SDK's default backend is a
-   SQLite file under `$TMPDIR`); `finalize_producer` reads it back and streams the
-   result, running the matcher **one partition at a time**. The partition is the
-   smallest sound streaming unit: a match may span a whole partition, so a
-   partition must be complete before it can be matched.
+   (Sink+Source), the `vgi-match` idiom: `process` spools each Arrow batch to disk
+   (`spool.rs`); `finalize_producer` reads it back and streams the result. The
+   partition is the smallest sound unit of work: a match may span a whole partition,
+   so a partition must be complete before it can be matched — but partitions are
+   independent, so a chunk of them is matched concurrently, and when the relation is
+   too big for the memory budget `combine` splits it into per-partition-key shards
+   and returns one finalize state per shard.
 2. **Output schema is fixed at `on_bind`** — before any data flows. The measure
    types are **inferred statically** from `params.input_schema` + the parsed
    measure ASTs (`mr-core::types::infer`), with an explicit `{"as","expr","type"}`
@@ -89,6 +96,27 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
   `VGI_WORKER_CATALOG_NAME` to `mr`.
 - `serde_json` is built with `preserve_order` so a MEASURES **object**'s key
   order is the output column order (the SDK contract).
+- **Labels are integer ids** (`engine/labels.rs`, `VarId`), assigned at bind time:
+  pattern variables in declaration order, then subset names. `Inst::Char`, `Bind`,
+  `AfterSkip` and `BindIndex` all carry ids, `define` is a `Vec` indexed by id, and
+  `Bind` is `Copy`. Carrying label *strings* here cost an allocation per VM step (~47%
+  of matcher self time in malloc). Expressions keep written labels and resolve them by
+  exact compare — cheaper than hashing, and once per node rather than per step.
+- **Three things that were quadratic in match length, and the shape of each fix.** All
+  are pinned by `perf_probe.rs::perf_match_length`, whose `ns/row/L` column must stay
+  ~0, and by `tests/running_aggregates.rs` + `tests/bind_index.rs` for values:
+  - `LAST(A.x)` (which is what a bare `A.x` means) scanned the match backwards →
+    `engine/bindindex.rs` keeps per-label ascending bind indices, maintained
+    incrementally by the matcher and **truncated in lockstep with every**
+    `binds.truncate()`. A stale entry is a wrong answer, not a slow one.
+  - A running aggregate re-folded its whole scope per output row → `engine/aggmemo.rs`
+    extends the fold instead, keyed by the address of the `Expr::Agg` node. Only sound
+    while each row's contribution is horizon-independent, so `memoizable` is a
+    conservative gate: a qualified reference is accepted **only when it is the
+    dominant qualifier** (otherwise `SUM(A.v + B.v)` freezes a stale `LAST(B)`), and
+    the matcher clears the memo wherever `binds` shrinks.
+  - `FIRST`/`LAST` materialised the scope as a `Vec<Bind>` per call → `scope_nth`
+    answers "n-th from this end" without building anything.
 - The matcher is a backtracking VM over an **explicit heap stack** of pending
   alternatives (`Alt { ip, pos, binds_len }`), never host recursion — match length
   must not be bounded by the OS stack (it once was, and a match over ~8k rows
@@ -125,7 +153,23 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
 - `Ty` is NOT `Copy` (it owns `List`'s element type); clone it.
 - The worker buffers only `Plan::referenced_columns()`. Buffering volume dominates
   runtime — one unused 200-byte column measured 2.8x on 2M rows.
-- `mr-worker/src/buffer.rs` owns the scan-cursor convention. `scan` filters
+- **Sorting reads fixed-width keys out once** (`plan.rs::sort_tape_on_keys`) instead
+  of calling `cmp_cells` per comparison, which re-located the row in the store every
+  time. Integer-family keys are packed as `i64` + a null flag; VARCHAR/LIST stay on
+  `cmp_cells` (materialising them would copy the column). Skipped below 256 rows —
+  the allocations lost 11% on a query with 160k tiny partitions. A temporal value whose
+  unit disagrees with its column's declared type falls back, since comparing raw
+  integers across units is the bug that sorted year 9999 before 2020.
+- **The spool is deleted when finalize has read it**, not on `Drop`: the SDK holds the
+  producer until a *best-effort* destructor RPC, so `Drop` leaked one directory per
+  query. A query killed earlier is caught by the TTL sweep on first spool use.
+- **A sharded run must not have one producer delete the shared directory** — the first
+  to finish took the others' data with it (289,781 rows became 111,258). Each removes
+  only its own shard; whoever is last removes the directory. And because sharding
+  bypasses the row-count log, each finalize state carries the row count its shard
+  should hold.
+- `mr-worker/src/buffer.rs` owns the scan-cursor convention for the SDK-store
+  *fallback* path (wasm, an unwritable temp dir). `scan` filters
   `id > after_id` and the contract only says ids are *monotonic*, not where they
   start: SQLite's log is AUTOINCREMENT (first id 1), the fs store's is `max_id + 1`
   on an empty dir (first id 0). Paging from `0` silently dropped the first batch on
@@ -156,10 +200,21 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
 - An unbounded quantifier (`*`, `+`, `{n,}`) over a **nullable** sub-pattern is
   rejected at compile (it would epsilon-loop); use a bounded form instead.
 
+## Environment knobs
+
+| | |
+|---|---|
+| `VGI_MR_MATCH_THREADS` | Threads matching partitions. `1` forces the serial path, which is what the determinism checks compare against. Default: machine parallelism, capped at 8. |
+| `VGI_MR_FINALIZE_MEMORY_BYTES` | Spooled bytes above which the relation is sharded by partition key. Default 256 MB, at most 64 shards. Small values are how the sharded path gets exercised by hand. |
+| `VGI_BUFFERING_STORE_TTL_SECS` | Age at which orphaned spool directories are swept (also the SDK store's own knob). Default 24h. |
+| `VGI_WORKER_SHARED_STORAGE` | SDK store backend. `memory` is refused off-wasm — the control records must outlive a process. |
+
 ## Build & test
 
 ```sh
 cargo test --workspace                       # unit + proptest + worker integration
+cargo test --release -p mr-core --test perf_probe -- --ignored --nocapture \
+    --test-threads=1                         # phase timings; see docs/perf-baseline.md
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo doc --no-deps --all-features           # with RUSTDOCFLAGS=-D warnings

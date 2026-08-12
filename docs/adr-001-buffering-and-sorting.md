@@ -1,6 +1,7 @@
 # ADR 001 — How we buffer and sort, and why not an embedded DuckDB
 
-**Status:** accepted · **Date:** 2026-08-12
+**Status:** accepted; superseded in part — see *Update, 2026-08-12* at the end
+· **Date:** 2026-08-12
 
 ## Context
 
@@ -122,8 +123,7 @@ concern the *input*:
 ## Consequences
 
 - Input size is bounded by memory at roughly 120 bytes per row until the streaming
-  path above is built. That is the honest limit, and it is documented in the README
-  rather than implied.
+  path above is built. (Since built — see the update below.)
 - We keep owning the comparator, so we keep owning its bugs — which is the point of
   the differential and adversarial-distribution tests around it
   (`mr-core/tests/sorting.rs`, `mr-worker/tests/sort_agreement.rs`).
@@ -133,3 +133,55 @@ concern the *input*:
   runs. SQL:2016 leaves it implementation-defined; we pin it, because the batch index
   makes that free. On a source that cannot supply an index the price is a serialized
   sink — correctness never varies, only ingest throughput.
+
+
+## Update, 2026-08-12 — what was actually built
+
+The decision above stands: no embedded DuckDB. Two of its consequences do not.
+
+### The buffer is no longer the SDK's store
+
+"Spool each batch to the SDK's cross-process store" was measured at **93.5 ns/row** —
+96% of the whole buffering round trip, against 4.3 ns/row to serialise the same data
+as Arrow IPC. The cost is per call, not per byte: a process-wide `Mutex<Connection>`
+plus an `INSERT` and a `touch` UPSERT for every 2048-row chunk, for a payload that is
+written once and read back once in order and never queried.
+
+Swapping the backend was not the answer either — the `fs` store measured *slower*
+(1.05 s vs 0.91 s on 2M rows), trading SQL overhead for per-file overhead.
+
+So bulk batches now go to `crates/mr-worker/src/spool.rs`: one append-only file per
+sink thread under `$TMPDIR`, one `write()` per `process()` call, no userspace buffering
+(a buffering function has no end-of-input hook to flush at). The SDK store keeps the
+small control records. End to end that took a 2M-row query from 0.80 s to 0.38 s and an
+8M-row one from 5.77 s to 2.17 s, before the other work landed.
+
+This does not weaken the guards; it strengthens them. The SDK's `append` is infallible
+by signature and reports loss through a negative id, while a file write returns an
+error, and every record is length-prefixed so a torn one is detectable.
+
+### Input size is no longer bounded by RAM
+
+The ADR proposed streaming partitions "if inputs outgrow RAM", requiring the buffered
+input to be ordered by partition key and verified while streaming. What was built is
+the simpler shape the spool made available: `combine` — the one point where the
+relation is complete and a single process is looking at it — splits the spool by
+partition key into shards when it exceeds `VGI_MR_FINALIZE_MEMORY_BYTES`, and returns
+one finalize state per shard. Each producer reads one shard, so peak memory tracks a
+shard rather than the relation (8M rows: 365 MB → 167 MB at a 32 MB budget). No
+ordering assumption, and no fallback path to get wrong.
+
+That also delivered what the addendum said the batch-index flag would buy in the
+future: several finalize states give DuckDB something to drain in parallel. The caveat
+recorded there still applies — the operator sizes its drain threads from the *sink*
+worker count — which is why matching is also parallelised *inside* one producer
+(`std::thread::scope` over a chunk of partitions), where it does not depend on how
+DuckDB scheduled the sink.
+
+### The sort
+
+"Our sort is ~60× slower than DuckDB's" was measured against `cmp_cells` through the
+`RowStore` trait, which re-located the row in the store on every comparison. Reading
+fixed-width keys out once first made it **2.9×** faster (587 → 204 ns/row on 1.6M
+scrambled rows). Pre-sorting the input still helps, just less: it is now worth about
+4× on the sort phase rather than the whole query.

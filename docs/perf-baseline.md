@@ -116,6 +116,69 @@ reusing one index per partition), and memoizing `COUNT(*)` — already O(1) — 
 hash lookups per output row (fixed by not memoizing it). The v-shape is ~3% down on
 the index's per-bind push cost, which interning labels should return.
 
+## Final — 2026-08-12, all workstreams landed
+
+Same machine, same probes, `--test-threads=1`.
+
+### End to end, through DuckDB (1000 partitions, `DOWN+`)
+
+| Query | before | after | |
+|---|---|---|---|
+| 2M rows, threads=1 | 0.83 s | **0.28 s** | 3.0× |
+| 2M rows, threads=8 | 0.80 s | **0.19 s** | 4.2× |
+| 8M rows, threads=1 | 5.77 s | **1.19 s** | 4.8× |
+| 8M rows, threads=8 | 3.70 s | **0.97 s** | 3.8× |
+| 8M rows, peak worker RSS | 365 MB | **167 MB** (32 MB budget) | 2.2× |
+
+Threads now help rather than being the only thing that helps: matching is parallel,
+and ingest no longer dominates.
+
+### Compute phases
+
+| Phase | before | after | |
+|---|---|---|---|
+| matcher VM floor (1M rows) | 64 | **38** ns/row | 1.7× |
+| `A+` one match, ONE ROW | 84 | **45** ns/row | 1.9× |
+| `A+` one match, ALL ROWS | 142 | **118** ns/row | 1.2× |
+| v-shape, `PREV` predicates | 105 | **69** ns/row | 1.5× |
+| sort, BIGINT key, 1.6M scrambled | 587 | **204** ns/row | 2.9× |
+| sort, VARCHAR key, 1.6M scrambled | 831 | **679** ns/row | 1.2× |
+| partitioning, 1.6M / 160k partitions | 167 | **96** ns/row | 1.7× |
+| re-sorting 1.6M pre-ordered rows | 93 ms | **55 ms** | 1.7× |
+
+### Cost per row vs match length — the quadratics
+
+Every shape is flat now (`ns/row/L` ~0), so cost per row no longer depends on how
+long the match is:
+
+| Shape | before, L=16k | after | factor |
+|---|---|---|---|
+| `B: k >= A.k` (qualified ref) | 30,344 | **80** ns/row | 380× |
+| `RUNNING SUM(k)` | 230,845 | **139** ns/row | 1,660× |
+| `FINAL SUM(k)` | 455,845 | **~150** ns/row | ~3,000× |
+| `LAST(k)` | 109,619 | **~120** ns/row | ~910× |
+| `SUM(k)` inside DEFINE | 231,831 | **~130** ns/row | ~1,780× |
+
+At L=32k the qualified-reference case went from 60,464 to 85 ns/row (600×).
+Extrapolated, a 1M-row match with one `A.k` reference went from roughly half an hour
+to about 0.1 s.
+
+## Measured and declined
+
+Two things the plan proposed that measurement argued against. Recorded so they are not
+re-attempted blind:
+
+- **Resolving column names to integer ids.** A profile attributed 4.3% of matcher time
+  to `col_index`, but that profile predates label interning. Two experiments since: an
+  O(1) `HashMap` lookup measured *worse* than the existing linear scan (v-shape 108 →
+  133 ns/row — hashing a name costs more than three short `eq_ignore_ascii_case`
+  compares), and an artificially cheap lookup (length-only compare, incorrect, purely
+  to measure the ceiling) measured the same or worse. Projection pushdown keeps the
+  store to the columns the pattern reads, so the scan is over ~3 names. Integer ids
+  would need `Expr::Col`/`Expr::Qualified` churn for no measurable gain.
+- **`opt-level = 3` without LTO.** Slower than `opt-level = 2` on every shape; see
+  below.
+
 ## Compiler-flag experiment
 
 `opt-level` and LTO, measured on `perf_matcher` (two runs each, single-threaded):

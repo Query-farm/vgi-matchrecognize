@@ -325,8 +325,8 @@ FROM mr.match_recognize(
 ### Buffering and memory
 
 Row pattern matching is intrinsically a whole-partition operation, so the function
-buffers its input before it matches anything. Batches are spooled to the worker's
-cross-process store as Arrow IPC — by default a SQLite file under `$TMPDIR`, not
+buffers its input before it matches anything. Batches are spooled to disk as Arrow
+IPC — one append-only file per sink thread under `$TMPDIR`, mode 0700 — not to
 process memory.
 
 - **Unused columns are free.** Only the columns the pattern reads — the partition
@@ -334,41 +334,53 @@ process memory.
   rest are projected away first. This matters more than it sounds: buffering
   volume dominates runtime, and on 2M rows a single unused 200-byte column cost
   1.02s → **2.83s** before this was added.
-- **Pre-sorting the input pays for itself.** DuckDB's sort is parallel, vectorized
-  and spills; ours is a single-threaded comparison sort over the buffered rows. It
-  sorted 4M rows in 0.039s where we take ~2.4s, and adding `ORDER BY` to the input
-  subquery — `(SELECT … FROM t ORDER BY user_id, ts)` — took a 4M-row query from
-  **3.96s to 1.52s**. We still sort defensively, so this is purely a speedup and
-  never a correctness dependency: an already-ordered run is nearly free to re-sort.
-- **Output streams.** Matching runs one partition at a time and emits ~8k-row
-  batches, so the result set is never fully live: 5M *output* rows peak at **349 MB**
-  of worker RSS, less than a 1.3M-match query over a wider input. DuckDB can also
-  stop pulling — adding `LIMIT 5` to that 5M-row query cut it from 2.85s to
-  **1.34s**, the remainder being the input buffering it cannot skip.
-- **Input does not stream.** At finalize the buffered relation is read back into
-  memory, plus one `usize` per row for the partition tapes. Measured: 5M rows × 4
-  columns → about **0.6 GB** peak worker RSS producing 1.33M matches. So memory
-  tracks the *input*, not the output: filter or aggregate before the function on
-  inputs far larger than RAM. Per-partition spilling is the next step.
+- **Matching runs on several threads.** Partitions are independent, so a chunk of
+  them is matched concurrently and the results are emitted in partition order —
+  byte-identical to matching one at a time. `VGI_MR_MATCH_THREADS` pins the count;
+  1 forces the serial path.
+- **Memory is bounded, and tunable.** If the buffered input exceeds
+  `VGI_MR_FINALIZE_MEMORY_BYTES` (default 256 MB), it is split by partition key into
+  shards and each is matched separately, so peak memory tracks a shard rather than
+  the relation: an 8M-row query went from **365 MB to 167 MB** of worker RSS with a
+  32 MB budget. Two things cannot be divided that way — a query with no
+  `partition_by` is a single partition by definition, and one enormous partition is
+  irreducible, because a match may span all of it.
+- **Output streams.** Matching emits ~8k-row batches, so the result set is never
+  fully live: 5M *output* rows peak at **349 MB** of worker RSS. DuckDB can also stop
+  pulling, and a `LIMIT` then skips the matching it does not need.
+- **Pre-sorting the input still helps a little.** Ours is a single-threaded sort over
+  the buffered rows; DuckDB's is parallel and vectorized. Adding `ORDER BY` to the
+  input subquery — `(SELECT … FROM t ORDER BY user_id, ts)` — lets our sort see an
+  already-ordered run, which costs about a quarter of sorting a scrambled one. We
+  sort regardless, so this is purely a speedup, never a correctness dependency.
 
 Matching cannot be made fully streaming: a match may span an entire partition, so
 the partition must be complete first, and DuckDB does not deliver input clustered
 by partition key. [ADR 001](docs/adr-001-buffering-and-sorting.md) records why the
-buffer is a plain Arrow-IPC log rather than an embedded DuckDB, and what the path
-to inputs larger than RAM looks like.
+buffer is a plain Arrow-IPC log rather than an embedded DuckDB, and
+[docs/perf-baseline.md](docs/perf-baseline.md) is the measured cost of every phase.
 
-Leave `VGI_WORKER_SHARED_STORAGE` alone. The buffering and producing phases may run
-in *different worker processes*, so the store has to outlive a process. Two
-independent guards make a misconfiguration an error rather than a quiet
-under-count:
+Leave `VGI_WORKER_SHARED_STORAGE` alone. The spool carries the buffered rows, but the
+SDK store still holds the small control records the finalize phase replays, and the
+two phases may run in *different worker processes* — so that store has to outlive a
+process. Three independent guards make a misconfiguration or a lost file an error
+rather than a quiet under-count:
 
 - Setting it to `memory` fails at bind with an explanation. Of the SDK's backends
   that is the only unsafe value — `sqlite` (the default) and `fs` are durable, and
-  an unrecognized value falls back to `fs`.
-- Independently of any backend name, the number of buffering sinks is carried to
-  the finalize phase *outside* the store. If sinks ran and finalize reads back no
-  rows, the two phases are not sharing state and the query fails. Each batch also
-  carries a separate row-count record, and the totals must agree.
+  an unrecognized value falls back to `fs`. (The wasm build is the exception: one
+  module serves every phase there, so `memory` is both safe and required.)
+- The number of buffering sinks is carried to the finalize phase *outside* the store.
+  If sinks ran and finalize reads back nothing, the two phases are not sharing state
+  and the query fails.
+- Every buffered batch is length-prefixed and its writes are checked, and a sharded
+  run additionally carries the row count each shard should hold. A truncated or
+  missing file is an error naming the shard, not a short answer.
+
+Spool files are deleted as soon as the finalize phase has read them. A query killed
+before that leaves the worker no hook at all, so directories older than
+`VGI_BUFFERING_STORE_TTL_SECS` (default 24h, the same knob the SDK's own store uses)
+are swept when a worker process first spools.
 
 ### Not hanging, not crashing
 
@@ -382,6 +394,15 @@ because a constant is the wrong shape — catastrophic backtracking is super-lin
 partition size, so one number cannot both catch a bad pattern on a small partition
 and let an ordinary linear match finish on a large one. Pin it with
 `step_budget := <n>` for a hard ceiling.
+
+**A long match is linear, not quadratic.** The cost of a row does not depend on how
+long the match containing it is — which was not true until recently. Resolving a
+qualified reference (`A.price`, i.e. `LAST(A.price)`), walking a running aggregate, and
+`FIRST`/`LAST` navigation were each linear in the match, so a match of *L* rows cost
+O(L²): a `DEFINE B: price >= A.price` at L=32,000 cost 60 µs **per row**, and a
+million-row match extrapolated to about half an hour. Each is now a lookup or an
+extended fold, and the same shape costs 85 ns/row — the same as reading a plain
+column. See [docs/perf-baseline.md](docs/perf-baseline.md).
 
 Backtracking uses an explicit heap stack rather than host recursion, so one match
 may span millions of rows: an `A B*` sessionization whose partition is a single long
