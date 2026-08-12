@@ -5,6 +5,7 @@
 //! vs FIRST/LAST logical), running aggregates, CLASSIFIER / MATCH_NUMBER, and
 //! RUNNING/FINAL semantics against it, with full 3-valued NULL logic.
 
+use super::aggmemo::{self, AggMemo};
 use super::rowstore::RowStore;
 use super::valops;
 use crate::error::{MrError, Result};
@@ -31,6 +32,11 @@ pub struct Frame<'a> {
     /// SUBSET name -> member variables. A qualifier naming a subset matches any
     /// of its members, so `U.price` and `COUNT(U.*)` range over all of them.
     pub subsets: &'a SubsetMap,
+    /// Incremental aggregate state shared by every output row of one match, so a
+    /// RUNNING aggregate is folded once across the match instead of re-folded per
+    /// row. `None` disables it (the matcher's frames, where the horizon jumps
+    /// around under backtracking, and single-row emits that have nothing to reuse).
+    pub agg_memo: Option<&'a AggMemo>,
 }
 
 /// SUBSET declarations: union-variable name -> the pattern variables it covers.
@@ -266,7 +272,14 @@ impl<'a> Frame<'a> {
             Expr::Nav { kind, arg, offset } => {
                 self.eval_nav(*kind, arg, *offset, cur_tp, final_sem)
             }
-            Expr::Agg { kind, arg } => self.eval_agg(*kind, arg, final_sem),
+            Expr::Agg { kind, arg } => {
+                // Try the incremental path first; it declines (returning None) for
+                // shapes whose per-row contribution depends on the horizon.
+                match self.eval_agg_memoized(e, *kind, arg, final_sem)? {
+                    Some(v) => Ok(v),
+                    None => self.eval_agg(*kind, arg, final_sem),
+                }
+            }
         }
     }
 
@@ -379,6 +392,94 @@ impl<'a> Frame<'a> {
                 }
             }
         }
+    }
+
+    /// Extend this aggregate site's fold to the current horizon, if the site can be
+    /// folded incrementally and a memo is available. Returns `None` when the caller
+    /// should just recompute from scratch.
+    ///
+    /// The horizon advances monotonically through an ALL ROWS emit loop, so the work
+    /// per output row is the *newly visible* binds rather than all of them. A
+    /// non-monotonic call (a smaller horizon than already folded) falls back rather
+    /// than trying to un-fold.
+    fn eval_agg_memoized(
+        &self,
+        node: &Expr,
+        kind: AggKind,
+        arg: &AggArg,
+        final_sem: bool,
+    ) -> Result<Option<Value>> {
+        let Some(memo) = self.agg_memo else {
+            return Ok(None);
+        };
+        // The dominant qualifier is a property of the expression, not of the row, so
+        // resolve it once: it decides both the scope filter and whether the shape can
+        // be folded incrementally at all.
+        let qual = match arg {
+            AggArg::Expr(e) => dominant_qualifier(e),
+            _ => None,
+        };
+        if !aggmemo::memoizable(kind, arg, qual.as_deref()) {
+            return Ok(None);
+        }
+        let key = (aggmemo::site_of(node), final_sem);
+        // FINAL sees the whole match, so it is folded once and then reused for every
+        // remaining output row of the match.
+        let target = if final_sem {
+            aggmemo::Entry::COMPLETE
+        } else {
+            self.horizon
+        };
+        let mut entry = match memo.get(key) {
+            Some(e) if e.done == aggmemo::Entry::COMPLETE => {
+                return Ok(Some(aggmemo::finish(&e.acc)))
+            }
+            Some(e) if e.done <= self.horizon => e,
+            // Either nothing folded yet, or the horizon moved backwards.
+            _ => aggmemo::Entry {
+                done: 0,
+                acc: aggmemo::empty_acc(kind),
+            },
+        };
+        let from = entry.done;
+        let upto = if final_sem {
+            self.binds.len()
+        } else {
+            self.horizon
+        };
+        let min = matches!(kind, AggKind::Min);
+        for b in &self.binds[from..upto] {
+            match arg {
+                // `COUNT(*)` counts rows; `COUNT(U.*)` counts the rows the union
+                // variable covers. There is no value to fold in either case.
+                AggArg::Star => aggmemo::count_row(&mut entry.acc),
+                AggArg::QualStar(v) => {
+                    if self.label_covers(v, &b.var) {
+                        aggmemo::count_row(&mut entry.acc);
+                    }
+                }
+                AggArg::Expr(e) => {
+                    // The same scope filter `scope()` applies: an aggregate ranges
+                    // over the rows its dominant qualifier covers.
+                    let in_scope = match &qual {
+                        Some(v) => self.label_covers(v, &b.var),
+                        None => true,
+                    };
+                    if in_scope {
+                        let v = self.eval(e, b.tape_pos, Some(b.var.as_str()), final_sem)?;
+                        // Every aggregate skips NULLs, and COUNT(expr) counts the
+                        // non-NULL values.
+                        if !v.is_null() {
+                            aggmemo::accumulate(&mut entry.acc, &v, min)?;
+                        }
+                    }
+                }
+            }
+        }
+        entry.done = target;
+        let out = aggmemo::finish(&entry.acc);
+        memo.put(key, entry);
+        Ok(Some(out))
     }
 
     fn eval_agg(&self, kind: AggKind, arg: &AggArg, final_sem: bool) -> Result<Value> {

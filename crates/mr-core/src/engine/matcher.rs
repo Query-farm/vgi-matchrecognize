@@ -287,6 +287,11 @@ impl<'a> Matcher<'a> {
             horizon: binds.len(),
             match_number: self.match_number,
             subsets: self.subsets,
+            // Backtracking moves the horizon in both directions, so an extend-only
+            // fold would be unsound here: a popped alternative un-binds rows that an
+            // accumulator has already absorbed. DEFINE aggregates therefore still
+            // recompute (see the plan's W5).
+            agg_memo: None,
         };
         let v = frame.eval_predicate(expr)?;
         Ok(matches!(v, Value::Bool(true)))

@@ -319,8 +319,10 @@ impl Plan {
                 continue;
             }
             if self.rows_all {
+                // One memo per match: the accumulators describe this bind sequence.
+                let memo = crate::engine::AggMemo::new();
                 for k in 0..m.binds.len() {
-                    out.push(self.emit_all_row(store, tape, m, k)?);
+                    out.push(self.emit_all_row(store, tape, m, k, &memo)?);
                 }
             } else {
                 out.push(self.emit_one_row(store, tape, m)?);
@@ -342,6 +344,8 @@ impl Plan {
             horizon: m.binds.len(),
             match_number: m.match_number,
             subsets: &self.subsets,
+            // A single output row has no later rows to share a fold with.
+            agg_memo: None,
         };
         let mut row = Vec::with_capacity(self.output_columns.len());
         let anchor_tape = m.binds.first().map(|b| b.tape_pos).unwrap_or(m.start);
@@ -372,6 +376,7 @@ impl Plan {
             horizon: 0,
             match_number: m.match_number,
             subsets: &self.subsets,
+            agg_memo: None,
         };
         let mut row = Vec::with_capacity(self.output_columns.len());
         for c in &self.partition_by {
@@ -404,6 +409,7 @@ impl Plan {
         tape: &[usize],
         m: &crate::engine::Match,
         k: usize,
+        memo: &crate::engine::AggMemo,
     ) -> Result<Vec<Value>> {
         let frame = Frame {
             store,
@@ -412,6 +418,9 @@ impl Plan {
             horizon: k + 1,
             match_number: m.match_number,
             subsets: &self.subsets,
+            // `k` ascends through the match, so the horizon only ever advances and
+            // each aggregate can extend its fold by the one newly visible bind.
+            agg_memo: Some(memo),
         };
         let row_tape = m.binds[k].tape_pos;
         let mut row = Vec::with_capacity(self.output_columns.len());
