@@ -174,6 +174,24 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
         description: "SQL:2016 MATCH_RECOGNIZE row pattern matching over a buffered relation"
             .into(),
         tags,
+        // Output rows come out partition by partition, in the order the partitions
+        // happened to arrive — not in the input's order, and not in `order_by`
+        // order across partitions. Say so, so the planner never assumes otherwise.
+        //
+        // The sink-side ordering knobs are deliberately left off. Declaring
+        // `requires_input_batch_index` would give us DuckDB's per-chunk batch index
+        // (and so the true input order, which would make tie ordering deterministic
+        // and would let a future finalize stream partitions), but it requires a
+        // source that can supply one: the extension's own comment names `range()`
+        // as a source that cannot, and with the community extension the flag
+        // segfaults the DuckDB process on such a query rather than raising the
+        // documented IOException. `sink_order_dependent` is the alternative and is
+        // mutually exclusive with it, but it forces a single-threaded sink, and
+        // ingest is ~83% of a realistic query's wall time. Neither price is worth
+        // deterministic tie ordering, which SQL:2016 leaves implementation-defined.
+        order_preservation: Some(
+            vgi::protocol::enums::order_preservation::NO_ORDER_GUARANTEE.to_string(),
+        ),
         ..Default::default()
     }
 }

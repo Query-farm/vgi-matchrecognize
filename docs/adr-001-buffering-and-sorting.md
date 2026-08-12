@@ -82,6 +82,35 @@ streamed chunks would silently produce different matches.
 batches (spill sorted runs to the same store, k-way merge), for inputs that are
 both larger than RAM *and* unsorted. Bounded work, no new dependency.
 
+## Addendum — the sink-side ordering knobs
+
+The SDK exposes three, and it is worth recording why we set only one.
+
+`FunctionMetadata.order_preservation` describes what our *output* does. We declare
+`NO_ORDER_GUARANTEE`, which is the truth: rows come out partition by partition, in
+whatever order the partitions arrived.
+
+The other two are mutually exclusive (the extension's header says so) and both
+concern the *input*:
+
+- `requires_input_batch_index` hands us DuckDB's per-chunk batch index, which would
+  give us the true input order — enough to make tie ordering deterministic and to
+  let a future finalize stream partitions. It requires a source that can supply one.
+  The extension's own comment names `range()` as a source that cannot, and says it
+  will "fail loudly" with an `IOException`. **Measured with the community extension,
+  it does not fail loudly: it segfaults the DuckDB process (exit 139) on
+  `(SELECT i FROM range(10))`, with no error and no output.** Removing the flag makes
+  the same query work. So the flag is unusable today, and even once fixed it would
+  restrict the function to sources with batch-index support — the error text suggests
+  "wrap input in a TEMP TABLE", which is not a reasonable thing to ask of every
+  caller.
+- `sink_order_dependent` forces `ParallelSink=false`, a single-threaded sink. That
+  works with any source, but ingest is ~83% of a realistic query's wall time, so it
+  trades most of the throughput for ordering.
+
+Neither price buys enough. Tie ordering is implementation-defined in SQL:2016, and
+the streaming work can verify ordering directly instead of being told about it.
+
 ## Consequences
 
 - Input size is bounded by memory at roughly 120 bytes per row until the streaming
@@ -92,3 +121,7 @@ both larger than RAM *and* unsorted. Bounded work, no new dependency.
   (`mr-core/tests/sorting.rs`, `mr-worker/tests/sort_agreement.rs`).
 - Users with large inputs get most of the available win for free, by writing
   `ORDER BY` in the subquery they were already writing.
+- Row order among ties on the `order_by` key is arrival order, and so may vary
+  between runs when DuckDB parallelises the sink. SQL:2016 leaves it
+  implementation-defined; making it deterministic is what the batch-index flag above
+  would buy, once it is usable.
