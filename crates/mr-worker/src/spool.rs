@@ -542,66 +542,132 @@ pub fn read_all(scope: &[u8]) -> Result<Vec<(i64, RecordBatch)>> {
     read_files(&files_with_prefix(scope, "sink-"))
 }
 
-/// Read a list of spool files into `(batch_index, batch)` pairs.
+/// One record's header, read ahead of its payload.
+#[derive(Clone, Copy)]
+struct Head {
+    index: i64,
+    stored_len: usize,
+    raw_len: u32,
+    codec: u8,
+}
+
+/// A lazy reader over one spool file's records, in the order they were written.
 ///
-/// Streams: one record's payload is resident at a time, and the file's bytes are never
-/// all in memory at once. The previous version read the whole file with `fs::read` and
-/// then kept every decoded batch, so a producer's peak was the file *plus* its decoded
-/// form — about twice its shard, against a memory budget that assumes once.
-///
-/// Each payload is read into a 64-byte-aligned `MutableBuffer`, which is what allows
-/// `decode_payload` below to hand out arrays that borrow it rather than copying.
-pub fn read_files(paths: &[PathBuf]) -> Result<Vec<(i64, RecordBatch)>> {
-    let mut out = Vec::new();
-    for path in paths {
-        let file = File::open(path).map_err(|e| {
+/// Keeps the *next* header in hand so its batch index can be inspected without decoding
+/// the payload — which is what lets the shard split merge several files in global index
+/// order ([`crate::shard::split`]) while holding only one payload at a time.
+pub struct RecordCursor {
+    path: PathBuf,
+    reader: BufReader<File>,
+    head: Option<Head>,
+}
+
+impl RecordCursor {
+    /// Open a spool file and read its first header. `None` for an empty file.
+    pub fn open(path: PathBuf) -> Result<Self> {
+        let file = File::open(&path).map_err(|e| {
             re(format!(
                 "match_recognize: opening {} failed: {e}",
                 path.display()
             ))
         })?;
-        let mut reader = BufReader::new(file);
-        while let Some((index, batch)) = read_record(&mut reader)
-            .map_err(|e| re(format!("match_recognize: reading {}: {e}", path.display())))?
-        {
-            out.push((index, batch));
+        let mut cursor = RecordCursor {
+            path,
+            reader: BufReader::new(file),
+            head: None,
+        };
+        cursor.read_head()?;
+        Ok(cursor)
+    }
+
+    fn read_head(&mut self) -> Result<()> {
+        let mut header = [0u8; HEADER];
+        match self.reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                self.head = None;
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(re(format!(
+                    "match_recognize: truncated record header in {}: {e}",
+                    self.path.display()
+                )))
+            }
+        }
+        self.head = Some(Head {
+            index: i64::from_le_bytes(header[0..8].try_into().expect("8 bytes")),
+            stored_len: u32::from_le_bytes(header[8..12].try_into().expect("4 bytes")) as usize,
+            raw_len: u32::from_le_bytes(header[12..16].try_into().expect("4 bytes")),
+            codec: header[16],
+        });
+        Ok(())
+    }
+
+    /// The batch index of the next record, without decoding it.
+    pub fn peek_index(&self) -> Option<i64> {
+        self.head.map(|h| h.index)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Decode the next record, then read the following header.
+    pub fn next_batch(&mut self) -> Result<Option<(i64, RecordBatch)>> {
+        let Some(head) = self.head else {
+            return Ok(None);
+        };
+        // Aligned, so the decoded arrays can borrow it.
+        let mut payload = MutableBuffer::from_len_zeroed(head.stored_len);
+        self.reader
+            .read_exact(payload.as_slice_mut())
+            .map_err(|e| {
+                re(format!(
+                    "match_recognize: truncated payload of {} bytes in {}: {e}",
+                    head.stored_len,
+                    self.path.display()
+                ))
+            })?;
+        // Records are padded to a multiple of 64; step over the tail.
+        let padding = (aligned(HEADER + head.stored_len) - HEADER - head.stored_len) as i64;
+        if padding > 0 {
+            self.reader.seek_relative(padding).map_err(|e| {
+                re(format!(
+                    "match_recognize: truncated record padding in {}: {e}",
+                    self.path.display()
+                ))
+            })?;
+        }
+        let batch = decode_payload(head.codec, head.raw_len, payload.into())?;
+        self.read_head()?;
+        Ok(Some((head.index, batch)))
+    }
+}
+
+/// A cursor per sink file of an execution, ready to be merged.
+pub fn sink_cursors(scope: &[u8]) -> Result<Vec<RecordCursor>> {
+    files_with_prefix(scope, "sink-")
+        .into_iter()
+        .map(RecordCursor::open)
+        .collect()
+}
+
+/// Read a list of spool files into `(batch_index, batch)` pairs.
+///
+/// Streams: one record's payload is resident at a time, and a file's bytes are never all
+/// in memory at once. The previous version read the whole file with `fs::read` and then
+/// kept every decoded batch, so a producer's peak was the file *plus* its decoded form —
+/// about twice its shard, against a memory budget that assumes once.
+pub fn read_files(paths: &[PathBuf]) -> Result<Vec<(i64, RecordBatch)>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let mut cursor = RecordCursor::open(path.clone())?;
+        while let Some(record) = cursor.next_batch()? {
+            out.push(record);
         }
     }
     Ok(out)
-}
-
-/// Read one record, or `None` at a clean end of file.
-fn read_record<R: Read>(reader: &mut R) -> Result<Option<(i64, RecordBatch)>> {
-    let mut header = [0u8; HEADER];
-    match reader.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(re(format!("truncated record header: {e}"))),
-    }
-    let index = i64::from_le_bytes(header[0..8].try_into().expect("8 bytes"));
-    let stored_len = u32::from_le_bytes(header[8..12].try_into().expect("4 bytes")) as usize;
-    let raw_len = u32::from_le_bytes(header[12..16].try_into().expect("4 bytes"));
-    let codec = header[16];
-
-    // Aligned, so the decoded arrays can borrow it.
-    let mut payload = MutableBuffer::from_len_zeroed(stored_len);
-    reader.read_exact(payload.as_slice_mut()).map_err(|e| {
-        re(format!(
-            "truncated record payload of {stored_len} bytes: {e}"
-        ))
-    })?;
-    // Records are padded to a multiple of 64; skip the tail so the next header is found.
-    let padding = aligned(HEADER + stored_len) - HEADER - stored_len;
-    if padding > 0 {
-        let mut skip = [0u8; RECORD_ALIGN];
-        reader
-            .read_exact(&mut skip[..padding])
-            .map_err(|e| re(format!("truncated record padding: {e}")))?;
-    }
-    Ok(Some((
-        index,
-        decode_payload(codec, raw_len, payload.into())?,
-    )))
 }
 
 /// Delete one shard's file, and the execution's directory if that was the last.

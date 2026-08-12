@@ -169,6 +169,18 @@ fn every_partition_lands_in_exactly_one_shard() {
         "expected the split to use several shards, used {used}"
     );
 
+    // Records are coalesced, so a shard holds far fewer of them than the split consumed —
+    // otherwise each input batch would contribute one sliver per shard and the shard files
+    // would be larger than the input they came from.
+    let records: usize = (0..SHARDS)
+        .map(|s| spool::read_shard(&scope, s).unwrap().len())
+        .sum();
+    assert!(
+        records < BATCHES as usize,
+        "expected coalescing to write fewer than {BATCHES} records across all shards, got \
+         {records}"
+    );
+
     for s in 0..SHARDS {
         spool::discard_shard(&scope, s);
     }
@@ -194,4 +206,84 @@ fn shard_count_respects_budget_and_shape() {
     // But it is still a cap, so no input means unbounded files and streams.
     assert!(shard::shard_count(budget * 10_000, true) <= 1024);
     assert_eq!(shard::shard_count(budget * 10_000, true), 1024);
+}
+
+/// The split consumes sink files in **global batch-index order**, so a coalesced record
+/// covers a contiguous range of indices and the read-side sort reconstructs input order
+/// exactly.
+///
+/// This is the property coalescing could quietly break. Sink files carry strided indices
+/// — one thread writes 0, 8, 16… while another writes 1, 9, 17… — so walking them file by
+/// file and merging adjacent records would tag a group with an index that no longer orders
+/// it against groups from another file, and every row of one sink would sort before every
+/// row of the next. The visible symptom would be tie order under `order_by` depending on
+/// how DuckDB scheduled its sinks.
+#[test]
+fn coalesced_records_reconstruct_input_order() {
+    const PARTITIONS: i64 = 4;
+    const SHARDS: usize = 4;
+    // Two "sink threads" worth of interleaved indices, written to separate files by using
+    // separate threads — which is how the real sink produces its striding.
+    const PER_THREAD: i64 = 60;
+
+    let scope = format!("shard-order-{}", std::process::id()).into_bytes();
+    let schema = schema();
+    std::thread::scope(|s| {
+        for t in 0..2i64 {
+            let scope = scope.clone();
+            let schema = schema.clone();
+            s.spawn(move || {
+                for k in 0..PER_THREAD {
+                    // Global index order interleaves the two threads: 0,1,2,3,…
+                    let index = k * 2 + t;
+                    let ts_base = index * 100;
+                    let uid: Vec<i64> = (0..100).map(|r: i64| r % PARTITIONS).collect();
+                    let ts: Vec<i64> = (0..100).map(|r| ts_base + r).collect();
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int64Array::from(uid)) as ArrayRef,
+                            Arc::new(Int64Array::from(ts)) as ArrayRef,
+                        ],
+                    )
+                    .unwrap();
+                    spool::append(&scope, &batch, Some(index)).unwrap();
+                }
+            });
+        }
+    });
+
+    let rows_per_shard = shard::split(&scope, &plan(), &schema, SHARDS).unwrap();
+    assert_eq!(
+        rows_per_shard.iter().sum::<u64>(),
+        (2 * PER_THREAD * 100) as u64
+    );
+
+    // Per shard: sort records by index as `read_batches` does, concatenate, and require ts
+    // to be ascending — which it is only if the merge consumed the sinks in index order.
+    for s in 0..SHARDS {
+        let mut records = spool::read_shard(&scope, s).unwrap();
+        records.sort_by_key(|(i, _)| *i);
+        let mut seen: Vec<i64> = Vec::new();
+        for (_, batch) in &records {
+            let ts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ts is Int64");
+            for i in 0..batch.num_rows() {
+                seen.push(ts.value(i));
+            }
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            seen, sorted,
+            "shard {s} came back out of input order after coalescing"
+        );
+    }
+    for s in 0..SHARDS {
+        spool::discard_shard(&scope, s);
+    }
+    spool::discard(&scope);
 }

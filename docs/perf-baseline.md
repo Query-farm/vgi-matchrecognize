@@ -254,6 +254,25 @@ entirely in the page cache, so nothing reaches a disk. A short query therefore p
 nothing, and a large one (where the spool is many times RAM) gets 1.5–2.9× fewer bytes
 for ~20 ns/row. At 10M rows the mixed default lands at 10.7 bytes/row against 24.6.
 
+## The spool format, after the review
+
+Per-row costs over the 10M-row probe, before and after the four format changes
+(64-byte-aligned records, streaming zero-copy reader, uncompressed accounting, coalesced
+shard records):
+
+| | before | after |
+|---|---|---|
+| read + decode | 16 | **5–10** ns/row |
+| read shards back | 16 | **8–10** ns/row |
+| shard records written (10 shards) | 48,830 | **964** |
+| shard bytes vs input | 1.1x | **~1.0x** |
+
+The record-count collapse is the one that matters at scale. The split used to write each
+input batch's slice straight out, so with `s` shards its records held `2048 / s` rows — two
+rows at `MAX_SHARDS = 1024` — and each record carries ~472 bytes of IPC framing. That is
+10.8x amplification at the top of the shard range, which made the high end unusable; the
+raised ceiling only became real once records were coalesced.
+
 ## Measured and declined
 
 Two things the plan proposed that measurement argued against. Recorded so they are not

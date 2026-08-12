@@ -98,19 +98,55 @@ pub fn shard_count(total_bytes: u64, partitioned: bool) -> usize {
     needed.clamp(1, MAX_SHARDS)
 }
 
-/// Rewrite an execution's spooled batches into `shards` shard files, keyed by
-/// partition key, and delete the originals.
+/// Target size of one shard record, in bytes of arrow data.
 ///
-/// Streams one batch at a time — the point is to bound memory, so the pass itself must
-/// not materialise the relation. Rows of one input batch that land in the same shard
-/// are written together, so a shard file holds whole (sub-)batches, each still carrying
-/// its original batch index so input order can be restored per shard.
+/// The split used to write each input batch's slice straight out, so with `s` shards its
+/// records held `2048 / s` rows: at 10 shards ~205, at 1024 shards **two**. Every record
+/// carries a fixed ~472 bytes of IPC framing (its own schema message), so that is 10%
+/// overhead at 205 rows and **10.8x** at two — the shard files would come out an order of
+/// magnitude larger than the input they came from. Accumulating rows per shard and writing
+/// full-size records is what makes the high end of `MAX_SHARDS` usable at all.
 ///
-/// **Disk, not just memory.** Each sink file is deleted as soon as its rows are in
-/// shards, rather than all of them at the end. Holding both copies made peak disk twice
-/// the buffered relation — measured at 5.0 GB against 2.4 GB of data on a 100M-row
-/// query — which for a large input is the difference between needing 25 GB free and
-/// needing 50 GB. Now the overlap is one sink file.
+/// 256 KB is where the returns stop: framing overhead is under 1% by ~2048 rows, LZ4's
+/// window is 64 KB so a bigger record buys no further ratio, and 256 KB of columns still
+/// sits in L2 while being processed.
+const TARGET_RECORD_BYTES: usize = 256 * 1024;
+
+/// Ceiling on rows accumulated across *all* shards at once.
+///
+/// Expressed in bytes, since the row width varies: this is what the pass may hold on top
+/// of the one batch it is splitting, and it must stay small against the memory budget the
+/// pass exists to enforce. With few shards each gets the full [`TARGET_RECORD_BYTES`];
+/// with many, each gets a proportionally smaller slice rather than the total growing.
+const ACCUM_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// Rows accumulated for one shard, waiting to be written as one record.
+struct Accum {
+    batches: Vec<RecordBatch>,
+    bytes: usize,
+    /// Batch index of the first input record contributing to this group. Because the merge
+    /// below consumes records in ascending index order, a group covers a contiguous range,
+    /// so tagging it with the first index keeps the read-side sort exact.
+    first_index: Option<i64>,
+}
+
+/// Rewrite an execution's spooled batches into `shards` shard files, keyed by partition
+/// key, and delete the originals.
+///
+/// **Merges the sink files in global batch-index order** rather than walking them one at a
+/// time. That matters for more than tidiness: sink files carry *strided* indices (one
+/// thread wrote 0, 8, 16…, another 1, 9, 17…), so consuming them file by file and then
+/// coalescing would tag a group with an index that no longer orders it against groups from
+/// another file — the read-side sort would put every row of one sink before every row of
+/// the next, instead of interleaving them. Rows tying on the `order_by` key would then come
+/// out in an order that depends on how DuckDB happened to schedule its sinks, which is
+/// exactly what the batch index exists to prevent (`test/sql/batch_index.test`).
+///
+/// Consuming in index order also means each coalesced group is index-contiguous, which is
+/// what makes coalescing sound at all.
+///
+/// Peak disk stays at about the size of the relation: a sink file is deleted as soon as its
+/// last record is consumed, so the shards grow as the sinks shrink.
 pub fn split(
     scope: &[u8],
     plan: &Plan,
@@ -119,53 +155,109 @@ pub fn split(
 ) -> Result<Vec<u64>> {
     debug_assert!(shards > 1, "splitting into one shard is a no-op");
     let mut rows_per_shard = vec![0u64; shards];
-    // Held open for the whole pass; see `ShardWriters`.
-    let mut writers = crate::spool::ShardWriters::new(scope, shards)?;
     let part_cols = plan.partition_by_columns();
-    let paths = crate::spool::files_with_prefix(scope, "sink-");
-    for path in &paths {
-        for (index, batch) in crate::spool::read_files(std::slice::from_ref(path))? {
-            // Column positions are resolved per batch against the schema the sink
-            // wrote, which is the projected one.
-            let store = BatchRowStore::new(projected_schema.clone(), vec![batch.clone()]);
-            let cols: Vec<usize> = part_cols
-                .iter()
-                .map(|c| {
-                    mr_core::engine::RowStore::col_index(&store, c).ok_or_else(|| {
-                        re(format!("match_recognize: unknown partition column '{c}'"))
-                    })
-                })
-                .collect::<Result<_>>()?;
+    let mut writers = crate::spool::ShardWriters::new(scope, shards)?;
+    let mut cursors = crate::spool::sink_cursors(scope)?;
+    let per_shard_target = (ACCUM_BUDGET_BYTES / shards.max(1)).min(TARGET_RECORD_BYTES);
+    let mut accums: Vec<Accum> = (0..shards)
+        .map(|_| Accum {
+            batches: Vec::new(),
+            bytes: 0,
+            first_index: None,
+        })
+        .collect();
 
-            // Row indices per shard, then one `take` per shard: a single pass over the
-            // batch and one copy of each row.
-            let mut per_shard: Vec<Vec<u32>> = vec![Vec::new(); shards];
-            for row in 0..batch.num_rows() {
-                let mut h = DefaultHasher::new();
-                for &ci in &cols {
-                    hash_value(&mr_core::engine::RowStore::cell(&store, row, ci), &mut h);
-                }
-                let s = (h.finish() % shards as u64) as usize;
-                per_shard[s].push(row as u32);
+    // The next record across all sinks, by batch index. Linear over the cursors, of which
+    // there are as many as sink threads — a heap would be pointless at that size.
+    let next_cursor = |cursors: &[crate::spool::RecordCursor]| -> Option<usize> {
+        cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.peek_index().map(|ix| (ix, i)))
+            .min()
+            .map(|(_, i)| i)
+    };
+    while let Some(pick) = next_cursor(&cursors) {
+        let Some((index, batch)) = cursors[pick].next_batch()? else {
+            continue;
+        };
+        if cursors[pick].peek_index().is_none() {
+            // Exhausted: its rows are all in shards or in an accumulator, so the copy on
+            // disk is dead weight. Dropping it here is what keeps peak disk at ~1x.
+            crate::spool::remove_file(cursors[pick].path());
+        }
+
+        let store = BatchRowStore::new(projected_schema.clone(), vec![batch.clone()]);
+        let cols: Vec<usize> = part_cols
+            .iter()
+            .map(|c| {
+                mr_core::engine::RowStore::col_index(&store, c)
+                    .ok_or_else(|| re(format!("match_recognize: unknown partition column '{c}'")))
+            })
+            .collect::<Result<_>>()?;
+
+        // Row indices per shard, then one `take` per shard: a single pass over the batch
+        // and one copy of each row.
+        let mut per_shard: Vec<Vec<u32>> = vec![Vec::new(); shards];
+        for row in 0..batch.num_rows() {
+            let mut h = DefaultHasher::new();
+            for &ci in &cols {
+                hash_value(&mr_core::engine::RowStore::cell(&store, row, ci), &mut h);
             }
-            for (s, rows) in per_shard.iter().enumerate() {
-                if rows.is_empty() {
-                    continue;
-                }
-                let sub = take_rows(&batch, rows)?;
-                rows_per_shard[s] += sub.num_rows() as u64;
-                writers.append(s, &sub, index)?;
+            let s = (h.finish() % shards as u64) as usize;
+            per_shard[s].push(row as u32);
+        }
+        for (s, rows) in per_shard.iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let sub = take_rows(&batch, rows)?;
+            rows_per_shard[s] += sub.num_rows() as u64;
+            let accum = &mut accums[s];
+            accum.first_index.get_or_insert(index);
+            accum.bytes += sub.get_array_memory_size();
+            accum.batches.push(sub);
+            if accum.bytes >= per_shard_target {
+                flush(&mut writers, s, accum, projected_schema)?;
             }
         }
-        // This file's rows are all in shards now, so the copy of them here is dead
-        // weight. Dropping it as we go keeps peak disk at the size of the relation
-        // plus one file, instead of two full copies.
-        crate::spool::remove_file(path);
     }
-    // Before the row counts are handed out as finalize state, every byte must be on
-    // its way to disk — another process may read these files.
+
+    for (s, accum) in accums.iter_mut().enumerate() {
+        flush(&mut writers, s, accum, projected_schema)?;
+    }
+    // Before the row counts are handed out as finalize state, every byte must be on its way
+    // to disk — another process may read these files.
     writers.finish()?;
     Ok(rows_per_shard)
+}
+
+/// Write one shard's accumulated rows as a single record, and reset the accumulator.
+fn flush(
+    writers: &mut crate::spool::ShardWriters,
+    shard: usize,
+    accum: &mut Accum,
+    schema: &SchemaRef,
+) -> Result<()> {
+    if accum.batches.is_empty() {
+        return Ok(());
+    }
+    let index = accum
+        .first_index
+        .take()
+        .expect("non-empty group has an index");
+    let merged = if accum.batches.len() == 1 {
+        accum.batches.pop().expect("length checked")
+    } else {
+        arrow_select::concat::concat_batches(schema, accum.batches.iter()).map_err(|e| {
+            re(format!(
+                "match_recognize: coalescing shard rows failed: {e}"
+            ))
+        })?
+    };
+    accum.batches.clear();
+    accum.bytes = 0;
+    writers.append(shard, &merged, index)
 }
 
 /// A batch holding just `rows`, in that order.

@@ -73,7 +73,13 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     ns/row**. `raw_len` is what the shard count divides by the memory budget; file sizes
     stopped predicting the producer's peak the moment anything was compressed.
   - `shard.rs` — splits the spool by partition key when it exceeds the finalize memory
-    budget, so peak memory tracks a shard rather than the relation. **A trade, not a
+    budget, so peak memory tracks a shard rather than the relation. It **merges the sink
+    files in global batch-index order**, which is not optional: sink files carry strided
+    indices (one thread wrote 0, 8, 16…, another 1, 9, 17…), so coalescing records without
+    merging would make every row of one sink sort before every row of the next and tie
+    order under `order_by` would depend on DuckDB's scheduling. Records are coalesced to
+    ~256 KB, which took a 10-shard split from 48,830 records to 964; without it, 1024
+    shards would write two-row records and the shard files would be ~10x the input. **A trade, not a
     win**: measured 2× wall clock for 2× less memory (the split is a second full,
     serial pass), so the default budget is high enough that ordinary queries never take
     it. Do not "optimize" it expecting a speedup — hashing was measured and is not the
