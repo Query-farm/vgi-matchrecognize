@@ -125,10 +125,15 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
 - `Ty` is NOT `Copy` (it owns `List`'s element type); clone it.
 - The worker buffers only `Plan::referenced_columns()`. Buffering volume dominates
   runtime — one unused 200-byte column measured 2.8x on 2M rows.
-- `mr-worker/src/buffer.rs` owns the scan-cursor convention. Backends promise only
-  *monotonic* ids: SQLite starts at 1, the fs store at 0, so paging from
-  `after_id = 0` silently dropped the first batch. Start below every id.
-  `tests/storage_probe.rs` round-trips every backend through the real helper.
+- `mr-worker/src/buffer.rs` owns the scan-cursor convention. `scan` filters
+  `id > after_id` and the contract only says ids are *monotonic*, not where they
+  start: SQLite's log is AUTOINCREMENT (first id 1), the fs store's is `max_id + 1`
+  on an empty dir (first id 0). Paging from `0` silently dropped the first batch on
+  fs. `tests/storage_probe.rs` round-trips the two durable local backends
+  (`sqlite`, `fs`) through the real helper; `memory` is refused and `http` is not
+  compiled in.
+- `append` reports failure by returning a negative id (SQLite returns -1 without
+  storing), so `buffer::append_batch` checks it rather than discarding it.
 - Empty matches (zero bound rows) ARE reported and DO consume a match number, per
   SQL:2016 — one row positioned on the row the match sits on, with every measure
   evaluated over an empty frame (`CLASSIFIER()`/navigation NULL, `COUNT(*)` 0).

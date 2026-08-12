@@ -2,20 +2,29 @@
 //! storage and reads them back.
 //!
 //! Both directions live here because they share one fragile convention — the scan
-//! cursor. The storage layer's `scan` returns entries with `id > after_id`, and the
-//! ids are only documented as *monotonic*: the SQLite backend starts them at 1,
-//! but the filesystem backend starts at 0. Paging from `after_id = 0` therefore
-//! silently skips the very first record on any backend that is 0-based — which
-//! cost one whole batch (measured: 547 missing matches out of 1,333,333) and
-//! looked like backend data loss rather than a cursor bug. `START_CURSOR` is
-//! below every representable id, so the first page includes everything.
+//! cursor. `scan` returns entries with `id > after_id`, and the storage contract
+//! says only that an id is *monotonic*, not where it starts: SQLite's log is
+//! `INTEGER PRIMARY KEY AUTOINCREMENT` so its first id is 1, while the filesystem
+//! store computes `max_id + 1` over an empty directory so its first id is 0.
+//! Paging from `after_id = 0` therefore skips the very first record on a 0-based
+//! backend — which cost one whole batch (measured with the `fs` backend: 547
+//! missing matches out of 1,333,333) and looked like backend data loss rather
+//! than a cursor bug.
 
 use arrow_array::RecordBatch;
 use vgi::ipc;
 use vgi::storage::SharedStorage;
 use vgi_rpc::{Result, RpcError};
 
-/// Cursor value that precedes every id a backend can assign. Do not use `0`.
+/// Where paging starts. Below every id either local backend assigns (1 for
+/// SQLite, 0 for the filesystem store), so the first page includes everything.
+/// Do not use `0`.
+///
+/// This is a floor, not a proof: because the filter is `id > after_id`, an entry
+/// whose id was exactly `i64::MIN` would still be missed. No backend assigns that,
+/// and one cannot be reached by incrementing from either origin above, but the
+/// only way to remove the assumption entirely would be a `scan` that takes an
+/// inclusive cursor.
 const START_CURSOR: i64 = i64::MIN;
 
 /// How many log entries to request per `scan` call.
@@ -57,14 +66,25 @@ pub fn scan_log(storage: &SharedStorage, scope: &[u8], ns: &[u8]) -> Vec<Vec<u8>
 }
 
 /// Buffer one (already projected) batch, plus its independent row-count record.
+///
+/// `append` is infallible by signature but reports failure through its return
+/// value — the SQLite backend logs and returns `-1` without storing the row — so
+/// both ids are checked. Dropping a batch here would otherwise surface as a
+/// quietly short result rather than an error.
 pub fn append_batch(storage: &SharedStorage, scope: &[u8], batch: &RecordBatch) -> Result<()> {
-    storage.append(scope, NS_BATCHES, b"", ipc::write_batch(batch)?);
-    storage.append(
+    let batch_id = storage.append(scope, NS_BATCHES, b"", ipc::write_batch(batch)?);
+    let count_id = storage.append(
         scope,
         NS_ROWS,
         b"",
         (batch.num_rows() as u64).to_le_bytes().to_vec(),
     );
+    if batch_id < 0 || count_id < 0 {
+        return Err(re(
+            "match_recognize: the shared storage backend refused a buffered batch, so the result \
+             would be silently incomplete. Check the worker log for the underlying storage error.",
+        ));
+    }
     Ok(())
 }
 

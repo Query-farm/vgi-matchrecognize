@@ -267,12 +267,16 @@ process and the result would be silently empty.
 Reading the buffered log back is guarded two ways, because a short read here
 would mean a confidently wrong answer rather than an error:
 
-- The scan cursor starts **below every representable id**, not at `0`. Backends
-  only promise *monotonic* ids — SQLite starts at 1, the filesystem store at 0 —
-  so paging from `0` silently skipped the first batch on a 0-based backend
-  (measured: 547 missing matches out of 1,333,333). `crates/mr-worker/src/buffer.rs`
-  owns that convention, and `tests/storage_probe.rs` round-trips every backend
-  through it.
+- The scan cursor starts at `i64::MIN`, not at `0`. `scan` returns entries with
+  `id > after_id`, and the storage contract says only that an id is *monotonic* —
+  not where it starts: SQLite's log is `INTEGER PRIMARY KEY AUTOINCREMENT` (first
+  id 1) while the filesystem store's is `max_id + 1` on an empty directory (first
+  id 0). Paging from `0` therefore skipped the first record on the 0-based
+  backend — measured with `VGI_WORKER_SHARED_STORAGE=fs` as 547 missing matches
+  out of 1,333,333, exactly one 2048-row batch. `crates/mr-worker/src/buffer.rs`
+  owns the cursor, and `tests/storage_probe.rs` round-trips the two durable local
+  backends (`sqlite`, `fs`) through it. Note `i64::MIN` is a floor, not a
+  guarantee: an id of exactly `i64::MIN` would still be excluded by `>`.
 - Each batch is written with an **independent row-count record**, and the two
   totals are compared at finalize; a mismatch is an error naming the backend.
 
