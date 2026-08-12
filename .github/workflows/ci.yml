@@ -143,7 +143,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain (pinned MSRV)
-        uses: dtolnay/rust-toolchain@1.97
+        uses: dtolnay/rust-toolchain@1.100
       # Its own toolchain means its own artifacts; this cache cannot be shared with the
       # stable jobs.
       - uses: Swatinem/rust-cache@v2
