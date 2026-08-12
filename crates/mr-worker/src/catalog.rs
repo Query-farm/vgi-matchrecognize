@@ -14,10 +14,10 @@ const AFTER_MATCH_SKIP_MODES_DEF: &str = "SELECT mode, needs_variable, resumes_a
      row of the matched span. This is the default when after is omitted.'), \
     ('to next row', FALSE, 'Resume at the row immediately after the FIRST row of the matched \
      span, so overlapping matches can be found.'), \
-    ('to first <var>', TRUE, 'Resume at the first row that was bound to the named pattern \
-     variable; replace <var> with a variable named in define or pattern.'), \
-    ('to last <var>', TRUE, 'Resume at the last row that was bound to the named pattern \
-     variable; replace <var> with a variable named in define or pattern.') \
+    ('to first <var>', TRUE, 'Resume at the first row that was bound to the named label; replace \
+     <var> with a pattern variable, or with a union variable declared in subset.'), \
+    ('to last <var>', TRUE, 'Resume at the last row that was bound to the named label; replace \
+     <var> with a pattern variable, or with a union variable declared in subset.') \
     ) AS t(mode, needs_variable, resumes_at)";
 
 /// Object-level example for the `after_match_skip_modes` view. A JSON array of

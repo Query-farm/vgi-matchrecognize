@@ -6,62 +6,42 @@
 
 **SQL:2016 `MATCH_RECOGNIZE` row pattern matching for DuckDB.**
 
-DuckDB has **no native `MATCH_RECOGNIZE`**. Oracle, Trino, Snowflake, Redshift,
-BigQuery, and Flink all ship it; on DuckDB you otherwise hand-roll the pattern
-with fragile `LAG`/`LEAD` chains, gap-and-island window tricks, recursive CTEs,
-and correlated subqueries that are slow, unreadable, and wrong on ties and
-nulls. `vgi-matchrecognize` is a [VGI](https://query.farm) worker that brings the
-**standard row-pattern surface** to DuckDB as a single table-in / table-out
-function: buffer a relation, partition it, sort each partition, run a
-regular-expression-over-rows matcher, and emit either one summary row per match
-or every matched row.
+Oracle, Trino, Snowflake, Redshift, BigQuery and Flink all ship `MATCH_RECOGNIZE`.
+DuckDB does not — so finding "three failed logins then a success", or "a price dip
+followed by a recovery", means hand-rolling it out of `LAG`/`LEAD` chains,
+gap-and-island tricks, recursive CTEs and correlated subqueries: slow to run,
+miserable to read, and usually subtly wrong on ties and NULLs.
 
-Pure local compute: **no network, no secrets, nothing on disk.** The whole
-engine — pattern compiler, Pratt expression parser, bind-time type inference,
-and backtracking matcher — is hand-rolled in the Arrow-free `mr-core` crate.
+This is a [VGI](https://query.farm) worker that gives DuckDB the standard surface
+as one table-in / table-out function. It buffers a relation, partitions it, sorts
+each partition, runs a regular expression **over rows**, and emits either one
+summary row per match or every matched row.
 
-## Install & attach
+Local compute only: **no network, no secrets, no credentials.** The engine —
+pattern compiler, Pratt expression parser, bind-time type inference, backtracking
+matcher — is hand-rolled in the Arrow-free `mr-core` crate. (Input *is* spooled to
+a temporary file while it buffers; see [Operating notes](#operating-notes).)
+
+## Quick start
 
 ```sql
 INSTALL vgi FROM community;
 LOAD vgi;
 
--- The worker is a local binary; no secret needed (pure compute, no egress).
+-- The worker is a local binary. No secret needed: pure compute, no egress.
 ATTACH 'mr' AS mr (TYPE vgi, LOCATION '/path/to/vgi-matchrecognize-worker');
 ```
 
-## The function
-
-```text
-mr.match_recognize(
-    (<relation>),               -- positional: the input relation, buffered whole
-    partition_by := ['col', …], -- VARCHAR[]   (default [] = one global partition)
-    order_by     := ['col', …], -- VARCHAR[]   (required; 'col DESC' / 'NULLS FIRST' ok)
-    pattern      := '…',        -- the row pattern (regex over variables)
-    define       := '{…}',      -- JSON: { "VAR": "<boolean predicate>", … }
-    subset       := '{…}',      -- JSON: { "U": ["A","B"], … }  (SQL:2016 SUBSET)
-    measures     := '{…}',      -- JSON object/array of output expressions
-    rows         := 'one'|'all',-- ONE ROW PER MATCH (default) | ALL ROWS PER MATCH
-    empty_matches := 'show'|'omit', -- SHOW (default) / OMIT EMPTY MATCHES
-    after        := '…',        -- AFTER MATCH SKIP mode (default 'past last row')
-    step_budget  := 5000000     -- per-partition backtracking guard (optional;
-                                --   omit to scale it with the partition size)
-) -> TABLE
-```
-
-Plus `mr.explain_pattern(p) -> VARCHAR` (pretty-print a compiled pattern; no
-data access) and the `mr.main.after_match_skip_modes` reference view. The worker
-build version is published as the catalog's `implementation_version` (read it
-from `vgi_catalogs()`), not a scalar function.
-
-## Examples
-
-### V-shape stock dip — a falling run then a rising run
+Find each V-shaped dip — a falling run, then a rising run — per symbol. This runs
+as-is:
 
 ```sql
 SELECT *
 FROM mr.match_recognize(
-       (SELECT symbol, ts, price FROM ticks),
+       (SELECT * FROM (VALUES
+          ('ACME', 1, 10), ('ACME', 2,  8), ('ACME', 3,  6),
+          ('ACME', 4,  9), ('ACME', 5, 11), ('ACME', 6,  7)
+        ) AS t(symbol, ts, price)),
        partition_by := ['symbol'],
        order_by     := ['ts'],
        pattern      := 'START DOWN+ UP+',
@@ -70,20 +50,207 @@ FROM mr.match_recognize(
          "UP":   "price > PREV(price)"
        }',
        measures     := '{
-         "match_no":     "MATCH_NUMBER()",
-         "start_ts":     "FIRST(START.ts)",
-         "bottom_ts":    "LAST(DOWN.ts)",
-         "bottom_price": "LAST(DOWN.price)",
-         "end_ts":       "LAST(UP.ts)",
-         "drawdown":     "FIRST(START.price) - LAST(DOWN.price)"
-       }',
-       rows  := 'one',           -- ONE ROW PER MATCH (default)
-       after := 'past last row'  -- AFTER MATCH SKIP PAST LAST ROW (default)
-     );
--- one row per V per symbol
+         "match_no":  "MATCH_NUMBER()",
+         "start_ts":  "FIRST(START.ts)",
+         "bottom_ts": "LAST(DOWN.ts)",
+         "end_ts":    "LAST(UP.ts)",
+         "drawdown":  "FIRST(START.price) - LAST(DOWN.price)"
+       }');
 ```
 
-### Brute-force then breach — ≥3 failed logins immediately followed by a success
+```text
+┌─────────┬──────────┬──────────┬───────────┬────────┬──────────┐
+│ symbol  │ match_no │ start_ts │ bottom_ts │ end_ts │ drawdown │
+│ varchar │  int64   │  int64   │   int64   │ int64  │  int64   │
+├─────────┼──────────┼──────────┼───────────┼────────┼──────────┤
+│ ACME    │        1 │        1 │         3 │      5 │        4 │
+└─────────┴──────────┴──────────┴───────────┴────────┴──────────┘
+```
+
+`START` has no predicate, so it matches any row; `DOWN+` then takes the falling
+run and `UP+` the recovery. The dip at `ts = 6` starts no match because nothing
+rises after it.
+
+## The function
+
+Everything except the relation is a named, bind-time constant. Functions live in
+catalog `mr`, schema `main` — `mr.match_recognize(…)` and
+`mr.main.match_recognize(…)` both resolve.
+
+```text
+mr.match_recognize(
+    (<relation>),                -- positional: the input relation, buffered whole
+    partition_by  := ['col', …], -- VARCHAR[]  (default [] = one global partition)
+    order_by      := ['col', …], -- VARCHAR[]  (required; 'col DESC', 'col NULLS FIRST')
+    pattern       := '…',        -- the row pattern: a regex over variables
+    define        := '{…}',      -- JSON: { "VAR": "<boolean predicate>", … }
+    subset        := '{…}',      -- JSON: { "U": ["A","B"], … }   (SQL:2016 SUBSET)
+    measures      := '{…}',      -- JSON: { "out_col": "<expression>", … }
+    rows          := 'one'|'all',-- ONE (default) | ALL ROWS PER MATCH
+    empty_matches := 'show'|'omit', -- SHOW (default) | OMIT EMPTY MATCHES
+    after         := '…',        -- AFTER MATCH SKIP mode (default 'past last row')
+    step_budget   := 5000000     -- backtracking guard; omit to scale with partition size
+) -> TABLE
+```
+
+Also: `mr.explain_pattern(p) -> VARCHAR` pretty-prints a compiled pattern (handy
+for checking greediness, no data access), and `mr.main.after_match_skip_modes` is a
+browsable list of the `after` modes. The worker's build version is the catalog's
+`implementation_version` in `vgi_catalogs()`.
+
+## Patterns
+
+A regular expression over **pattern variables**, not characters:
+
+| Construct     | Syntax                            | Meaning |
+|---------------|-----------------------------------|---------|
+| Variable      | `A`, `DOWN`, `START`              | one row satisfying `define["A"]` (any row if undefined) |
+| Concatenation | `A B C`                           | A then B then C |
+| Alternation   | `A \| B`                          | A or B — the left branch is preferred |
+| Quantifiers   | `* + ? {n} {n,} {n,m} {,m} {,}`   | 0+, 1+, 0/1, exactly n, n+, n..m, 0..m, 0+ |
+| Reluctant     | `A+?`, `A*?`, `A{2,}?`            | match as few rows as possible |
+| Grouping      | `(A B)+`                          | quantify or alternate a sub-pattern |
+| Anchors       | `^A`, `A$`                        | partition start / end |
+
+Unquoted variable names are case-insensitive and canonicalize to upper case. A
+**double-quoted** name is case-sensitive, so `"b"` and `b` are different variables
+(the latter being `B`), and `CLASSIFIER()` reports the canonical spelling.
+
+## DEFINE and MEASURES
+
+Both clauses share one expression language. `define` decides whether a row can
+bind a variable; `measures` computes the output columns.
+
+| | you can write |
+|---|---|
+| Columns | `price`, `A.price`, `"My Col"` |
+| Navigation | `PREV`/`NEXT`/`FIRST`/`LAST(expr[, n])` |
+| Aggregates | `SUM` `COUNT` `AVG` `MIN` `MAX` `ARRAY_AGG` `ARBITRARY`, plus `COUNT(*)`, `COUNT()`, `COUNT(A.*)` |
+| Match info | `CLASSIFIER([label])`, `MATCH_NUMBER()` |
+| Horizon | `RUNNING` / `FINAL` |
+| Operators | arithmetic, comparison, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `BETWEEN`, `IN`, `\|\|`, `CAST`/`::` |
+| Scalars | `abs` `ceil` `floor` `round` `sqrt` `lower` `upper` `trim` `ltrim` `rtrim` `length` `coalesce` `nullif` `greatest` `least` |
+
+DEFINE predicates are always **RUNNING**: they see only the rows matched so far,
+which is what lets a predicate refer back to the match in progress.
+
+**A bare `A.price` means `LAST(A.price)`** under the prevailing RUNNING/FINAL
+horizon — the last row bound to `A`, or NULL if `A` has not bound one yet. So
+match-dependent predicates read the way you would write them:
+`"B": "price > A.price"` compares each candidate `B` against `A`'s row. Qualified
+physical navigation anchors on the variable too: `PREV(A.price, n)` steps back `n`
+rows from `A`'s last row (the standard's `PREV(LAST(A.price), n)`), while
+unqualified `PREV(price)` steps back from the current row.
+
+**`array_agg(expr)`** collects matched values in match order as a DuckDB list
+(`BIGINT[]`, `VARCHAR[]`, …). Over an empty match it is an empty list, not NULL —
+so a RUNNING `array_agg` grows row by row.
+
+**`subset := '{"U": ["A","B"]}'`** declares SQL:2016 union variables. `U` then
+stands for any of its members wherever a pattern variable may appear: `U.price`,
+`COUNT(U.*)`, `SUM(U.price)`, `CLASSIFIER(U)`, `after := 'to last U'`. A union
+variable may not have its own DEFINE predicate.
+
+### Anything else: compose around the call
+
+The expression language is a deliberate subset, and it does not need to be
+complete — DuckDB's full library is available on both sides of the call:
+
+```sql
+-- row-local scalar: compute it in the input subquery
+(SELECT *, lower(event) AS ev FROM t)   →  define := '{"A": "ev = ''view''"}'
+
+-- post-processing a measure: do it in the outer SELECT
+SELECT CAST(lower(cls) || '_label' AS VARCHAR(7))
+FROM mr.match_recognize(…, measures := '{"cls": "LAST(CLASSIFIER())"}')
+```
+
+What composition cannot reach: an **unsupported scalar inside a DEFINE predicate**
+(the predicate feeds back into matching, so it has to run in the matcher), an
+**unsupported aggregate over match state** (it depends on which rows are bound, so
+neither side of the call can see it), and **subqueries** in either clause — a
+standalone worker receives Arrow batches and has no catalog to resolve them
+against.
+
+## What comes out
+
+The output schema is fixed at bind time, before any data flows.
+
+- **`rows := 'one'`** — the `partition_by` columns, then one column per measure.
+- **`rows := 'all'`** — the `partition_by` columns, the `order_by` columns,
+  `match_number BIGINT` and `classifier VARCHAR` (automatic unless a measure of
+  that name shadows them), then one column per measure.
+
+> **Deviation from Trino/Oracle.** Under `ALL ROWS PER MATCH` they emit *every*
+> input column and no automatic `match_number`/`classifier`. Project any other
+> input column through a measure — `{"value": "value"}` — if you need it.
+
+Measure **types are inferred** from the input schema: `MATCH_NUMBER()` and
+`COUNT(…)` → `BIGINT`; `CLASSIFIER()` → `VARCHAR`;
+`FIRST`/`LAST`/`PREV`/`NEXT`/`MIN`/`MAX` → that column's type; `SUM` widens
+(integer → `HUGEINT`, float → `DOUBLE`); `AVG` → `DOUBLE`; `ARRAY_AGG` → a list of
+the argument's type; arithmetic → the widened numeric type; comparison and logic →
+`BOOLEAN`; `||` → `VARCHAR`. When inference cannot decide — a measure that resolves
+to an untyped `NULL`, say — use the array form and pin the type:
+
+```json
+[
+  { "as": "ratio", "expr": "SUM(A.qty) / SUM(B.qty)", "type": "DECIMAL(18,6)" },
+  { "as": "label", "expr": "CLASSIFIER()" }
+]
+```
+
+## Semantics worth knowing
+
+**`MATCH_NUMBER()` counts within a partition.** It restarts at 1 for every
+partition, as SQL:2016 specifies — it is not a global row number.
+
+**Empty matches are real matches.** A pattern that legitimately matches zero rows
+at some position — `B*` where the row cannot bind `B` — produces one output row
+positioned on the row it sits on, and consumes a match number. Its measures see a
+match with nothing bound: `CLASSIFIER()` and the navigation functions are NULL,
+`COUNT(*)` is 0, `array_agg` is empty. This surprises people, and it is what every
+conforming engine does. `empty_matches := 'omit'` drops those rows under
+`rows := 'all'`; `rows := 'one'` always reports them.
+
+**AFTER MATCH SKIP** decides where the next search begins:
+
+| `after`               | Next search resumes at        | notes |
+|-----------------------|-------------------------------|-------|
+| `'past last row'`     | the row after the match       | non-overlapping (default) |
+| `'to next row'`       | the row after the match start | overlapping matches |
+| `'to first <VAR>'`    | the first row bound to VAR    | VAR may be a union variable |
+| `'to last <VAR>'`     | the last row bound to VAR     | VAR may be a union variable |
+
+A no-progress safeguard advances the cursor by at least one row per iteration, so
+the scan always terminates regardless of the skip mode. `mr.main.after_match_skip_modes`
+lists the same thing from SQL.
+
+## Recipes
+
+### Sessionization — split a stream where the gap exceeds 30 minutes
+
+```sql
+SELECT user_id, session_no, session_start, session_end, n_events
+FROM mr.match_recognize(
+       (SELECT user_id, ts FROM clicks),
+       partition_by := ['user_id'],
+       order_by     := ['ts'],
+       pattern      := 'A B*',
+       define       := '{ "B": "ts <= PREV(ts) + INTERVAL 1800 SECOND" }',
+       measures     := '{
+         "session_no":    "MATCH_NUMBER()",
+         "session_start": "FIRST(ts)",
+         "session_end":   "LAST(ts)",
+         "n_events":      "COUNT(*)"
+       }');
+```
+
+`A` takes any row; `B*` extends the session for as long as each event is within
+30 minutes of the previous one. The next session starts at the first row that is
+not.
+
+### Brute force then breach — three or more failures, then a success
 
 ```sql
 SELECT *
@@ -97,240 +264,110 @@ FROM mr.match_recognize(
          "OK":   "outcome = ''success''"
        }',
        measures     := '{
-         "match_no":   "MATCH_NUMBER()",
          "var":        "CLASSIFIER()",
          "n_fails":    "FINAL COUNT(FAIL.*)",
          "first_fail": "FIRST(FAIL.ts)",
          "breach_ts":  "LAST(OK.ts)"
        }',
-       rows  := 'all',           -- ALL ROWS PER MATCH: each event, tagged by classifier
-       after := 'past last row'
-     );
+       rows := 'all');   -- every event in the burst, tagged by classifier
 ```
 
-### Sessionization — split a stream where the inter-event gap exceeds 30 minutes
+### Funnel — view → click → purchase, in order, per user
 
 ```sql
-SELECT user_id, session_no, session_start, session_end, n_events
+SELECT *
 FROM mr.match_recognize(
-       (SELECT user_id, ts, event FROM clicks),
+       (SELECT user_id, ts, event FROM events),
        partition_by := ['user_id'],
        order_by     := ['ts'],
-       pattern      := 'A B*',
-       define       := '{ "B": "ts <= PREV(ts) + INTERVAL 1800 SECOND" }',
-       measures     := '{
-         "session_no":    "MATCH_NUMBER()",
-         "session_start": "FIRST(ts)",
-         "session_end":   "LAST(ts)",
-         "n_events":      "COUNT(*)"
+       pattern      := 'V+ C+ P',
+       define       := '{
+         "V": "event = ''view''",
+         "C": "event = ''click''",
+         "P": "event = ''purchase''"
        }',
-       rows := 'one'
-     );
+       measures     := '{
+         "views":    "COUNT(V.*)",
+         "clicks":   "COUNT(C.*)",
+         "elapsed":  "LAST(P.ts) - FIRST(V.ts)",
+         "sequence": "array_agg(CLASSIFIER())"
+       }');
 ```
 
-## Pattern grammar
+## Operating notes
 
-A regular expression **over pattern variables** (not characters):
+### Buffering and memory
 
-| Construct        | Syntax                              | Meaning |
-|------------------|-------------------------------------|---------|
-| Variable         | `A`, `DOWN`, `START`                | one row satisfying `DEFINE[A]` (or always-true if undefined) |
-| Concatenation    | `A B C`                             | A then B then C |
-| Alternation      | `A \| B`                            | A or B (left preferred under greedy) |
-| Quantifiers      | `* + ? {n} {n,} {n,m} {,m}`         | 0+, 1+, 0/1, exactly n, n+, n..m, 0..m |
-| Reluctant        | `A+?`, `A*?`, `A{2,}?`              | match as few as possible |
-| Grouping         | `(A B)+`                            | quantify/alternate a sub-pattern |
-| Anchors          | `^A`, `A$`                          | partition start / end |
+Row pattern matching is intrinsically a whole-partition operation, so the function
+buffers its input before it matches anything. Batches are spooled to the worker's
+cross-process store as Arrow IPC — by default a SQLite file under `$TMPDIR`, not
+process memory.
 
-## DEFINE / MEASURES expression language
+- **Unused columns are free.** Only the columns the pattern reads — the partition
+  and order keys plus everything `define`/`measures` reference — are buffered; the
+  rest are projected away first. This matters more than it sounds: buffering
+  volume dominates runtime, and on 2M rows a single unused 200-byte column cost
+  1.02s → **2.83s** before this was added.
+- **Output streams** one partition at a time, coalesced into ~8k-row batches, so
+  the whole result set is never live at once.
+- **Input does not stream.** At finalize the buffered relation is read back into
+  memory, plus one `usize` per row for the partition tapes. Measured: 5M rows × 4
+  columns → about **0.6 GB** peak worker RSS producing 1.33M matches. Filter or
+  aggregate before the function on inputs far larger than RAM; per-partition
+  spilling is the next step.
 
-Column refs (`price`), variable-qualified refs (`A.price`), literals,
-`PREV`/`NEXT`/`FIRST`/`LAST(expr[,n])`, aggregates
-`SUM`/`COUNT`/`AVG`/`MIN`/`MAX`/`ARRAY_AGG`/`ARBITRARY` (incl. `COUNT(*)`,
-`COUNT()` and `COUNT(A.*)`), `CLASSIFIER([label])`, `MATCH_NUMBER()`,
-`RUNNING`/`FINAL`, arithmetic, comparison, `AND`/`OR`/`NOT`, `IS [NOT] NULL`,
-`BETWEEN`, `IN`, `||`, `CAST`/`::`, and the scalar functions `abs`, `ceil`,
-`floor`, `round`, `sqrt`, `lower`, `upper`, `trim`/`ltrim`/`rtrim`, `length`,
-`coalesce`, `nullif`, `greatest`, `least`. DEFINE predicates are always
-**RUNNING** (they see only rows matched so far).
+Matching cannot be made fully streaming: a match may span an entire partition, so
+the partition must be complete first, and DuckDB does not deliver input clustered
+by partition key.
 
-`array_agg(expr)` collects the matched values in match order as a DuckDB list
-(`BIGINT[]`, `VARCHAR[]`, …); over an empty match it is an empty list, not NULL.
+Leave `VGI_WORKER_SHARED_STORAGE` alone: the buffering and producing phases may run
+in *different worker processes*, so the store has to outlive a process, and the
+in-process `memory` backend is rejected at bind time for exactly that reason. Every
+batch carries an independent row count that is checked when the relation is read
+back, so a short read is an error rather than a quietly incomplete answer.
 
-**Anything else, compose around the call** rather than inside it — the host's full
-function library is available on both sides, so nothing is really out of reach:
-a row-local computation belongs in the input subquery
-(`(SELECT *, lower(event) AS ev FROM t)`), and post-processing a measure belongs
-in the outer `SELECT` (`SELECT lower(cls) FROM mr.main.match_recognize(…)`).
+### Not hanging, not crashing
 
-A **double-quoted label** is case-sensitive, so `"b"` is a different variable from
-the unquoted `b` (which canonicalizes to `B`), and `CLASSIFIER()` reports the
-canonical spelling.
+An ambiguous pattern can backtrack catastrophically, so the matcher runs on a
+**per-partition step budget** and returns a clean error rather than running forever.
+It never panics or aborts: property tests drive arbitrary patterns over arbitrary
+row tables, including partitions of 12,000–20,000 rows.
 
-`subset := '{"U": ["A","B"]}'` declares SQL:2016 **union variables**: `U` then
-stands for any of its members wherever a pattern variable may appear — `U.price`,
-`COUNT(U.*)`, `SUM(U.price)`, `CLASSIFIER(U)`, and `after := 'to last U'`. A union
-variable may not have its own DEFINE predicate.
+The budget **scales with the partition** (128 steps per row, floor 5,000,000),
+because a constant is the wrong shape — catastrophic backtracking is super-linear in
+partition size, so one number cannot both catch a bad pattern on a small partition
+and let an ordinary linear match finish on a large one. Pin it with
+`step_budget := <n>` for a hard ceiling.
 
-A bare `A.price` is the standard's shorthand for `LAST(A.price)` under the
-prevailing RUNNING/FINAL semantics — the last row bound to `A`, or NULL if `A`
-has not bound one yet. So match-dependent predicates work as written:
-`"B": "price > A.price"` compares each candidate `B` row against `A`'s row.
-Qualified physical navigation anchors on the variable too: `PREV(A.price, n)`
-steps back `n` rows from `A`'s last row (the standard's `PREV(LAST(A.price), n)`),
-while unqualified `PREV(price)` steps from the current row.
+Backtracking uses an explicit heap stack rather than host recursion, so one match
+may span millions of rows: an `A B*` sessionization whose partition is a single long
+session is bounded by the budget, not by the OS stack. Deeply nested
+`pattern`/`define`/`measures` input is refused past 128 levels for the same reason.
 
-## Output schema (fixed at bind time)
+## Conformance
 
-- **`rows := 'one'`** — the `partition_by` columns, then one column per measure.
-- **`rows := 'all'`** — the `partition_by` columns, the `order_by` columns,
-  `match_number BIGINT`, `classifier VARCHAR` (auto, unless a measure shadows
-  them), then one column per measure.
+**132 assertions ported from Trino's `MATCH_RECOGNIZE` test suite** run as part of
+the end-to-end suite (`test/sql/trino_conformance.test`). Of the 150 cases
+expressible on this surface, **none produces a wrong answer**: the remaining 18
+error cleanly on features we do not implement — subqueries in `DEFINE`/`MEASURES`,
+two-argument aggregates (`max_by`), a few scalar functions, and the `ALL ROWS`
+column layout above.
 
-> **Deviation from Trino/Oracle.** Under `ALL ROWS PER MATCH` they emit *every*
-> input column and no automatic `match_number`/`classifier`; we emit the
-> partition and order columns plus the two automatic ones. Project any other input
-> column through a measure (`{"value": "value"}`) if you need it.
+Still unimplemented: `PERMUTE`, pattern exclusion `{- … -}`, `WITH UNMATCHED ROWS`,
+and some exotic temporal/`INTERVAL` type-lattice corners (route those through the
+explicit `type` override).
 
-## Matches, empty matches, and match numbers
-
-`MATCH_NUMBER()` counts matches **within a partition** — it restarts at 1 for each
-partition, as SQL:2016 specifies.
-
-An **empty match** — a pattern that legitimately matches zero rows at a position,
-e.g. `B*` where the row cannot bind `B` — is a real match: it contributes one
-output row positioned on the row it sits on, and it consumes a match number.
-Every measure over it sees a match with nothing bound, so `CLASSIFIER()` and the
-navigation functions are NULL and `COUNT(*)` is 0. Pass
-`empty_matches := 'omit'` (only meaningful with `rows := 'all'`) to drop those
-rows, matching SQL:2016 `OMIT EMPTY MATCHES`; `rows := 'one'` always reports them.
-
-Measure **types are inferred** from the input Arrow schema at bind time:
-`MATCH_NUMBER()`/`COUNT(...)` → `BIGINT`, `CLASSIFIER()` → `VARCHAR`,
-`FIRST`/`LAST`/`PREV`/`NEXT`/`MIN`/`MAX`/aggregate-of-column → that column's
-type, `SUM` widens (integer → `HUGEINT`, float → `DOUBLE`), `AVG` → `DOUBLE`,
-arithmetic → the widened numeric type, comparison/logical → `BOOLEAN`, `||` →
-`VARCHAR`. When inference can't decide, supply the **array form** with an
-explicit override:
-
-```json
-[
-  { "as": "ratio", "expr": "SUM(A.qty) / SUM(B.qty)", "type": "DECIMAL(18,6)" },
-  { "as": "label", "expr": "CLASSIFIER()" }
-]
-```
-
-## AFTER MATCH SKIP
-
-| `after` value          | Next search resumes at | Notes |
-|------------------------|------------------------|-------|
-| `'past last row'`      | row after the match    | non-overlapping (default) |
-| `'to next row'`        | row after match start  | overlapping matches |
-| `'to first <VAR>'`     | first row bound to VAR | — |
-| `'to last <VAR>'`      | last row bound to VAR  | — |
-
-A no-progress safeguard forces the cursor forward by one row each iteration, so
-matching always terminates independently of the step budget.
-
-## Robustness
-
-The matcher backtracks with a **per-partition step budget**: on a pathological,
-ambiguous pattern it returns a clean error rather than hanging, and it never panics
-or aborts (enforced by property tests over arbitrary patterns × arbitrary row
-tables, including partitions of 12,000–20,000 rows).
-
-The budget **scales with the partition** by default (128 steps per row, floor
-5,000,000). A fixed constant is the wrong shape here: catastrophic backtracking is
-super-linear in the partition size, so a constant both lets a pathological pattern
-run a long time on a small partition and cuts off an ordinary linear match on a
-large one. Pass `step_budget := <n>` to pin it instead.
-
-Backtracking runs on an **explicit heap stack**, not host recursion, so a single
-match may span millions of rows — a `A B*` sessionization where one partition is
-one long session, or `A+` over a whole partition, is bounded by the step budget
-rather than by the OS stack. Deeply nested `pattern` / `define` / `measures` input
-is refused past 128 levels of nesting, again to keep a pathological string from
-exhausting the stack.
-
-## Memory & streaming
-
-Input is **buffered to disk, not held in RAM**: each incoming batch is written to
-the worker's cross-process store as Arrow IPC — a SQLite file under `$TMPDIR`,
-the SDK default.
-
-The buffering sink and the producing source may run in **different worker
-processes**, so the store has to outlive any one process. The durable backends
-(the default `sqlite`, or `fs`) both work; `VGI_WORKER_SHARED_STORAGE=memory` is
-rejected at bind time, because an in-process map is simply empty in the other
-process and the result would be silently empty.
-
-Reading the buffered log back is guarded two ways, because a short read here
-would mean a confidently wrong answer rather than an error:
-
-- The scan cursor starts at `i64::MIN`, not at `0`. `scan` returns entries with
-  `id > after_id`, and the storage contract says only that an id is *monotonic* —
-  not where it starts: SQLite's log is `INTEGER PRIMARY KEY AUTOINCREMENT` (first
-  id 1) while the filesystem store's is `max_id + 1` on an empty directory (first
-  id 0). Paging from `0` therefore skipped the first record on the 0-based
-  backend — measured with `VGI_WORKER_SHARED_STORAGE=fs` as 547 missing matches
-  out of 1,333,333, exactly one 2048-row batch. `crates/mr-worker/src/buffer.rs`
-  owns the cursor, and `tests/storage_probe.rs` round-trips the two durable local
-  backends (`sqlite`, `fs`) through it. Note `i64::MIN` is a floor, not a
-  guarantee: an id of exactly `i64::MIN` would still be excluded by `>`.
-- Each batch is written with an **independent row-count record**, and the two
-  totals are compared at finalize; a mismatch is an error naming the backend.
-
-**Unused columns cost nothing.** Only the columns the pattern actually reads —
-the partition and order keys plus everything referenced by `define`/`measures` —
-are buffered; the rest are projected away before they reach the store. Buffering
-volume dominates runtime, so this matters: on 2M rows a single unused 200-byte
-column took a query from 1.02s to **2.83s** before projection pushdown, and 1.02s
-after.
-
-At finalize the buffered relation is read back and matched. Two properties keep
-the footprint down:
-
-- The batches are **not concatenated** — `BatchRowStore` addresses them as one
-  contiguous row space, so there is no second full copy of the input.
-- Output is **streamed one partition at a time**, coalesced into ~8k-row batches,
-  so only the current batch's rows are materialized rather than the whole result.
-
-What still scales with input size is the relation itself (read back into memory at
-finalize) plus one `usize` per row for the partition tapes. Measured: 5M rows × 4
-columns → **552 MB** peak worker RSS producing 1.33M matches. Matching cannot be
-made fully streaming — a match may span an entire partition, so a partition has to
-be complete before it can be matched, and DuckDB does not deliver input clustered
-by partition key. Per-partition spilling is the next step for inputs larger than
-RAM; until then, block or filter before the function on very large inputs.
-
-## Scope
-
-**v1 (this release):** one `match_recognize` table function +
-`explain_pattern`; the pattern grammar, expression language, inference, `rows`,
-and AFTER MATCH SKIP above.
-
-**Deferred to v1.1:** `PERMUTE`, `SUBSET`, pattern exclusion `{- … -}`, `WITH
-UNMATCHED ROWS` / `SHOW EMPTY MATCHES`, and exotic temporal/`INTERVAL`
-type-lattice corners (route those through the explicit `type` override).
+[`test/trino/README.md`](test/trino/README.md) has the full tally, the bugs the
+port found, and how to regenerate it.
 
 ## Build & test
 
 ```sh
-cargo test --workspace          # mr-core unit + proptest, mr-worker integration
-cargo build --release           # build the worker binary
-./run_tests.sh                  # haybarn SQLLogic end-to-end suite
-./test/trino/port.sh            # re-port Trino's row-pattern suite (needs a Trino checkout)
+cargo test --workspace     # mr-core unit + property tests, mr-worker integration
+cargo build --release      # the worker binary
+./run_tests.sh             # haybarn SQLLogic end-to-end suite
+./test/trino/port.sh       # re-port Trino's suite (needs a Trino checkout)
 ```
-
-## Conformance
-
-103 assertions ported from Trino's `MATCH_RECOGNIZE` test suite run as part of the
-end-to-end suite (`test/sql/trino_conformance.test`); of the 135 cases expressible
-on this surface, **none produce a wrong answer** — the remainder error cleanly on
-features we do not implement (arbitrary scalar/aggregate functions, subqueries in
-`DEFINE`/`MEASURES`, `SUBSET`, `PERMUTE`, `{- … -}`). See
-[`test/trino/README.md`](test/trino/README.md) for the full tally, the bugs the
-port found, and how to regenerate it.
 
 ## License
 
