@@ -1,0 +1,90 @@
+# name: test/sql/streaming.test
+# description: The per-partition streaming producer — empty results, batch coalescing, match numbering.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# An empty input relation streams zero batches, not one empty one.
+query I
+SELECT count(*) FROM mr.main.match_recognize(
+       (SELECT 1 AS uid, 1 AS ts WHERE false),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A+',
+       define       := '{"A":"ts >= 0"}',
+       measures     := '{"n":"COUNT(*)"}');
+----
+0
+
+# Rows present but no match: also an empty result.
+query I
+SELECT count(*) FROM mr.main.match_recognize(
+       (SELECT 1 AS uid, i AS ts FROM range(100) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A+',
+       define       := '{"A":"ts < 0"}',
+       measures     := '{"n":"COUNT(*)"}');
+----
+0
+
+# Many empty partitions before a matching one: the producer must keep scanning
+# rather than stopping at the first partition that yields nothing.
+query III
+SELECT count(*), min(uid), max(uid) FROM mr.main.match_recognize(
+       (SELECT i AS uid, 1 AS ts FROM range(1000) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A',
+       define       := '{"A":"uid = 999"}',
+       measures     := '{"n":"COUNT(*)"}');
+----
+1	999	999
+
+# MATCH_NUMBER runs continuously across partition boundaries.
+query II
+SELECT uid, mn FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,1),(1,2),(2,1),(2,2),(3,1)) AS t(uid, ts)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A',
+       define       := '{"A":"ts >= 0"}',
+       measures     := '{"mn":"MATCH_NUMBER()"}')
+ORDER BY uid, mn;
+----
+1	1
+1	2
+2	3
+2	4
+3	5
+
+# Many partitions crossing the batch-coalescing threshold: every match survives
+# and the count is exact (100k partitions of 3 rows -> 100k matches).
+query II
+SELECT count(*), sum(n) FROM mr.main.match_recognize(
+       (SELECT (i//3)::BIGINT AS uid, i AS ts FROM range(300000) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A+',
+       define       := '{"A":"ts >= 0"}',
+       measures     := '{"n":"COUNT(*)"}');
+----
+100000	300000
+
+# A single partition far larger than the batch target under ALL ROWS PER MATCH:
+# one match's rows may overshoot a batch and must not be split or duplicated.
+query III
+SELECT count(*), min(rn), max(rn) FROM mr.main.match_recognize(
+       (SELECT 1 AS uid, i AS ts FROM range(50000) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A+',
+       define       := '{"A":"ts >= 0"}',
+       measures     := '{"rn":"RUNNING COUNT(*)"}',
+       rows         := 'all',
+       step_budget  := 50000000);
+----
+50000	1	50000

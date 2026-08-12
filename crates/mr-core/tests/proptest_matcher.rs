@@ -59,7 +59,7 @@ proptest! {
             order_by: vec!["x".into()],
             rows_all: false,
             after: "past last row".into(),
-            step_budget: 200_000,
+            step_budget: Some(200_000),
         };
         let n = data.len();
         let store = VecRowStore::new(
@@ -79,6 +79,56 @@ proptest! {
                         if let Value::Int(m) = r[0] {
                             prop_assert!(m > prev, "match numbers must strictly increase");
                             prev = m;
+                        }
+                    }
+                }
+                Err(_) => { /* clean error (e.g. step budget) is acceptable */ }
+            }
+        }
+    }
+}
+
+proptest! {
+    // Fewer cases, far more rows: the generator above tops out at 12 rows, which
+    // is why it never caught the stack overflow that long matches used to cause.
+    // These partitions are past the old ~6k-row cliff, so an arbitrary pattern
+    // over them must still either answer or fail cleanly — never abort.
+    #![proptest_config(ProptestConfig { cases: 16, max_shrink_iters: 10, ..ProptestConfig::default() })]
+
+    #[test]
+    fn matcher_survives_large_partitions(
+        pat in pattern_strategy(),
+        // One dominant value across the whole partition, so an unbounded
+        // quantifier really does bind every row in a *single* match. Mixed data
+        // would sort into three short runs and never reach the interesting depth.
+        (dominant, len) in (0i64..3, 12_000usize..20_000),
+    ) {
+        let data: Vec<i64> = std::iter::repeat_n(dominant, len).collect();
+        let cfg = PlanConfig {
+            pattern: pat,
+            define_json: r#"{"A":"x = 0","B":"x = 1","C":"x = 2"}"#.into(),
+            measures_json: Some(r#"{"mn":"MATCH_NUMBER()","n":"COUNT(*)"}"#.into()),
+            partition_by: vec![],
+            order_by: vec!["x".into()],
+            rows_all: false,
+            after: "past last row".into(),
+            step_budget: Some(2_000_000),
+        };
+        let n = data.len();
+        let store = VecRowStore::new(
+            vec![("x", Ty::Int64)],
+            data.into_iter().map(|v| vec![Value::Int(v)]).collect(),
+        );
+        if let Ok(plan) = Plan::build(&cfg, &Sch) {
+            match plan.run(&store) {
+                Ok(rows) => {
+                    prop_assert!(rows.len() <= n);
+                    // Each match reports at least one bound row (empty matches are
+                    // omitted), and no match can exceed the partition.
+                    for r in &rows {
+                        if let Value::Int(cnt) = r[1] {
+                            prop_assert!(cnt >= 1 && cnt <= n as i64,
+                                "match row count {cnt} out of range for {n} rows");
                         }
                     }
                 }

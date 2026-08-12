@@ -63,7 +63,7 @@ fn cfg(
         order_by: vec![order.into()],
         rows_all,
         after: "past last row".into(),
-        step_budget: 1_000_000,
+        step_budget: Some(1_000_000),
     }
 }
 
@@ -240,7 +240,7 @@ fn one_vs_all_rows_schema() {
         order_by: vec!["ts".into()],
         rows_all,
         after: "past last row".into(),
-        step_budget: 1_000_000,
+        step_budget: Some(1_000_000),
     };
     // ONE ROW: [sym, n] one row.
     let one = case.run(mk(false), &["A", "B"]).unwrap();
@@ -317,7 +317,7 @@ fn step_budget_aborts_cleanly() {
         rows: (0..n).map(|k| vec![i(k), i(1)]).collect(),
     };
     let mut c = cfg("(A+)+ B", r#"{"A":"x = 1","B":"x = 0"}"#, None, "ts", false);
-    c.step_budget = 50_000;
+    c.step_budget = Some(50_000);
     let err = case.run(c, &["A", "B"]).unwrap_err();
     assert!(matches!(err, MrError::StepBudget(_)), "got {err:?}");
 }

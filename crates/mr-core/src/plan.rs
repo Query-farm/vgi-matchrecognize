@@ -17,6 +17,30 @@ use crate::pattern::parser::{parse as parse_pattern, Pattern};
 use crate::types::{infer, BindSchema, Ty};
 use crate::value::Value;
 
+/// Floor for the automatic step budget — enough to catch catastrophic
+/// backtracking on a small partition, where a per-row allowance would be tiny.
+const MIN_AUTO_STEP_BUDGET: i64 = 5_000_000;
+
+/// Steps allowed per row in the automatic budget. A linear scan costs a handful
+/// of steps per row (one per VM instruction touched: roughly `Split`/`Char`/`Jmp`
+/// for a simple quantifier), so this leaves ample headroom for elaborate patterns
+/// while still being blown through quickly by anything super-linear.
+const AUTO_STEPS_PER_ROW: i64 = 128;
+
+/// The default per-partition step budget for a partition of `rows` rows.
+///
+/// The budget exists to stop *catastrophic backtracking*, which is super-linear in
+/// the partition size — so a fixed constant is the wrong shape: it lets a
+/// pathological pattern run a long time on a small partition while cutting off a
+/// perfectly ordinary linear scan of a large one. Scaling per row keeps legitimate
+/// long matches (a sessionization whose partition is one long session) working at
+/// any size, and still trips on quadratic-or-worse behaviour.
+pub fn auto_step_budget(rows: usize) -> i64 {
+    (rows as i64)
+        .saturating_mul(AUTO_STEPS_PER_ROW)
+        .max(MIN_AUTO_STEP_BUDGET)
+}
+
 /// Raw, string-form arguments to `match_recognize` (as they arrive from SQL).
 #[derive(Debug, Clone)]
 pub struct PlanConfig {
@@ -30,7 +54,9 @@ pub struct PlanConfig {
     pub rows_all: bool,
     /// Raw AFTER MATCH SKIP string (`"past last row"`, `"to first A"`, …).
     pub after: String,
-    pub step_budget: i64,
+    /// Per-partition matcher step budget. `None` scales it with the partition's
+    /// row count (see [`auto_step_budget`]); `Some(n)` pins it to `n`.
+    pub step_budget: Option<i64>,
 }
 
 /// One sort key.
@@ -65,7 +91,7 @@ pub struct Plan {
     order_by: Vec<OrderKey>,
     rows_all: bool,
     after: AfterSkip,
-    step_budget: i64,
+    step_budget: Option<i64>,
     /// Auto `match_number` column emitted (ALL ROWS, not shadowed by a measure).
     auto_match_number: bool,
     /// Auto `classifier` column emitted (ALL ROWS, not shadowed by a measure).
@@ -110,7 +136,7 @@ impl Plan {
         // AFTER MATCH SKIP.
         let after = parse_after(&cfg.after, &vars)?;
 
-        if cfg.step_budget <= 0 {
+        if cfg.step_budget.is_some_and(|b| b <= 0) {
             return Err(MrError::Bind("step_budget must be positive".into()));
         }
 
@@ -181,40 +207,68 @@ impl Plan {
 
     /// Produce-time: group into partitions, sort each, match, and emit output
     /// rows in `output_columns` order.
+    ///
+    /// This materializes every output row at once. Callers that stream (the
+    /// worker) should use [`Plan::partition_tapes`] + [`Plan::run_partition`]
+    /// instead, so only one partition's rows are live at a time.
     pub fn run(&self, store: &dyn RowStore) -> Result<Vec<Vec<Value>>> {
         let mut out = Vec::new();
         let mut match_number = 1i64;
-        let partitions = self.partitions(store)?;
-        for (label, mut tape) in partitions {
-            self.sort_tape(store, &mut tape)?;
-            let mut matcher = Matcher::new(
-                &self.program,
-                store,
-                &tape,
-                &self.define,
-                &self.after,
-                self.step_budget,
-                label,
-                match_number,
-            );
-            let matches = matcher.find_all()?;
-            match_number = matcher.next_match_number();
-            for m in &matches {
-                // Empty matches (zero bound rows) emit no output, per the spec's
-                // "omit empty matches" behavior — for both ONE ROW and ALL ROWS.
-                if m.binds.is_empty() {
-                    continue;
-                }
-                if self.rows_all {
-                    for k in 0..m.binds.len() {
-                        out.push(self.emit_all_row(store, &tape, m, k)?);
-                    }
-                } else {
-                    out.push(self.emit_one_row(store, &tape, m)?);
-                }
-            }
+        for (label, mut tape) in self.partition_tapes(store)? {
+            match_number = self.run_partition(store, &label, &mut tape, match_number, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// The partitions of `store` as `(label, tape)` pairs, in output order. The
+    /// tapes are unsorted; [`Plan::run_partition`] sorts the one it is given.
+    ///
+    /// Splitting this out lets a caller process one partition at a time: the
+    /// tapes are just row indices (8 bytes/row), so holding them all costs far
+    /// less than holding every output row.
+    pub fn partition_tapes(&self, store: &dyn RowStore) -> Result<Vec<(String, Vec<usize>)>> {
+        self.partitions(store)
+    }
+
+    /// Sort, match, and emit one partition, appending its rows to `out`. Returns
+    /// the match number the next partition should start from, so that streaming
+    /// partition-by-partition numbers matches exactly as [`Plan::run`] does.
+    pub fn run_partition(
+        &self,
+        store: &dyn RowStore,
+        label: &str,
+        tape: &mut [usize],
+        first_match_number: i64,
+        out: &mut Vec<Vec<Value>>,
+    ) -> Result<i64> {
+        self.sort_tape(store, tape)?;
+        let mut matcher = Matcher::new(
+            &self.program,
+            store,
+            tape,
+            &self.define,
+            &self.after,
+            self.step_budget
+                .unwrap_or_else(|| auto_step_budget(tape.len())),
+            label,
+            first_match_number,
+        );
+        let matches = matcher.find_all()?;
+        for m in &matches {
+            // Empty matches (zero bound rows) emit no output, per the spec's
+            // "omit empty matches" behavior — for both ONE ROW and ALL ROWS.
+            if m.binds.is_empty() {
+                continue;
+            }
+            if self.rows_all {
+                for k in 0..m.binds.len() {
+                    out.push(self.emit_all_row(store, tape, m, k)?);
+                }
+            } else {
+                out.push(self.emit_one_row(store, tape, m)?);
+            }
+        }
+        Ok(matcher.next_match_number())
     }
 
     fn emit_one_row(

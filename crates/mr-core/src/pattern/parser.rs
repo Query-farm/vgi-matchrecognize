@@ -83,12 +83,30 @@ impl Pattern {
     }
 }
 
+/// Maximum grouping depth. The parser descends recursively through
+/// `alternation -> concat -> factor -> primary -> '(' alternation ')'`, so deeply
+/// nested input would otherwise exhaust the native stack and abort the process.
+/// Real patterns nest a handful of levels; this reports a clean error instead.
+const MAX_DEPTH: u32 = 128;
+
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    depth: u32,
 }
 
 impl Parser {
+    /// Enter one grouping level, refusing input deep enough to blow the stack.
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(MrError::Pattern(format!(
+                "pattern nests deeper than the {MAX_DEPTH}-level limit"
+            )));
+        }
+        Ok(())
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
@@ -113,11 +131,14 @@ impl Parser {
 
     /// alternation := concat ('|' concat)*
     fn alternation(&mut self) -> Result<Pattern> {
+        self.enter()?;
         let mut branches = vec![self.concat()?];
         while matches!(self.peek(), Some(Tok::Pipe)) {
             self.next();
             branches.push(self.concat()?);
         }
+        // Only decremented on success; an error aborts the whole parse.
+        self.depth -= 1;
         if branches.len() == 1 {
             Ok(branches.pop().unwrap())
         } else {
@@ -281,7 +302,11 @@ pub fn parse(src: &str) -> Result<Pattern> {
     if toks.is_empty() {
         return Err(MrError::Pattern("pattern is empty".into()));
     }
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     let pat = p.alternation()?;
     if p.pos != p.toks.len() {
         return Err(MrError::Pattern(format!(

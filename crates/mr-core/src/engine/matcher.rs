@@ -1,6 +1,10 @@
 //! The backtracking matcher: executes a compiled [`Program`] over a partition
 //! tape, evaluating DEFINE predicates at each tentative assignment, with a step
 //! budget (no hang) and AFTER MATCH SKIP advancement (guaranteed termination).
+//!
+//! Backtracking uses an explicit heap stack of pending alternatives, not host
+//! recursion, so match length is bounded by the step budget rather than by the OS
+//! stack: a single match may span millions of rows.
 
 use std::collections::HashMap;
 
@@ -35,9 +39,19 @@ pub struct Match {
     pub binds: Vec<Bind>,
 }
 
-/// Recursion-depth cap, a backstop against stack overflow on deep grouping;
-/// the step budget is the primary guard.
-const DEPTH_CAP: usize = 100_000;
+/// One pending alternative on the explicit backtrack stack: resume execution at
+/// `ip` and tape position `pos`, with `binds` truncated back to `binds_len`.
+///
+/// Truncation is a sound restore because `binds` is append-only along any single
+/// path — `Char` pushes (and pops only its own entry on immediate failure) while
+/// the control instructions never touch it — so the prefix `[0, binds_len)` is
+/// exactly the binding state that was live when the alternative was recorded.
+#[derive(Debug, Clone, Copy)]
+struct Alt {
+    ip: usize,
+    pos: usize,
+    binds_len: usize,
+}
 
 /// Per-partition matcher state.
 pub struct Matcher<'a> {
@@ -90,7 +104,7 @@ impl<'a> Matcher<'a> {
         let mut i = 0usize;
         while i < self.tape.len() {
             let mut binds: Vec<Bind> = Vec::new();
-            let res = self.run(0, i, &mut binds, 0)?;
+            let res = self.run(i, &mut binds)?;
             match res {
                 // Empty matches (zero bound rows) are not recorded or numbered
                 // (the spec omits them); the cursor still advances by one row so
@@ -135,68 +149,98 @@ impl<'a> Matcher<'a> {
         Ok(pos)
     }
 
-    /// The backtracking VM executor. Returns the end tape position on accept.
-    /// Leaves `binds` unchanged when it returns `Ok(None)`.
-    fn run(
-        &mut self,
-        ip: usize,
-        pos: usize,
-        binds: &mut Vec<Bind>,
-        depth: usize,
-    ) -> Result<Option<usize>> {
-        self.budget -= 1;
-        if self.budget <= 0 {
-            return Err(MrError::StepBudget(format!(
-                "step budget exhausted in partition {} (pattern may be ambiguous; raise \
-                 step_budget or rewrite the pattern)",
-                self.partition_label
-            )));
-        }
-        if depth > DEPTH_CAP {
-            return Err(MrError::StepBudget(format!(
-                "recursion depth cap reached in partition {} (pattern too deeply nested)",
-                self.partition_label
-            )));
-        }
-        match self.prog[ip].clone() {
-            Inst::Match => Ok(Some(pos)),
-            Inst::Jmp(t) => self.run(t, pos, binds, depth + 1),
-            Inst::Split(a, b) => {
-                if let Some(e) = self.run(a, pos, binds, depth + 1)? {
-                    return Ok(Some(e));
-                }
-                self.run(b, pos, binds, depth + 1)
+    /// The backtracking VM executor: a depth-first search driven by an explicit
+    /// **heap** backtrack stack. Returns the end tape position on accept, leaving
+    /// `binds` holding the accepted match; on failure returns `Ok(None)` with
+    /// `binds` restored to its entry state.
+    ///
+    /// The pending alternatives live on the heap rather than the call stack, so a
+    /// single match may span millions of rows — match length is bounded only by
+    /// the step budget, never by the OS stack.
+    fn run(&mut self, start_pos: usize, binds: &mut Vec<Bind>) -> Result<Option<usize>> {
+        // A copy of the shared program reference, so indexing it does not borrow
+        // `self` and the loop body can still call `&mut self` / `&self` methods.
+        let prog = self.prog;
+        let base = binds.len();
+        let mut stack: Vec<Alt> = Vec::new();
+        let mut ip = 0usize;
+        let mut pos = start_pos;
+        loop {
+            self.budget -= 1;
+            if self.budget <= 0 {
+                return Err(MrError::StepBudget(format!(
+                    "step budget exhausted in partition {} (pattern may be ambiguous; raise \
+                     step_budget or rewrite the pattern)",
+                    self.partition_label
+                )));
             }
-            Inst::AnchorStart => {
-                if pos == 0 {
-                    self.run(ip + 1, pos, binds, depth + 1)
-                } else {
-                    Ok(None)
+            // `false` = this instruction failed; fall through to backtracking.
+            let advanced = match &prog[ip] {
+                Inst::Match => return Ok(Some(pos)),
+                Inst::Jmp(t) => {
+                    ip = *t;
+                    true
                 }
-            }
-            Inst::AnchorEnd => {
-                if pos == self.tape.len() {
-                    self.run(ip + 1, pos, binds, depth + 1)
-                } else {
-                    Ok(None)
+                Inst::Split(a, b) => {
+                    // Take the first target now and keep the second for later.
+                    // Popping LIFO reproduces exactly the preference order of the
+                    // former recursive executor, so greedy vs reluctant semantics
+                    // (which differ only in `Split` branch order) are unchanged.
+                    stack.push(Alt {
+                        ip: *b,
+                        pos,
+                        binds_len: binds.len(),
+                    });
+                    ip = *a;
+                    true
                 }
-            }
-            Inst::Char(var) => {
-                if pos >= self.tape.len() {
-                    return Ok(None);
-                }
-                binds.push(Bind {
-                    tape_pos: pos,
-                    var: var.clone(),
-                });
-                let holds = self.predicate_holds(&var, binds)?;
-                if holds {
-                    if let Some(e) = self.run(ip + 1, pos + 1, binds, depth + 1)? {
-                        return Ok(Some(e));
+                Inst::AnchorStart => {
+                    if pos == 0 {
+                        ip += 1;
+                        true
+                    } else {
+                        false
                     }
                 }
-                binds.pop();
-                Ok(None)
+                Inst::AnchorEnd => {
+                    if pos == self.tape.len() {
+                        ip += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Inst::Char(var) => {
+                    if pos >= self.tape.len() {
+                        false
+                    } else {
+                        binds.push(Bind {
+                            tape_pos: pos,
+                            var: var.clone(),
+                        });
+                        if self.predicate_holds(var, binds)? {
+                            ip += 1;
+                            pos += 1;
+                            true
+                        } else {
+                            binds.pop();
+                            false
+                        }
+                    }
+                }
+            };
+            if !advanced {
+                match stack.pop() {
+                    Some(alt) => {
+                        ip = alt.ip;
+                        pos = alt.pos;
+                        binds.truncate(alt.binds_len);
+                    }
+                    None => {
+                        binds.truncate(base);
+                        return Ok(None);
+                    }
+                }
             }
         }
     }

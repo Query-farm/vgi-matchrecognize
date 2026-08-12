@@ -43,7 +43,7 @@ fn build_plan(batch: &RecordBatch, measures: &str, rows_all: bool) -> Plan {
         order_by: vec!["ts".into()],
         rows_all,
         after: "past last row".into(),
-        step_budget: 1_000_000,
+        step_budget: Some(1_000_000),
     };
     let pat = mr_core::pattern::parse(&cfg.pattern).unwrap();
     let bs = ArrowBindSchema::new(batch.schema(), pat.variables());
@@ -75,7 +75,7 @@ fn arrow_round_trip_one_row() {
     );
     assert_eq!(out_schema.field(3).data_type(), &DataType::Int64);
 
-    let store = BatchRowStore::new(batch);
+    let store = BatchRowStore::single(batch);
     let rows = plan.run(&store).unwrap();
     let out = build_batch(out_schema, plan.output_columns(), &rows).unwrap();
 
@@ -110,7 +110,7 @@ fn arrow_all_rows_has_auto_columns() {
         vec!["symbol", "ts", "match_number", "classifier", "n"]
     );
 
-    let store = BatchRowStore::new(batch);
+    let store = BatchRowStore::single(batch);
     let rows = plan.run(&store).unwrap();
     let fields: Vec<Field> = cols.iter().map(|c| output_field(&c.name, c.ty)).collect();
     let out = build_batch(Arc::new(Schema::new(fields)), cols, &rows).unwrap();

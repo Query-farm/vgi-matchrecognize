@@ -3,18 +3,20 @@
 //! pattern matching over a buffered relation.
 //!
 //! A `TableBufferingFunction` (Sink + Source): every input batch is buffered
-//! into cross-process storage (`process`); once the whole relation is present,
-//! `finalize_producer` concatenates it, builds the mr-core [`Plan`], runs the
-//! matcher per partition, and emits the result rows on the bind-time output
-//! schema. Pattern matching is intrinsically a whole-partition operation, so
-//! buffer-all-then-compute is required (the `vgi-match` idiom).
+//! into cross-process storage (`process`) — on disk, as Arrow IPC, under the
+//! default SQLite backend; once the whole relation is present,
+//! `finalize_producer` reads it back, builds the mr-core [`Plan`], and returns a
+//! producer that runs the matcher **one partition at a time**, emitting a batch
+//! per partition on the bind-time output schema. Pattern matching is intrinsically
+//! a whole-partition operation, so buffer-all-then-compute is required (the
+//! `vgi-match` idiom) — but the partition is the natural streaming unit, so the
+//! whole result set never has to be live at once.
 
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{Schema, SchemaRef};
-use arrow_select::concat::concat_batches;
 use mr_core::plan::{Plan, PlanConfig};
 use vgi::arguments::Arguments;
 use vgi::buffering::{BufferingParams, TableBufferingFunction};
@@ -28,7 +30,6 @@ use crate::arrow_out::build_batch;
 use crate::schema::{output_field, ArrowBindSchema};
 
 const NS: &[u8] = b"match_recognize";
-const DEFAULT_STEP_BUDGET: i64 = 5_000_000;
 
 pub struct MatchRecognize;
 
@@ -88,7 +89,8 @@ fn plan_config(args: &Arguments) -> Result<PlanConfig> {
     let after = args
         .named_str("after")
         .unwrap_or_else(|| "past last row".to_string());
-    let step_budget = args.named_i64("step_budget").unwrap_or(DEFAULT_STEP_BUDGET);
+    // Absent -> None, i.e. scale the budget with each partition's row count.
+    let step_budget = args.named_i64("step_budget");
     Ok(PlanConfig {
         pattern,
         define_json,
@@ -212,8 +214,9 @@ impl TableBufferingFunction for MatchRecognize {
                 -1,
                 "int64",
                 "Maximum matcher steps per partition before a clean catastrophic-backtracking \
-                 error is raised (default 5000000). The matcher never hangs; raise this for very \
-                 large or ambiguous patterns.",
+                 error is raised. Omit it to scale the budget with each partition's row count, \
+                 which keeps ordinary long matches working at any size; pass a number to pin it \
+                 instead. The matcher never hangs.",
             ),
         ]
     }
@@ -268,27 +271,66 @@ impl TableBufferingFunction for MatchRecognize {
             }
         }
 
-        let combined = if batches.is_empty() {
-            RecordBatch::new_empty(input_schema.clone())
-        } else {
-            concat_batches(&input_schema, &batches)
-                .map_err(|e| RpcError::runtime_error(e.to_string()))?
-        };
-
-        let store = BatchRowStore::new(combined);
-        let rows = plan.run(&store).map_err(ve)?;
-        let out = build_batch(params.output_schema.clone(), plan.output_columns(), &rows)?;
-        Ok(Box::new(OneShot { batch: Some(out) }))
+        // The batches are kept as they arrived rather than concatenated: the
+        // engine reads cells by row index, so a merged copy would only double
+        // peak memory.
+        let store = BatchRowStore::new(input_schema, batches);
+        let tapes = plan.partition_tapes(&store).map_err(ve)?;
+        Ok(Box::new(PartitionStream {
+            plan,
+            store,
+            tapes: tapes.into_iter(),
+            output_schema: params.output_schema.clone(),
+            match_number: 1,
+        }))
     }
 }
 
-/// Emits a single precomputed batch, then EOF.
-struct OneShot {
-    batch: Option<RecordBatch>,
+/// Rows to accumulate before emitting an output batch. Matching is per-partition,
+/// so the partition is the unit of work — but partitions are often tiny (one per
+/// user, say), and emitting a batch each would pay IPC framing per handful of
+/// rows. Coalescing to a target keeps batches a sensible size while still bounding
+/// how many output rows are live at once.
+const TARGET_BATCH_ROWS: usize = 8192;
+
+/// Streams the result, running the matcher one partition at a time and emitting
+/// batches of roughly [`TARGET_BATCH_ROWS`] rows.
+///
+/// Only the rows of the partitions accumulated so far are ever materialized, not
+/// the whole result set. Partitions are visited in `partition_tapes` order, so
+/// MATCH_NUMBER runs continuously exactly as the all-at-once path numbers them.
+struct PartitionStream {
+    plan: Plan,
+    store: BatchRowStore,
+    tapes: std::vec::IntoIter<(String, Vec<usize>)>,
+    output_schema: SchemaRef,
+    match_number: i64,
 }
 
-impl TableProducer for OneShot {
+impl TableProducer for PartitionStream {
     fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
-        Ok(self.batch.take())
+        let mut rows: Vec<Vec<mr_core::value::Value>> = Vec::new();
+        // Consume partitions until the batch is full enough (a single partition may
+        // overshoot the target — matches are never split across batches) or the
+        // input is drained. Partitions yielding no matches simply add nothing.
+        for (label, mut tape) in self.tapes.by_ref() {
+            self.match_number = self
+                .plan
+                .run_partition(&self.store, &label, &mut tape, self.match_number, &mut rows)
+                .map_err(ve)?;
+            if rows.len() >= TARGET_BATCH_ROWS {
+                break;
+            }
+        }
+        if rows.is_empty() {
+            // Every remaining partition matched nothing: end of stream.
+            return Ok(None);
+        }
+        build_batch(
+            self.output_schema.clone(),
+            self.plan.output_columns(),
+            &rows,
+        )
+        .map(Some)
     }
 }

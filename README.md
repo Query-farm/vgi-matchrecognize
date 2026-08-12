@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/vgi-logo.png" alt="Vector Gateway Interface" width="360">
+</p>
+
 # vgi-matchrecognize
 
 **SQL:2016 `MATCH_RECOGNIZE` row pattern matching for DuckDB.**
@@ -23,7 +27,7 @@ INSTALL vgi FROM community;
 LOAD vgi;
 
 -- The worker is a local binary; no secret needed (pure compute, no egress).
-ATTACH 'mr' AS mr (TYPE vgi, COMMAND 'vgi-matchrecognize-worker');
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '/path/to/vgi-matchrecognize-worker');
 ```
 
 ## The function
@@ -38,7 +42,8 @@ mr.match_recognize(
     measures     := '{…}',      -- JSON object/array of output expressions
     rows         := 'one'|'all',-- ONE ROW PER MATCH (default) | ALL ROWS PER MATCH
     after        := '…',        -- AFTER MATCH SKIP mode (default 'past last row')
-    step_budget  := 5000000     -- per-partition backtracking guard (optional)
+    step_budget  := 5000000     -- per-partition backtracking guard (optional;
+                                --   omit to scale it with the partition size)
 ) -> TABLE
 ```
 
@@ -144,6 +149,14 @@ Column refs (`price`), variable-qualified refs (`A.price`), literals,
 `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `BETWEEN`, `IN`, `||`, and `CAST`/`::`.
 DEFINE predicates are always **RUNNING** (they see only rows matched so far).
 
+A bare `A.price` is the standard's shorthand for `LAST(A.price)` under the
+prevailing RUNNING/FINAL semantics — the last row bound to `A`, or NULL if `A`
+has not bound one yet. So match-dependent predicates work as written:
+`"B": "price > A.price"` compares each candidate `B` row against `A`'s row.
+Qualified physical navigation anchors on the variable too: `PREV(A.price, n)`
+steps back `n` rows from `A`'s last row (the standard's `PREV(LAST(A.price), n)`),
+while unqualified `PREV(price)` steps from the current row.
+
 ## Output schema (fixed at bind time)
 
 - **`rows := 'one'`** — the `partition_by` columns, then one column per measure.
@@ -180,12 +193,45 @@ matching always terminates independently of the step budget.
 
 ## Robustness
 
-The matcher backtracks with a **per-partition step budget** (default 5,000,000):
-on a pathological, ambiguous pattern it returns a clean error rather than
-hanging, and it never panics (enforced by a property test over arbitrary
-patterns × arbitrary row tables). Buffer-all-then-compute holds the whole input
-relation in memory — block or filter before the function on very large inputs;
-partitioning keeps each working set small.
+The matcher backtracks with a **per-partition step budget**: on a pathological,
+ambiguous pattern it returns a clean error rather than hanging, and it never panics
+or aborts (enforced by property tests over arbitrary patterns × arbitrary row
+tables, including partitions of 12,000–20,000 rows).
+
+The budget **scales with the partition** by default (128 steps per row, floor
+5,000,000). A fixed constant is the wrong shape here: catastrophic backtracking is
+super-linear in the partition size, so a constant both lets a pathological pattern
+run a long time on a small partition and cuts off an ordinary linear match on a
+large one. Pass `step_budget := <n>` to pin it instead.
+
+Backtracking runs on an **explicit heap stack**, not host recursion, so a single
+match may span millions of rows — a `A B*` sessionization where one partition is
+one long session, or `A+` over a whole partition, is bounded by the step budget
+rather than by the OS stack. Deeply nested `pattern` / `define` / `measures` input
+is refused past 128 levels of nesting, again to keep a pathological string from
+exhausting the stack.
+
+## Memory & streaming
+
+Input is **buffered to disk, not held in RAM**: each incoming batch is written to
+the worker's cross-process store as Arrow IPC (a SQLite file under `$TMPDIR` by
+default; set `VGI_WORKER_SHARED_STORAGE=memory|fs|sqlite` to choose a backend).
+
+At finalize the buffered relation is read back and matched. Two properties keep
+the footprint down:
+
+- The batches are **not concatenated** — `BatchRowStore` addresses them as one
+  contiguous row space, so there is no second full copy of the input.
+- Output is **streamed one partition at a time**, coalesced into ~8k-row batches,
+  so only the current batch's rows are materialized rather than the whole result.
+
+What still scales with input size is the relation itself (read back into memory at
+finalize) plus one `usize` per row for the partition tapes. Measured: 5M rows × 4
+columns → **552 MB** peak worker RSS producing 1.33M matches. Matching cannot be
+made fully streaming — a match may span an entire partition, so a partition has to
+be complete before it can be matched, and DuckDB does not deliver input clustered
+by partition key. Per-partition spilling is the next step for inputs larger than
+RAM; until then, block or filter before the function on very large inputs.
 
 ## Scope
 

@@ -5,11 +5,11 @@ Guidance for working in this repository.
 ## What this is
 
 `vgi-matchrecognize` is a **VGI worker** (a standalone binary DuckDB launches and
-talks to over Apache Arrow IPC, `ATTACH 'mr' (TYPE vgi, COMMAND '…')`) that
+talks to over Apache Arrow IPC, `ATTACH 'mr' (TYPE vgi, LOCATION '…')`) that
 brings **SQL:2016 `MATCH_RECOGNIZE` row pattern matching** to DuckDB, which has
 no native support for it. Functions live under catalog `mr`, schema `main`.
 
-Built on the published VGI Rust SDK (`vgi = "0.17.0"` from crates.io), arrow 59.
+Built on the published VGI Rust SDK (`vgi = "0.29"` from crates.io), arrow 59.
 The repo builds standalone — no local SDK checkout, no path deps except the
 intra-workspace `mr-core`. License **MIT**.
 
@@ -49,11 +49,16 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     budget + AFTER MATCH SKIP).
   - `plan` — `Plan::build` (bind: parse + type-check + compute the output column
     layout) and `Plan::run` (produce: group → sort → match → evaluate → rows).
+    `Plan::partition_tapes` + `Plan::run_partition` are the streaming form of
+    `run`: one partition at a time, threading the match number across calls.
 - **`crates/mr-worker`** — thin Arrow/VGI adapter:
   - `match_recognize.rs` — the `TableBufferingFunction` (`on_bind` / `process` /
     `combine` / `finalize_producer`); buffers each batch into `storage`, then
-    concatenates, builds the `Plan`, runs it, and emits one output batch.
-  - `arrow_in.rs` — a `RowStore` over a concatenated `RecordBatch`.
+    builds the `Plan` and returns a `PartitionStream` producer that matches one
+    partition per step, coalescing output into ~8k-row batches.
+  - `arrow_in.rs` — a `RowStore` over the buffered `RecordBatch`es, addressed as
+    one contiguous row space (deliberately **not** concatenated — a merged copy
+    would double peak memory for no gain).
   - `arrow_out.rs` — `Vec<Vec<Value>>` + output `Ty`s → a `RecordBatch`.
   - `schema.rs` — `Ty` ↔ Arrow `DataType` + the `ArrowBindSchema` for inference.
   - `scalar/` — `explain_pattern`.
@@ -65,8 +70,11 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
 1. **Buffer-all, then compute.** Row pattern matching is intrinsically a
    whole-partition operation, so `match_recognize` is a `TableBufferingFunction`
    (Sink+Source), the `vgi-match` idiom: `process` buffers each Arrow batch into
-   cross-process `storage`; `finalize_producer` concatenates everything, runs the
-   matcher per partition, and streams the result back.
+   cross-process `storage` (on disk as Arrow IPC — the SDK's default backend is a
+   SQLite file under `$TMPDIR`); `finalize_producer` reads it back and streams the
+   result, running the matcher **one partition at a time**. The partition is the
+   smallest sound streaming unit: a match may span a whole partition, so a
+   partition must be complete before it can be matched.
 2. **Output schema is fixed at `on_bind`** — before any data flows. The measure
    types are **inferred statically** from `params.input_schema` + the parsed
    measure ASTs (`mr-core::types::infer`), with an explicit `{"as","expr","type"}`
@@ -81,11 +89,30 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
   `VGI_WORKER_CATALOG_NAME` to `mr`.
 - `serde_json` is built with `preserve_order` so a MEASURES **object**'s key
   order is the output column order (the SDK contract).
-- The matcher is a backtracking VM: it leaves `binds` unchanged on a failed
-  branch (the `Char` instruction push/pops; control instructions never touch
-  bindings), so backtracking is just "return `None`". Termination is guaranteed
-  two ways: the per-partition **step budget** (no hang) bounds inner work, and
-  the outer match loop advances the tape cursor by ≥1 row each iteration.
+- The matcher is a backtracking VM over an **explicit heap stack** of pending
+  alternatives (`Alt { ip, pos, binds_len }`), never host recursion — match length
+  must not be bounded by the OS stack (it once was, and a match over ~8k rows
+  aborted the process). `binds` is append-only along a path, so restoring an
+  alternative is just `binds.truncate(binds_len)`, and popping LIFO reproduces the
+  greedy/reluctant preference order that `Split` branch order encodes.
+  Termination is guaranteed two ways: the per-partition **step budget** (no hang)
+  bounds inner work, and the outer match loop advances the tape cursor by ≥1 row
+  each iteration.
+- `PlanConfig::step_budget` is `Option<i64>`: `None` means `auto_step_budget(rows)`
+  (128 steps/row, floor 5M), computed per partition in `run_partition`. The budget
+  targets *super-linear* backtracking, so it has to scale with the partition — a
+  constant default cut off ordinary linear matches past ~1.5M rows.
+- `Frame::var_at_tp` **binary searches** `binds` (which is strictly increasing in
+  `tape_pos`, since matches consume rows left to right). It is on the PREV/NEXT hot
+  path; a linear scan there made `x <= PREV(x) + 1` quadratic in match length.
+  `last_bind_of` / `scope` are still linear in the match — fine for short matches,
+  a known cost for very long ones.
+- Both parsers cap nesting at 128 levels (`MAX_DEPTH`) — they recurse through
+  grouping, and `pattern`/`define`/`measures` are user-supplied strings.
+- A bare qualified ref `A.col` outside a navigation/aggregate call means
+  `LAST(A.col)` under the prevailing RUNNING/FINAL semantics (NULL if `A` is
+  unbound); `eval` reads it directly only when the row being evaluated is itself
+  bound to `A`, which is how nav/aggregate scopes pin their row.
 - Empty matches (zero bound rows) are omitted from output and don't consume a
   match number.
 - An unbounded quantifier (`*`, `+`, `{n,}`) over a **nullable** sub-pattern is

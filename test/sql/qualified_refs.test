@@ -1,0 +1,98 @@
+# name: test/sql/qualified_refs.test
+# description: Bare VAR.col resolves per-variable (LAST semantics), not to the current row.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# A match-dependent predicate comparing against another variable's row. This
+# returned zero rows when `A.amt` collapsed to the current row (`amt > amt`).
+query III
+SELECT n, a, lb
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,10),(2,20),(3,30)) AS t(ts, amt)),
+       order_by := ['ts'],
+       pattern  := 'A B+',
+       define   := '{"B":"amt > A.amt"}',
+       measures := '{"n":"COUNT(*)","a":"A.amt","lb":"LAST(B.amt)"}');
+----
+3	10	30
+
+# The predicate must still discriminate: the trailing 5 does not exceed A.amt.
+query II
+SELECT n, lb
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,20),(2,30),(3,5)) AS t(ts, amt)),
+       order_by := ['ts'],
+       pattern  := 'A B+',
+       define   := '{"B":"amt > A.amt"}',
+       measures := '{"n":"COUNT(*)","lb":"LAST(B.amt)"}');
+----
+2	30
+
+# Each qualifier in MEASURES resolves to its own variable's row.
+query III
+SELECT a, b, diff
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,10),(2,20)) AS t(ts, amt)),
+       order_by := ['ts'],
+       pattern  := 'A B',
+       define   := '{}',
+       measures := '{"a":"A.amt","b":"B.amt","diff":"B.amt - A.amt"}');
+----
+10	20	10
+
+# `A.col` is LAST(A.col) when A bound several rows — not FIRST, not the current row.
+query III
+SELECT la, fa, b
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,1),(2,2),(3,3),(4,100)) AS t(ts, amt)),
+       order_by := ['ts'],
+       pattern  := 'A+ B',
+       define   := '{"A":"amt < 100","B":"amt >= 100"}',
+       measures := '{"la":"A.amt","fa":"FIRST(A.amt)","b":"B.amt"}');
+----
+3	1	100
+
+# An unbound qualifier is NULL: the alternation takes A, leaving C unbound.
+query II
+SELECT a, c
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,10),(2,20)) AS t(ts, amt)),
+       order_by := ['ts'],
+       pattern  := '(A | C) B',
+       define   := '{"A":"amt = 10","C":"amt = 999","B":"amt = 20"}',
+       measures := '{"a":"A.amt","c":"C.amt"}');
+----
+10	NULL
+
+# Under ALL ROWS PER MATCH the default is RUNNING: B.amt is NULL until B binds.
+query IIII
+SELECT ts, classifier, ax, bx
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,10),(2,20),(3,30)) AS t(ts, amt)),
+       order_by := ['ts'],
+       pattern  := 'A B*',
+       define   := '{"A":"amt = 10"}',
+       measures := '{"ax":"A.amt","bx":"B.amt"}',
+       rows     := 'all')
+ORDER BY ts;
+----
+1	A	10	NULL
+2	B	10	20
+3	B	10	30
+
+# Qualified physical navigation anchors on the variable's last row
+# (PREV(LAST(A.amt))), while unqualified PREV steps from the current row.
+query III
+SELECT pa, na, p
+FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1,5),(2,10),(3,20)) AS t(ts, amt)),
+       order_by := ['ts'],
+       pattern  := 'A B',
+       define   := '{"A":"amt = 10","B":"amt = 20"}',
+       measures := '{"pa":"PREV(A.amt)","na":"NEXT(A.amt)","p":"PREV(amt)"}');
+----
+5	20	10

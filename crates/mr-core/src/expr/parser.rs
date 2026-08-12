@@ -15,12 +15,30 @@ const BP_ADD: u8 = 5;
 const BP_MUL: u8 = 6;
 const BP_UNARY: u8 = 7;
 
+/// Maximum expression nesting depth. `parse_expr` recurses through parenthesized
+/// sub-expressions and call arguments, so deeply nested input would otherwise
+/// exhaust the native stack and abort the process. Real DEFINE/MEASURES
+/// expressions nest a handful of levels; this reports a clean error instead.
+const MAX_DEPTH: u32 = 128;
+
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    depth: u32,
 }
 
 impl Parser {
+    /// Enter one nesting level, refusing input deep enough to blow the stack.
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(MrError::Expr(format!(
+                "expression nests deeper than the {MAX_DEPTH}-level limit"
+            )));
+        }
+        Ok(())
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
     }
@@ -54,6 +72,7 @@ impl Parser {
     }
 
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr> {
+        self.enter()?;
         let mut lhs = self.parse_prefix()?;
         while let Some((lbp, _)) = self.infix_bp() {
             if lbp < min_bp {
@@ -61,6 +80,8 @@ impl Parser {
             }
             lhs = self.parse_infix(lhs, lbp)?;
         }
+        // Only decremented on success; an error aborts the whole parse.
+        self.depth -= 1;
         Ok(lhs)
     }
 
@@ -544,7 +565,11 @@ pub fn parse(src: &str) -> Result<Expr> {
     if toks.is_empty() {
         return Err(MrError::Expr("empty expression".into()));
     }
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     let e = p.parse_expr(0)?;
     if p.pos != p.toks.len() {
         return Err(MrError::Expr(format!(
@@ -558,7 +583,11 @@ pub fn parse(src: &str) -> Result<Expr> {
 /// Parse a standalone SQL type name (used for the `type` override on measures).
 pub fn parse_type_name(src: &str) -> Result<Ty> {
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        depth: 0,
+    };
     let ty = p.parse_ty()?;
     if p.pos != p.toks.len() {
         return Err(MrError::Expr(format!("trailing tokens in type '{src}'")));

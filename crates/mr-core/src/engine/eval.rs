@@ -52,11 +52,27 @@ impl<'a> Frame<'a> {
         }
     }
 
+    /// The variable bound at tape position `tp`, if that row is in the match.
+    ///
+    /// Binary search, not a scan: a match consumes rows left to right, so `binds`
+    /// is strictly increasing in `tape_pos`. This is on the hot path — every
+    /// PREV/NEXT evaluation calls it — so a linear scan here made a DEFINE
+    /// predicate like `x <= PREV(x) + 1` quadratic in the match length.
     fn var_at_tp(&self, tp: usize, final_sem: bool) -> Option<String> {
+        let binds = self.visible(final_sem);
+        binds
+            .binary_search_by_key(&tp, |b| b.tape_pos)
+            .ok()
+            .map(|i| binds[i].var.clone())
+    }
+
+    /// Tape position of the last visible row bound to `var` (logical `LAST`).
+    fn last_bind_of(&self, var: &str, final_sem: bool) -> Option<usize> {
         self.visible(final_sem)
             .iter()
-            .find(|b| b.tape_pos == tp)
-            .map(|b| b.var.clone())
+            .rev()
+            .find(|b| b.var.eq_ignore_ascii_case(var))
+            .map(|b| b.tape_pos)
     }
 
     fn col_value(&self, name: &str, tp: usize) -> Result<Value> {
@@ -90,7 +106,23 @@ impl<'a> Frame<'a> {
                 nanos: *nanos,
             })),
             Expr::Col(name) => self.col_value(name, cur_tp),
-            Expr::Qualified(_var, col) => self.col_value(col, cur_tp),
+            // A bare `VAR.col` used outside a navigation/aggregate call is
+            // shorthand for `LAST(VAR.col)` under the prevailing RUNNING/FINAL
+            // semantics — NULL when no row is bound to `VAR` yet. When the row
+            // being evaluated is itself bound to `VAR` the read is direct; that
+            // is how FIRST/LAST/aggregate scopes and qualified PREV/NEXT pin
+            // their row, and it also makes `B.col` inside `DEFINE[B]` mean the
+            // candidate row.
+            Expr::Qualified(var, col) => {
+                if cur_var.is_some_and(|cv| cv.eq_ignore_ascii_case(var)) {
+                    self.col_value(col, cur_tp)
+                } else {
+                    match self.last_bind_of(var, final_sem) {
+                        Some(tp) => self.col_value(col, tp),
+                        None => Ok(Value::Null),
+                    }
+                }
+            }
             Expr::Classifier => Ok(cur_var
                 .map(|v| Value::Str(v.to_string()))
                 .unwrap_or(Value::Null)),
@@ -178,10 +210,22 @@ impl<'a> Frame<'a> {
     ) -> Result<Value> {
         match kind {
             NavKind::Prev | NavKind::Next => {
+                // Physical navigation. An unqualified argument (`PREV(price)`)
+                // steps from the current row; a qualified one (`PREV(A.price, n)`)
+                // steps from the last row bound to that variable — the standard's
+                // `PREV(LAST(A.price), n)` — and is NULL when nothing is bound.
+                let qual = dominant_qualifier(arg);
+                let anchor = match &qual {
+                    Some(v) => match self.last_bind_of(v, final_sem) {
+                        Some(tp) => tp,
+                        None => return Ok(Value::Null),
+                    },
+                    None => cur_tp,
+                };
                 let target = if kind == NavKind::Prev {
-                    cur_tp.checked_sub(offset)
+                    anchor.checked_sub(offset)
                 } else {
-                    let t = cur_tp + offset;
+                    let t = anchor + offset;
                     if t < self.tape.len() {
                         Some(t)
                     } else {
@@ -190,7 +234,10 @@ impl<'a> Frame<'a> {
                 };
                 match target {
                     Some(tp) if tp < self.tape.len() => {
-                        let v = self.var_at_tp(tp, final_sem);
+                        // Pin `cur_var` to the qualifier so reading the column at
+                        // the navigated row is a physical read, rather than
+                        // resolving to LAST all over again.
+                        let v = qual.or_else(|| self.var_at_tp(tp, final_sem));
                         self.eval(arg, tp, v.as_deref(), final_sem)
                     }
                     _ => Ok(Value::Null),

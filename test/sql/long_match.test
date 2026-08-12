@@ -1,0 +1,88 @@
+# name: test/sql/long_match.test
+# description: A single match spanning many rows must not overflow the stack / abort the worker.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# `A+` swallowing a whole 50k-row partition. This aborted the worker process
+# (stack overflow, SIGABRT) at ~8k rows before backtracking moved to the heap.
+query II
+SELECT n, mn
+FROM mr.main.match_recognize(
+       (SELECT 1 AS uid, i AS ts FROM range(50000) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A+',
+       define       := '{"A":"ts >= 0"}',
+       measures     := '{"n":"COUNT(*)","mn":"MATCH_NUMBER()"}',
+       step_budget  := 50000000);
+----
+50000	1
+
+# The README's sessionization shape over a single 20k-event session.
+query III
+SELECT n_events, session_start, session_end
+FROM mr.main.match_recognize(
+       (SELECT 1 AS uid, i * 60 AS ts FROM range(20000) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A B*',
+       define       := '{"B":"ts <= PREV(ts) + 1800"}',
+       measures     := '{"n_events":"COUNT(*)","session_start":"FIRST(ts)","session_end":"LAST(ts)"}',
+       step_budget  := 50000000);
+----
+20000	0	1199940
+
+# Deep backtracking: greedy `A+` overshoots the whole partition, then gives rows
+# back one at a time until the trailing B can bind.
+query II
+SELECT n, nb
+FROM mr.main.match_recognize(
+       (SELECT 1 AS uid, i AS ts, CASE WHEN i < 20000 THEN 'a' ELSE 'b' END AS kind
+          FROM range(20001) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A+ B',
+       define       := '{"A":"kind = ''a''","B":"kind = ''b''"}',
+       measures     := '{"n":"COUNT(*)","nb":"COUNT(B.*)"}',
+       step_budget  := 50000000);
+----
+20001	1
+
+# A 2M-row single match with NO step_budget argument. The old fixed default of
+# 5,000,000 steps cut this off with a misleading "pattern may be ambiguous"; the
+# automatic budget scales with the partition, so an ordinary linear match is safe
+# at any size.
+query II
+SELECT n, mn
+FROM mr.main.match_recognize(
+       (SELECT 1 AS uid, i AS ts FROM range(2000000) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A+',
+       define       := '{"A":"ts >= 0"}',
+       measures     := '{"n":"COUNT(*)","mn":"MATCH_NUMBER()"}');
+----
+2000000	1
+
+# The step budget still bounds a runaway match, reported cleanly rather than crashing.
+statement error
+SELECT n FROM mr.main.match_recognize(
+       (SELECT 1 AS uid, i AS ts FROM range(50000) t(i)),
+       partition_by := ['uid'],
+       order_by     := ['ts'],
+       pattern      := 'A+',
+       define       := '{"A":"ts >= 0"}',
+       measures     := '{"n":"COUNT(*)"}',
+       step_budget  := 5000);
+----
+step budget
+
+# Pathologically nested patterns are refused cleanly, not by aborting the worker.
+statement error
+SELECT mr.main.explain_pattern(repeat('(', 5000) || 'A' || repeat(')', 5000));
+----
+nests deeper

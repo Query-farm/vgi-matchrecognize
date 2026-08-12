@@ -61,7 +61,7 @@ fn v_shape_one_row() {
         order_by: vec!["ts".into()],
         rows_all: false,
         after: "past last row".into(),
-        step_budget: 1_000_000,
+        step_budget: Some(1_000_000),
     };
     let plan = Plan::build(
         &cfg,
@@ -110,7 +110,7 @@ fn login_fail_then_success_all_rows() {
         order_by: vec!["ts".into()],
         rows_all: true,
         after: "past last row".into(),
-        step_budget: 1_000_000,
+        step_budget: Some(1_000_000),
     };
     let plan = Plan::build(
         &cfg,
