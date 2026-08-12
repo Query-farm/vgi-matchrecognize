@@ -188,6 +188,10 @@ fn shard_count_respects_budget_and_shape() {
     assert_eq!(shard::shard_count(budget * 2 + 1, true), 3);
     // Unpartitioned input is one partition, so no split can divide it.
     assert_eq!(shard::shard_count(budget * 100, false), 1);
-    // Capped, so a huge input does not mean unbounded files and streams.
-    assert!(shard::shard_count(budget * 10_000, true) <= 64);
+    // The cap is high enough that the budget stays a bound at realistic sizes: at the
+    // 256 MB default, 1024 shards covers ~256 GB of input.
+    assert_eq!(shard::shard_count(budget * 500, true), 500);
+    // But it is still a cap, so no input means unbounded files and streams.
+    assert!(shard::shard_count(budget * 10_000, true) <= 1024);
+    assert_eq!(shard::shard_count(budget * 10_000, true), 1024);
 }

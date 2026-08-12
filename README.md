@@ -378,7 +378,8 @@ rather than a quiet under-count:
   run additionally carries the row count each shard should hold. A truncated or
   missing file is an error naming the shard, not a short answer.
 
-Spool files are deleted as soon as the finalize phase has read them. A query killed
+Disk use is about 24 bytes per buffered row, plus one sink file's worth while a split
+is in progress. Spool files are deleted as soon as the finalize phase has read them. A query killed
 before that leaves the worker no hook at all, so directories older than
 `VGI_BUFFERING_STORE_TTL_SECS` (default 24h, the same knob the SDK's own store uses)
 are swept when a worker process first spools.

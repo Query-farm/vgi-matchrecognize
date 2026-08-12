@@ -184,6 +184,39 @@ This is why the default budget is high: sharding is for the query that would oth
 run out of memory, not for throughput. Making it cheap would mean sharding at *sink*
 time (no extra pass, but a per-row cost on every query, whether it needs it or not).
 
+## How far it scales
+
+Measured, not extrapolated: 100M rows, 3 BIGINT columns, 100k partitions of 1000 rows,
+`DOWN+ UP+`, on the 24 GB machine above.
+
+| | time | peak worker RSS | peak spool on disk |
+|---|---|---|---|
+| unsharded (budget raised) | **17.8 s** | 2.6 GB | 2.4 GB |
+| sharded (256 MB default → 10 shards) | 44.5 s | **0.7 GB** | 3.0 GB |
+
+Scaling is linear through this range: 8M → 1.0 s, 100M → 17.8 s (12.5× rows, 12.5×
+time), and resident memory is ~26 bytes/row unsharded. So a **billion** rows of this
+shape extrapolates to roughly 3 minutes unsharded (needing ~26 GB of RAM, i.e. more
+than this machine has) or 7–8 minutes sharded at ~1–2 GB, with ~24 GB of spool.
+
+What actually limits it, in the order it bites:
+
+1. **One giant partition cannot be divided.** No `partition_by`, or one partition
+   holding most of the rows, means the whole relation is resident and sharding cannot
+   help. This is inherent: a match may span the partition, so the partition is the
+   smallest unit that can be matched soundly.
+2. **Disk.** The spool is ~24 bytes/row. Peak was twice the relation until each sink
+   file started being deleted as the split consumed it; it is now the relation plus
+   about one file (5.0 → 3.0 GB on the 100M query).
+3. **Time**, because the split pass is serial — ~2.5× here, and DuckDB idles through it.
+4. **The shard ceiling**, raised from 64 to 1024 for exactly this reason: at 64 the
+   budget stopped binding above 64 × 256 MB = 16 GB of input, and peak memory went back
+   to growing with the relation. At 1024 the default budget holds to ~256 GB.
+
+Index widths are not a limit at this scale: tape positions, step budget, match numbers
+and batch indices are all `i64`, and the `u32` bind indices only cap a single *match* at
+4.29B rows.
+
 ## Measured and declined
 
 Two things the plan proposed that measurement argued against. Recorded so they are not

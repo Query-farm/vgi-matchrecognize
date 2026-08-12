@@ -253,11 +253,12 @@ pub fn append_shard(
     })
 }
 
-/// Delete the unsharded sink files, once their rows have been written to shards.
-pub fn remove_sink_files(scope: &[u8]) {
-    for p in files_with_prefix(scope, "sink-") {
-        let _ = fs::remove_file(p);
-    }
+/// Delete one spool file.
+///
+/// Used by the shard split as each sink file is consumed, so the relation is never on
+/// disk twice.
+pub fn remove_file(path: &std::path::Path) {
+    let _ = fs::remove_file(path);
 }
 
 /// Read one shard's batches.

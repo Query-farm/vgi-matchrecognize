@@ -57,9 +57,20 @@ use crate::arrow_in::BatchRowStore;
 /// producer will hold, since the IPC form and the in-memory form are close in size.
 const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Ceiling on shards. Each is a file and a finalize stream, and past this the split
-/// costs more than the memory it saves.
-const MAX_SHARDS: usize = 64;
+/// Ceiling on shards. Each one is a file and a finalize stream, so this bounds how many
+/// of both a single query can create.
+///
+/// It has to be high enough that the memory budget stays a *bound* rather than a
+/// suggestion: with 64 the budget stopped binding above 64 x 256 MB = 16 GB of buffered
+/// input, and peak memory went back to growing linearly with the relation — which is
+/// precisely what sharding exists to prevent. At 1024 the budget holds to ~256 GB of
+/// input at the default, and further with a smaller one.
+///
+/// The cost of a high ceiling is file descriptors and finalize streams, and neither is
+/// paid unless the input actually needs the shards: the count comes from
+/// `input / budget`, so a query only reaches 1024 shards if it really is that large
+/// relative to what it was told it may hold.
+const MAX_SHARDS: usize = 1024;
 
 fn re(e: impl std::fmt::Display) -> RpcError {
     RpcError::runtime_error(e.to_string())
@@ -94,6 +105,12 @@ pub fn shard_count(total_bytes: u64, partitioned: bool) -> usize {
 /// not materialise the relation. Rows of one input batch that land in the same shard
 /// are written together, so a shard file holds whole (sub-)batches, each still carrying
 /// its original batch index so input order can be restored per shard.
+///
+/// **Disk, not just memory.** Each sink file is deleted as soon as its rows are in
+/// shards, rather than all of them at the end. Holding both copies made peak disk twice
+/// the buffered relation — measured at 5.0 GB against 2.4 GB of data on a 100M-row
+/// query — which for a large input is the difference between needing 25 GB free and
+/// needing 50 GB. Now the overlap is one sink file.
 pub fn split(
     scope: &[u8],
     plan: &Plan,
@@ -138,8 +155,11 @@ pub fn split(
                 crate::spool::append_shard(scope, s, &sub, index)?;
             }
         }
+        // This file's rows are all in shards now, so the copy of them here is dead
+        // weight. Dropping it as we go keeps peak disk at the size of the relation
+        // plus one file, instead of two full copies.
+        crate::spool::remove_file(path);
     }
-    crate::spool::remove_sink_files(scope);
     Ok(rows_per_shard)
 }
 

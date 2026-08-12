@@ -18,7 +18,7 @@
 //! Extending a fold is only sound if each bind's contribution does not itself
 //! depend on the horizon. Most do not — `SUM(k)`, `SUM(A.value)`,
 //! `array_agg(value || CLASSIFIER())` — but a nested navigation or aggregate can
-//! (`SUM(x - LAST(y))` changes as the horizon grows). [`memoizable`] is the
+//! (`SUM(x - LAST(y))` changes as the horizon grows). `memoizable` below is the
 //! conservative test; anything it rejects takes the original recompute path, so a
 //! shape this cannot handle is slow rather than wrong.
 //!

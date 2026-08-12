@@ -87,10 +87,10 @@ impl BindIndex {
 
     /// The greatest recorded bind index for `label` that is below `horizon`.
     ///
-    /// `None` means the label has no visible bind — which is a real answer (an
-    /// unbound qualifier reads as NULL), not a lookup failure. A label outside the
-    /// universe also gives `None`; callers that must distinguish the two use
-    /// [`BindIndex::knows`].
+    /// `None` means the label has no visible bind, which is a real answer rather than a
+    /// lookup failure: an unbound qualifier reads as NULL. A label id outside this
+    /// plan's universe also gives `None`, and cannot arise — ids come from the
+    /// [`LabelSet`] the index was built over.
     pub fn last_before(&self, label: VarId, horizon: usize) -> Option<usize> {
         let list = self.lists.get(label as usize)?;
         // Ascending, so the answer is the element before the first one >= horizon.
