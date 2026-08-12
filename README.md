@@ -266,6 +266,14 @@ the argument's type; arithmetic → the widened numeric type; comparison and log
 `BOOLEAN`; `||` → `VARCHAR`. When inference cannot decide — a measure that resolves
 to an untyped `NULL`, say — use the array form and pin the type:
 
+`UBIGINT` keeps its own type rather than widening to `BIGINT`, so a value above
+`i64::MAX` round-trips intact. Because `u64` and `i64` contain neither the
+other, mixing them widens to `HUGEINT` (`u + bigint`, and `-u`), while
+`SUM(u)` → `HUGEINT` and `AVG(u)` → `DOUBLE` as for any integer. One
+limitation: the expression lexer parses an integer literal as `BIGINT`, so a
+constant above `i64::MAX` has to be written
+`CAST('18446744073709551615' AS UBIGINT)`.
+
 ```json
 [
   { "as": "ratio", "expr": "SUM(A.qty) / SUM(B.qty)", "type": "DECIMAL(18,6)" },

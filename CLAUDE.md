@@ -155,6 +155,36 @@ by itself, since the relation still has to be read back to match it.
   well-formed). Do not relax this to a runtime check; `tests/bind_diagnostics.rs`
   pins it, and `ordinary_predicates_still_bind` there is the guard against making
   `infer` stricter than `eval`.
+- **There are two comparators, and they are pinned to each other.**
+  `valops::compare` is SQL comparison (`None` = unordered, which callers turn into
+  NULL); `cmp_for_sort`/`cmp_present` is the total tape order. They drifted once:
+  the sort side was fixed to compare integers exactly and to use `total_cmp` for
+  NaN, and `compare` was not — so `ORDER BY` and a DEFINE predicate disagreed about
+  which rows were *equal*, which is a wrong match rather than a wrong value. Both
+  now go through one `cmp_ints` (i128, exact across `BIGINT`/`UBIGINT`/`HUGEINT`),
+  and `tests/compare.rs::comparators_agree_exactly` is the guard. They are allowed
+  to differ on exactly two float ties, both documented there: NaN is unordered to
+  SQL but must land somewhere in a total order, and `-0.0`/`0.0` are equal to SQL
+  but distinct to `total_cmp`. `mr-worker/tests/sort_agreement.rs` pins the *sort*
+  pair (`cmp_cells` vs `cmp_for_sort`) separately; a new key type needs an arm in
+  both harnesses.
+- **`Ty::UInt64` deliberately has no `numeric_rank`.** A rank means containment and
+  `unify` takes the higher one, but `u64` and `i64` contain neither the other —
+  sharing `Int64`'s rank makes `unify` non-commutative (`u + v` and `v + u` would
+  type differently), and ranking either side of it re-creates the wrap. Its joins
+  are explicit arms *before* the rank fallback, and falling through to `None` is
+  the safety net: a forgotten pair is a bind error, not a silent mis-typing.
+  Every `Ty` match fails closed that way; the `Value` matches do not, so the ones
+  to watch when adding a variant are `value.rs`'s `as_f64`/`as_i128`/`as_bool` and
+  `arrow_out`'s `to_i128`/`to_decimal`/`display` — six catch-alls that compile
+  cleanly and return wrong data. `UInt8`/`16`/`32` stay `Int64` on purpose.
+- **Overflow is checked in i128, because release builds do not check it at all.**
+  `[profile.release]` sets no `overflow-checks` and CI sets no `RUSTFLAGS`, so
+  `cargo test` catches a wrap and the shipped binary silently returns it — that is
+  how `TIMESTAMP '9999-12-31' - epoch` shipped a *negative* interval. Temporal
+  arithmetic, interval literals and decimal rescaling all compute wide and
+  range-check once. When touching them, verify with
+  `RUSTFLAGS="-C overflow-checks=on" cargo test --release --workspace`.
 - **Errors from `define`/`measures` carry their key** via `MrError::with_context`,
   applied in `parse_define`/`parse_measures`. The expression parser is handed one
   string and cannot name it, so anything new added inside those per-key loops must
@@ -227,7 +257,12 @@ by itself, since the relation still has to be read back to match it.
   `last_bind_of` / `scope` are still linear in the match — fine for short matches,
   a known cost for very long ones.
 - Both parsers cap nesting at 128 levels (`MAX_DEPTH`) — they recurse through
-  grouping, and `pattern`/`define`/`measures` are user-supplied strings.
+  grouping, and `pattern`/`define`/`measures` are user-supplied strings. The
+  *compiler* has the third such cap, `MAX_PROGRAM_INSTS`: a bounded quantifier is
+  expanded by copying its body, so the repeat counts multiply and `A{100000000}`
+  or `((A{1000}){1000}){1000}` is an allocation failure — the process dies rather
+  than the query. `emit_quant` rejects the count before looping over it, so an
+  absurd bound fails promptly instead of spinning to the ceiling.
 - A bare qualified ref `A.col` outside a navigation/aggregate call means
   `LAST(A.col)` under the prevailing RUNNING/FINAL semantics (NULL if `A` is
   unbound); `eval` reads it directly only when the row being evaluated is
