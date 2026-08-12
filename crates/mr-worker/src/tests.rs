@@ -126,3 +126,31 @@ fn arrow_all_rows_has_auto_columns() {
     assert_eq!(classifier.value(0), "START");
     assert_eq!(classifier.value(4), "UP");
 }
+
+/// The `memory` backend is refused where the phases can be separate processes, and
+/// allowed where they cannot. Neither half was covered before, and the wasm build
+/// depends on the second: `mr-wasm` selects `memory` because emscripten has no
+/// durable temp dir and there is only ever one module instance, so refusing it
+/// unconditionally made the browser build fail on its only real function.
+#[test]
+fn memory_backend_is_refused_only_when_phases_can_be_separate_processes() {
+    use crate::match_recognize::storage_backend_ok;
+
+    // Multi-process (every native transport): memory is unsound, so it must error,
+    // and the message has to say why rather than just "invalid".
+    let err = storage_backend_ok(Some("memory"), true).expect_err("memory must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("different worker processes"), "{msg}");
+    assert!(msg.contains("VGI_WORKER_SHARED_STORAGE"), "{msg}");
+    // Case-insensitively, since the SDK compares that way when selecting a backend.
+    assert!(storage_backend_ok(Some("MEMORY"), true).is_err());
+
+    // Single address space (wasm): memory is the only workable backend.
+    assert!(storage_backend_ok(Some("memory"), false).is_ok());
+
+    // Durable backends and the default are fine either way.
+    for backend in [None, Some("sqlite"), Some("fs"), Some("")] {
+        assert!(storage_backend_ok(backend, true).is_ok(), "{backend:?}");
+        assert!(storage_backend_ok(backend, false).is_ok(), "{backend:?}");
+    }
+}

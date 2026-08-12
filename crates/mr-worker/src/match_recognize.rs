@@ -153,11 +153,15 @@ fn projection(plan: &Plan, input_schema: &SchemaRef) -> Vec<usize> {
 /// buffered relation is simply *absent* at finalize and the function would return
 /// zero rows — silently. Durable backends (the default SQLite store, or the
 /// filesystem store) are all fine.
-fn check_storage_backend() -> Result<()> {
-    if std::env::var("VGI_WORKER_SHARED_STORAGE")
-        .unwrap_or_default()
-        .eq_ignore_ascii_case("memory")
-    {
+///
+/// `multi_process` is what makes `memory` unsound, so it is a parameter rather than
+/// an assumption: the wasm build serves every phase from **one** module instance
+/// (the SAB ring hands each slot a serve *thread*, not a process) and has no
+/// filesystem to be durable on, so there `memory` is the only workable backend and
+/// is perfectly safe. See `crates/mr-wasm/src/lib.rs`, which selects it.
+pub(crate) fn storage_backend_ok(configured: Option<&str>, multi_process: bool) -> Result<()> {
+    let is_memory = configured.is_some_and(|v| v.eq_ignore_ascii_case("memory"));
+    if is_memory && multi_process {
         return Err(ve(
             "match_recognize: VGI_WORKER_SHARED_STORAGE=memory cannot be used with a buffering \
              function — the buffering and producing phases may run in different worker processes, \
@@ -166,6 +170,16 @@ fn check_storage_backend() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// [`storage_backend_ok`] against the ambient configuration.
+fn check_storage_backend() -> Result<()> {
+    // One address space under wasm32; a pool of worker processes everywhere else.
+    let multi_process = !cfg!(target_arch = "wasm32");
+    storage_backend_ok(
+        std::env::var("VGI_WORKER_SHARED_STORAGE").ok().as_deref(),
+        multi_process,
+    )
 }
 
 /// The output Arrow schema derived from a bound plan.

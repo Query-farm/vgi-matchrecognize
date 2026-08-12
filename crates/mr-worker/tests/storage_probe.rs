@@ -127,3 +127,65 @@ fn fs_log_round_trips_concurrent() {
     }
     check(&store, &scope, THREADS * PER, "fs concurrent");
 }
+
+/// The out-of-band sink count must turn "the phases cannot see each other's state"
+/// into an error rather than an empty result — the failure mode that motivated
+/// carrying the count outside the store in the first place. This was the one guard
+/// in `buffer.rs` with no test.
+#[test]
+fn finalize_errors_when_sinks_ran_but_nothing_was_buffered() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use mr_worker::buffer::{append_batch, read_batches, FinalizeState};
+
+    let path = std::env::temp_dir().join(format!("mr-probe-guard-{}.db", std::process::id()));
+    let store: SharedStorage = Arc::new(vgi::storage::SqliteStorage::open(path.clone()));
+
+    // Three sinks reported buffering, but the store hands back nothing.
+    let scope = format!("guard-empty-{}", std::process::id()).into_bytes();
+    let err = read_batches(
+        &store,
+        &FinalizeState {
+            scope: scope.clone(),
+            sink_count: 3,
+        },
+    )
+    .expect_err("sinks ran but no rows read back must be an error");
+    let msg = err.to_string();
+    assert!(msg.contains("not sharing state"), "{msg}");
+    assert!(
+        msg.contains('3'),
+        "the message should name the sink count: {msg}"
+    );
+
+    // No sinks and no rows is a legitimately empty relation, not a failure.
+    read_batches(
+        &store,
+        &FinalizeState {
+            scope: scope.clone(),
+            sink_count: 0,
+        },
+    )
+    .expect("an empty input must not error");
+
+    // And the happy path still agrees on the row count, which is the other guard.
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![1i64, 2, 3])) as arrow_array::ArrayRef],
+    )
+    .unwrap();
+    append_batch(&store, &scope, &batch, Some(0)).unwrap();
+    let back = read_batches(
+        &store,
+        &FinalizeState {
+            scope: scope.clone(),
+            sink_count: 1,
+        },
+    )
+    .expect("a buffered batch must read back");
+    assert_eq!(back.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+    store.clear(&scope);
+    let _ = std::fs::remove_file(&path);
+}
