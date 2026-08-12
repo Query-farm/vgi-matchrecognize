@@ -58,24 +58,54 @@ fn re(e: impl std::fmt::Display) -> RpcError {
 pub struct FinalizeState {
     pub scope: Vec<u8>,
     pub sink_count: u32,
+    /// Which shard of the buffered relation this producer serves, and how many there
+    /// are in total. `(0, 1)` is the unsharded case: one producer reads everything.
+    ///
+    /// Sharding is decided in `combine` (see [`crate::shard`]) once the input size is
+    /// known, so the shape of the finalize phase is chosen from the data rather than
+    /// fixed at bind time.
+    pub shard: u32,
+    pub shards: u32,
+    /// Rows this finalize state should read back, counted when the split wrote them.
+    /// `None` outside a sharded run, where the row-count log serves the same purpose.
+    pub expect_rows: Option<u64>,
 }
 
 impl FinalizeState {
-    pub fn encode(scope: &[u8], sink_count: u32) -> Vec<u8> {
+    pub fn encode(
+        scope: &[u8],
+        sink_count: u32,
+        shard: u32,
+        shards: u32,
+        expect_rows: Option<u64>,
+    ) -> Vec<u8> {
         let mut out = sink_count.to_le_bytes().to_vec();
+        out.extend_from_slice(&shard.to_le_bytes());
+        out.extend_from_slice(&shards.to_le_bytes());
+        // u64::MAX means "not counted", which no real row count can reach.
+        out.extend_from_slice(&expect_rows.unwrap_or(u64::MAX).to_le_bytes());
         out.extend_from_slice(scope);
         out
     }
 
     pub fn decode(id: &[u8]) -> Result<Self> {
-        if id.len() < 4 {
+        if id.len() < 20 {
             return Err(re("match_recognize: malformed finalize state id"));
         }
-        let (count, scope) = id.split_at(4);
+        let (head, scope) = id.split_at(20);
+        let expect = u64::from_le_bytes(head[12..20].try_into().expect("8 bytes"));
         Ok(FinalizeState {
             scope: scope.to_vec(),
-            sink_count: u32::from_le_bytes(count.try_into().expect("4 bytes")),
+            sink_count: u32::from_le_bytes(head[0..4].try_into().expect("4 bytes")),
+            shard: u32::from_le_bytes(head[4..8].try_into().expect("4 bytes")),
+            shards: u32::from_le_bytes(head[8..12].try_into().expect("4 bytes")),
+            expect_rows: (expect != u64::MAX).then_some(expect),
         })
+    }
+
+    /// Whether the relation was split, i.e. this producer serves one shard of it.
+    pub fn is_sharded(&self) -> bool {
+        self.shards > 1
     }
 }
 
@@ -145,6 +175,16 @@ pub fn append_batch(
     Ok(())
 }
 
+/// Whether nothing was written to the SDK store's batch log for this execution.
+///
+/// Used to check that every sink took the local spool before the finalize phase
+/// shards, since a split only moves spooled rows.
+pub fn sdk_log_is_empty(storage: &SharedStorage, scope: &[u8]) -> bool {
+    storage
+        .scan(scope, NS_BATCHES, b"", START_CURSOR, 1)
+        .is_empty()
+}
+
 /// Read back every buffered batch, verifying that the relation arrived intact.
 ///
 /// Two independent checks, because a short read here would surface as a confidently
@@ -161,7 +201,17 @@ pub fn read_batches(storage: &SharedStorage, state: &FinalizeState) -> Result<Ve
     // The local spool first, then the SDK log. Which sink used which is not recorded
     // anywhere: reading both and merging on the batch index is simpler than a mode
     // flag, and it means a sink that fell back mixes with one that did not.
-    let spooled = crate::spool::read_all(scope)?;
+    //
+    // A sharded execution reads only its own shard — that is the whole point, so that
+    // peak memory tracks a shard rather than the relation. The SDK log is not sharded
+    // (a fallback sink wrote there), so a sharded run must not also read it; the split
+    // in `combine` covers only spooled rows, and it refuses to run if any sink fell
+    // back. See `MatchRecognize::combine`.
+    let spooled = if state.is_sharded() {
+        crate::spool::read_shard(scope, state.shard as usize)?
+    } else {
+        crate::spool::read_all(scope)?
+    };
     let spooled_rows: usize = spooled.iter().map(|(_, b)| b.num_rows()).sum();
     indexed.extend(spooled);
     for bytes in scan_log(storage, scope, NS_BATCHES) {
@@ -184,6 +234,8 @@ pub fn read_batches(storage: &SharedStorage, state: &FinalizeState) -> Result<Ve
     // spool needs none, because a file write reports its own failure and every record
     // is length-prefixed, so loss there cannot be silent.
     let mut expected_rows = spooled_rows;
+    // Row-count records only exist for the SDK-store path, which a sharded run never
+    // mixes with, so this cross-check applies to the unsharded case.
     for bytes in scan_log(storage, scope, NS_ROWS) {
         let n: [u8; 8] = bytes
             .as_slice()
@@ -192,7 +244,9 @@ pub fn read_batches(storage: &SharedStorage, state: &FinalizeState) -> Result<Ve
         expected_rows += u64::from_le_bytes(n) as usize;
     }
 
-    if batches.is_empty() && state.sink_count > 0 {
+    // A shard can legitimately be empty (fewer distinct partitions than shards), so
+    // the "sinks ran but nothing came back" check only applies to a whole relation.
+    if batches.is_empty() && state.sink_count > 0 && !state.is_sharded() {
         return Err(re(format!(
             "match_recognize: {} buffering sink(s) ran but the finalize phase read back no \
              buffered rows, so the two phases are not sharing state. This normally means the \
@@ -201,7 +255,19 @@ pub fn read_batches(storage: &SharedStorage, state: &FinalizeState) -> Result<Ve
             state.sink_count
         )));
     }
-    if expected_rows != buffered_rows {
+    // A sharded run is checked against the count the split recorded for this shard, so
+    // a lost shard file is an error rather than a short answer.
+    if let Some(expect) = state.expect_rows {
+        if expect as usize != buffered_rows {
+            return Err(re(format!(
+                "match_recognize: shard {} of {} read back {buffered_rows} rows but {expect} were \
+                 written to it. The buffered relation was split across files under \
+                 $TMPDIR and one is missing or truncated.",
+                state.shard, state.shards
+            )));
+        }
+    }
+    if !state.is_sharded() && expected_rows != buffered_rows {
         return Err(re(format!(
             "match_recognize: read back {buffered_rows} buffered rows but {expected_rows} were \
              written — the shared storage backend lost data, so the result would be silently \

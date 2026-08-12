@@ -21,6 +21,7 @@ mod match_recognize;
 mod meta;
 mod scalar;
 mod schema;
+pub mod shard;
 pub mod spool;
 #[cfg(test)]
 mod tests;

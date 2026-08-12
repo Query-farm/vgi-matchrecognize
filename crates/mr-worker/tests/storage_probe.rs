@@ -148,6 +148,9 @@ fn finalize_errors_when_sinks_ran_but_nothing_was_buffered() {
         &FinalizeState {
             scope: scope.clone(),
             sink_count: 3,
+            shard: 0,
+            shards: 1,
+            expect_rows: None,
         },
     )
     .expect_err("sinks ran but no rows read back must be an error");
@@ -164,6 +167,9 @@ fn finalize_errors_when_sinks_ran_but_nothing_was_buffered() {
         &FinalizeState {
             scope: scope.clone(),
             sink_count: 0,
+            shard: 0,
+            shards: 1,
+            expect_rows: None,
         },
     )
     .expect("an empty input must not error");
@@ -181,6 +187,9 @@ fn finalize_errors_when_sinks_ran_but_nothing_was_buffered() {
         &FinalizeState {
             scope: scope.clone(),
             sink_count: 1,
+            shard: 0,
+            shards: 1,
+            expect_rows: None,
         },
     )
     .expect("a buffered batch must read back");

@@ -145,6 +145,16 @@ fn projection(plan: &Plan, input_schema: &SchemaRef) -> Vec<usize> {
         .collect()
 }
 
+/// The schema the sinks wrote: the input schema projected to the columns the plan
+/// reads. Derived the same way in every phase, so they agree on the buffered layout.
+fn projected_schema(plan: &Plan, input_schema: &SchemaRef) -> Result<SchemaRef> {
+    Ok(Arc::new(
+        input_schema
+            .project(&projection(plan, input_schema))
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?,
+    ))
+}
+
 /// Reject storage backends that cannot survive the sink and source running in
 /// different worker processes.
 ///
@@ -357,13 +367,59 @@ impl TableBufferingFunction for MatchRecognize {
         Ok(params.execution_id.clone())
     }
 
+    /// Decide the shape of the finalize phase, now that the input size is known.
+    ///
+    /// This is the only point where the whole relation is known to be present and a
+    /// single process is looking at it, so it is where the split decision belongs: if
+    /// the spooled input is bigger than the finalize memory budget, rewrite it into
+    /// shards by partition key and return one finalize state per shard, so each
+    /// producer holds a shard rather than the relation. Otherwise return one state and
+    /// nothing is rewritten.
     fn combine(&self, params: &BufferingParams, state_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
         // Carry the sink count to finalize outside the store, so finalize can tell
         // "no input rows" (legitimately empty) from "cannot see the sinks' state".
         let count = u32::try_from(state_ids.len()).unwrap_or(u32::MAX);
+        let scope = &params.execution_id;
+
+        let spooled = crate::spool::sink_bytes(scope);
+        let plan = params
+            .input_schema
+            .as_ref()
+            .and_then(|schema| build_plan(&params.arguments, schema).ok());
+        let partitioned = plan
+            .as_ref()
+            .is_some_and(|p| !p.partition_by_columns().is_empty());
+        let shards = crate::shard::shard_count(spooled, partitioned);
+
+        // Sharding covers spooled rows only. If any sink fell back to the SDK store
+        // its rows are not in the spool, so splitting would silently drop them —
+        // stay unsharded rather than risk that.
+        let all_spooled = crate::buffer::sdk_log_is_empty(&params.storage, scope) && spooled > 0;
+        if shards > 1 && all_spooled {
+            if let (Some(plan), Some(input_schema)) = (plan.as_ref(), params.input_schema.as_ref())
+            {
+                let projected = projected_schema(plan, input_schema)?;
+                let rows = crate::shard::split(scope, plan, &projected, shards)?;
+                params.log(format!(
+                    "match_recognize: split {spooled} buffered bytes into {shards} shards \
+                     (finalize memory budget {} bytes)",
+                    crate::shard::budget_bytes()
+                ));
+                return Ok((0..shards)
+                    .map(|s| {
+                        crate::buffer::FinalizeState::encode(
+                            scope,
+                            count,
+                            s as u32,
+                            shards as u32,
+                            Some(rows[s]),
+                        )
+                    })
+                    .collect());
+            }
+        }
         Ok(vec![crate::buffer::FinalizeState::encode(
-            &params.execution_id,
-            count,
+            scope, count, 0, 1, None,
         )])
     }
 
@@ -392,9 +448,21 @@ impl TableBufferingFunction for MatchRecognize {
                 .map_err(|e| RpcError::runtime_error(e.to_string()))?,
         );
         let store = BatchRowStore::new(projected_schema, batches);
+        // The buffered relation is now entirely in `store`, and nothing reads the spool
+        // again — so this is the point to delete it. Waiting for end-of-stream or Drop
+        // is not reliable: a consumer that stops asking (or the SDK holding the producer
+        // until its *best-effort* destructor RPC) leaves the files behind, which is
+        // exactly what the e2e suite was doing, one directory per query.
+        //
+        // If a finalize stream were ever re-initialised for the same state id it would
+        // now read nothing — and be told so: the sink-count and per-shard row-count
+        // guards turn that into an error, never a short answer.
+        match state.shards {
+            0 | 1 => crate::spool::discard(&state.scope),
+            _ => crate::spool::discard_shard(&state.scope, state.shard as usize),
+        }
         let tapes = plan.partition_tapes(&store).map_err(ve)?;
         Ok(Box::new(PartitionStream {
-            scope: state.scope.clone(),
             plan,
             store,
             tapes: tapes.into_iter(),
@@ -456,27 +524,13 @@ struct PartitionStream {
     store: BatchRowStore,
     tapes: std::vec::IntoIter<(String, Vec<usize>)>,
     output_schema: SchemaRef,
-    /// The execution's storage scope, so the local spool can be deleted when this
-    /// producer goes away.
-    scope: Vec<u8>,
+
     /// Matched partitions waiting to be emitted, each entry one partition's rows, in
     /// partition order. Keeping them grouped means a partition's rows stay contiguous
     /// and a match is never split across output batches.
     ready: std::collections::VecDeque<Vec<Vec<mr_core::value::Value>>>,
     /// Threads to match on. Read once, so a query cannot change it midway.
     threads: usize,
-}
-
-impl Drop for PartitionStream {
-    /// Delete the execution's spooled batches.
-    ///
-    /// Fires on normal end-of-stream *and* on cancellation (DuckDB stopping early,
-    /// e.g. a LIMIT), which is the only teardown hook a buffering producer gets. A
-    /// query that dies before finalize never reaches this, which is why the spool also
-    /// sweeps stale directories on first use.
-    fn drop(&mut self) {
-        crate::spool::discard(&self.scope);
-    }
 }
 
 impl PartitionStream {

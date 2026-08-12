@@ -162,7 +162,7 @@ pub fn append(scope: &[u8], batch: &RecordBatch, batch_index: Option<i64>) -> Re
             }
             harden(&dir);
             let no = THREAD_NO.with(|n| *n);
-            let path = dir.join(format!("{}-{}.mrspool", std::process::id(), no));
+            let path = dir.join(format!("sink-{}-{}.mrspool", std::process::id(), no));
             match OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(f) => {
                     files.insert(scope.to_vec(), f);
@@ -182,30 +182,103 @@ pub fn append(scope: &[u8], batch: &RecordBatch, batch_index: Option<i64>) -> Re
     })
 }
 
+/// The spool files matching a prefix, sorted by name.
+///
+/// Sorted so a run is reproducible when two files hold the same batch index (only
+/// possible without indices, where arrival order is all there is).
+pub fn files_with_prefix(scope: &[u8], prefix: &str) -> Vec<PathBuf> {
+    let Some(dir) = dir(scope) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|x| x == "mrspool")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix))
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Total bytes an execution has spooled from its sinks — the input size, used to
+/// decide whether the finalize phase needs to shard (see [`crate::shard`]).
+pub fn sink_bytes(scope: &[u8]) -> u64 {
+    files_with_prefix(scope, "sink-")
+        .iter()
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Append a batch to one shard of an execution, for the finalize-phase split.
+pub fn append_shard(
+    scope: &[u8],
+    shard: usize,
+    batch: &RecordBatch,
+    batch_index: i64,
+) -> Result<()> {
+    let Some(dir) = dir(scope) else {
+        return Err(re("match_recognize: no spool directory to shard into"));
+    };
+    let payload = ipc::write_batch(batch)?;
+    let len = u32::try_from(payload.len())
+        .map_err(|_| re("match_recognize: buffered batch exceeds 4 GiB"))?;
+    let path = dir.join(format!("shard{shard}.mrspool"));
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| {
+            re(format!(
+                "match_recognize: opening {} failed: {e}",
+                path.display()
+            ))
+        })?;
+    let mut record = Vec::with_capacity(HEADER + payload.len());
+    record.extend_from_slice(&batch_index.to_le_bytes());
+    record.extend_from_slice(&len.to_le_bytes());
+    record.extend_from_slice(&payload);
+    f.write_all(&record).map_err(|e| {
+        re(format!(
+            "match_recognize: writing {} failed: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// Delete the unsharded sink files, once their rows have been written to shards.
+pub fn remove_sink_files(scope: &[u8]) {
+    for p in files_with_prefix(scope, "sink-") {
+        let _ = fs::remove_file(p);
+    }
+}
+
+/// Read one shard's batches.
+pub fn read_shard(scope: &[u8], shard: usize) -> Result<Vec<(i64, RecordBatch)>> {
+    read_files(&files_with_prefix(scope, &format!("shard{shard}.")))
+}
+
 /// Read every spooled batch of an execution, as `(batch_index, batch)` pairs.
 ///
 /// An empty or absent directory is not an error: it just means nothing was spooled
 /// (every sink fell back, or there was no input). Whether that is legitimate is
 /// decided by the sink count in [`crate::buffer::FinalizeState`].
 pub fn read_all(scope: &[u8]) -> Result<Vec<(i64, RecordBatch)>> {
-    let Some(dir) = dir(scope) else {
-        return Ok(Vec::new());
-    };
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(Vec::new());
-    };
-    // Sorted by name so a run is reproducible when two files hold the same index
-    // (only possible without batch indices, where arrival order is all there is).
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "mrspool"))
-        .collect();
-    paths.sort();
+    read_files(&files_with_prefix(scope, "sink-"))
+}
 
+/// Read a list of spool files into `(batch_index, batch)` pairs.
+pub fn read_files(paths: &[PathBuf]) -> Result<Vec<(i64, RecordBatch)>> {
     let mut out = Vec::new();
     for path in paths {
-        let bytes = fs::read(&path).map_err(|e| {
+        let bytes = fs::read(path).map_err(|e| {
             re(format!(
                 "match_recognize: reading {} failed: {e}",
                 path.display()
@@ -237,6 +310,18 @@ pub fn read_all(scope: &[u8]) -> Result<Vec<(i64, RecordBatch)>> {
         }
     }
     Ok(out)
+}
+
+/// Delete one shard's file, and the execution's directory if that was the last.
+///
+/// A sharded execution has several producers reading the same directory, so no single
+/// one may delete it — the first to finish would take the others' data with it. Each
+/// removes only its own shard and then tries the directory, which succeeds for whoever
+/// is last because `remove_dir` refuses a non-empty one.
+pub fn discard_shard(scope: &[u8], shard: usize) {
+    let Some(dir) = dir(scope) else { return };
+    let _ = fs::remove_file(dir.join(format!("shard{shard}.mrspool")));
+    let _ = fs::remove_dir(dir);
 }
 
 /// Drop this thread's handle on an execution's spool, then delete its directory.

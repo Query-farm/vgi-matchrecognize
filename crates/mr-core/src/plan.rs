@@ -248,6 +248,15 @@ impl Plan {
     ///
     /// Names are returned as written in the input schema's terms (matching is
     /// case-insensitive, as elsewhere), de-duplicated, order not significant.
+    ///
+    /// (The `partition_by` accessor below is exposed so the worker can shard buffered
+    /// rows on exactly the key this plan will group by — the two must not be able to
+    /// disagree.)
+    pub fn partition_by_columns(&self) -> &[String] {
+        &self.partition_by
+    }
+
+    /// The columns this plan reads, for projection pushdown.
     pub fn referenced_columns(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let add = |name: &str, out: &mut Vec<String>| {
