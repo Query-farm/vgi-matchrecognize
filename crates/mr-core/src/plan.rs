@@ -107,8 +107,9 @@ pub struct Plan {
     auto_classifier: bool,
     output_columns: Vec<OutputColumn>,
     /// Pattern variables followed by subset names — the labels a qualifier may name.
-    /// Held so the matcher and the emit path can index binds by label.
-    labels: Vec<String>,
+    /// Held so the matcher and the emit path can index binds by label; shared so
+    /// building a per-partition index does not copy the names.
+    labels: std::sync::Arc<[String]>,
 }
 
 impl Plan {
@@ -202,7 +203,7 @@ impl Plan {
 
         Ok(Plan {
             program,
-            labels,
+            labels: labels.into(),
             define,
             subsets,
             measures,
@@ -526,8 +527,28 @@ impl Plan {
                     .map(|ci| (ci, k.desc, k.nulls_first))
             })
             .collect::<Result<_>>()?;
-        // Stable sort by successive keys. Comparison goes through the store rather
-        // than materializing a `Value` per comparison — see `RowStore::cmp_cells`.
+        // A sort does ~n·log n comparisons over n rows, so anything paid per
+        // comparison is paid log n times per row. `cmp_cells` is a virtual call that
+        // re-locates the row in the store every time (the Arrow store binary-searches
+        // its batch offsets, twice per comparison). When every key is fixed-width,
+        // reading each key *once* into a flat vector and sorting on that is the same
+        // ordering for a fraction of the work — and it is exactly the common case,
+        // ordering by a timestamp or an id.
+        //
+        // Variable-width keys (VARCHAR, LIST) are deliberately left on `cmp_cells`:
+        // materialising them would clone every string, trading the store's in-place
+        // buffer comparison for a copy of the column.
+        // Reading the keys out costs a few allocations, so it only pays on a
+        // partition big enough to amortise them. A ten-row partition sorts in a
+        // handful of comparisons either way, and a query can have 160,000 of them.
+        if tape.len() >= MIN_ROWS_FOR_KEY_SORT
+            && keys
+                .iter()
+                .all(|&(ci, _, _)| fixed_width(&store.col_ty(ci)))
+        {
+            self.sort_tape_on_keys(store, tape, &keys);
+            return Ok(());
+        }
         tape.sort_by(|&a, &b| {
             for &(ci, desc, nulls_first) in &keys {
                 let ord = store.cmp_cells(a, b, ci, desc, nulls_first);
@@ -539,9 +560,164 @@ impl Plan {
         });
         Ok(())
     }
+
+    /// Sort by keys read once into memory, rather than fetched per comparison.
+    ///
+    /// Sorts a permutation of the tape's *positions* so the keys stay addressable by
+    /// their original position, then applies the permutation. Stable, and the
+    /// comparator is [`valops::cmp_for_sort`] — the same total order `cmp_cells`
+    /// implements, which `mr-worker/tests/sort_agreement.rs` pins the two together on.
+    fn sort_tape_on_keys(
+        &self,
+        store: &dyn RowStore,
+        tape: &mut [usize],
+        keys: &[(usize, bool, bool)],
+    ) {
+        let n = tape.len();
+        // One column of keys per order-by term, indexed by tape position.
+        let cols: Vec<KeyCol> = keys
+            .iter()
+            .map(|&(ci, _, _)| KeyCol::read(store, tape, ci))
+            .collect();
+        let mut perm: Vec<u32> = (0..n as u32).collect();
+        perm.sort_by(|&a, &b| {
+            for (col, &(_, desc, nulls_first)) in cols.iter().zip(keys) {
+                let ord = col.cmp_at(a as usize, b as usize, desc, nulls_first);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        let original: Vec<usize> = tape.to_vec();
+        for (slot, &p) in tape.iter_mut().zip(&perm) {
+            *slot = original[p as usize];
+        }
+    }
 }
 
 /// A stable key fragment for a partition value.
+/// Partition size at which reading sort keys into memory starts to pay for its
+/// allocations. Below this the per-comparison saving cannot cover them.
+const MIN_ROWS_FOR_KEY_SORT: usize = 256;
+
+/// A sort key column, read out of the store once.
+///
+/// The integer-family types get a packed representation — 8 bytes and a null flag per
+/// row instead of a 32-byte `Value` — which both halves the memory a large partition's
+/// sort needs and makes each comparison an `i64` compare rather than a match over an
+/// enum. That covers `BIGINT`, `DATE`, `TIMESTAMP` and `TIME`, which is what
+/// `ORDER BY` almost always names. Everything else fixed-width keeps its `Value`.
+enum KeyCol {
+    Ints { vals: Vec<i64>, null: Vec<bool> },
+    Vals(Vec<Value>),
+}
+
+impl KeyCol {
+    fn read(store: &dyn RowStore, tape: &[usize], ci: usize) -> KeyCol {
+        let ty = store.col_ty(ci);
+        if let Some(packed) = KeyCol::read_ints(store, tape, ci, &ty) {
+            return packed;
+        }
+        KeyCol::Vals(tape.iter().map(|&r| store.cell(r, ci)).collect())
+    }
+
+    /// Try to read the column as packed `i64`s.
+    ///
+    /// `None` if the column is not integer-family, or if any value disagrees with the
+    /// declared type — including a temporal value in a different unit, which cannot be
+    /// compared as a raw integer (that is what made `TIMESTAMP '9999-12-31'` sort
+    /// before 2020 when the rescale overflowed). Those columns fall back to the
+    /// `Value` comparator, which handles the mixed case exactly.
+    fn read_ints(store: &dyn RowStore, tape: &[usize], ci: usize, ty: &Ty) -> Option<KeyCol> {
+        if !matches!(ty, Ty::Int64 | Ty::Date | Ty::Timestamp(_) | Ty::Time(_)) {
+            return None;
+        }
+        let mut vals = Vec::with_capacity(tape.len());
+        let mut null = Vec::with_capacity(tape.len());
+        for &r in tape {
+            let raw = match (store.cell(r, ci), ty) {
+                (Value::Null, _) => None,
+                (Value::Int(v), Ty::Int64) => Some(v),
+                (Value::Date(v), Ty::Date) => Some(v as i64),
+                (Value::Timestamp(v, u), Ty::Timestamp(want)) if u == *want => Some(v),
+                (Value::Time(v, u), Ty::Time(want)) if u == *want => Some(v),
+                // Anything else: the column is not uniformly what it claims to be.
+                _ => return None,
+            };
+            match raw {
+                Some(v) => {
+                    vals.push(v);
+                    null.push(false);
+                }
+                None => {
+                    // The placeholder is never compared — `null` gates it.
+                    vals.push(0);
+                    null.push(true);
+                }
+            }
+        }
+        Some(KeyCol::Ints { vals, null })
+    }
+
+    /// Order two rows of this column. Identical to
+    /// [`valops::cmp_for_sort`](crate::engine::valops::cmp_for_sort), including the
+    /// rule that NULL placement is *absolute*: `nulls_first` says where NULLs land in
+    /// the final order, so `DESC` must not flip them.
+    fn cmp_at(&self, a: usize, b: usize, desc: bool, nulls_first: bool) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        match self {
+            KeyCol::Ints { vals, null } => match (null[a], null[b]) {
+                (true, true) => Equal,
+                (true, false) => {
+                    if nulls_first {
+                        Less
+                    } else {
+                        Greater
+                    }
+                }
+                (false, true) => {
+                    if nulls_first {
+                        Greater
+                    } else {
+                        Less
+                    }
+                }
+                (false, false) => {
+                    let ord = vals[a].cmp(&vals[b]);
+                    if desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                }
+            },
+            KeyCol::Vals(vals) => {
+                crate::engine::valops::cmp_for_sort(&vals[a], &vals[b], desc, nulls_first)
+            }
+        }
+    }
+}
+
+/// Whether a sort key of this type occupies a fixed number of bytes, so reading a
+/// column of them into memory copies no heap data.
+fn fixed_width(ty: &Ty) -> bool {
+    match ty {
+        Ty::Boolean
+        | Ty::Int64
+        | Ty::HugeInt
+        | Ty::Double
+        | Ty::Decimal(_, _)
+        | Ty::Date
+        | Ty::Timestamp(_)
+        | Ty::Time(_)
+        | Ty::Interval
+        | Ty::Null => true,
+        // A copy of these would be a copy of the column's heap data.
+        Ty::Varchar | Ty::List(_) => false,
+    }
+}
+
 fn write_key_part(out: &mut String, v: &Value) {
     match v {
         // A sentinel that no rendered value can produce, so NULL groups with NULL

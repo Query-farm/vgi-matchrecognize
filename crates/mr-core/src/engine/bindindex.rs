@@ -25,22 +25,26 @@
 //! the subset names), so `slot_of` is a short linear scan of strings rather than a
 //! hash. Interning labels as integer ids would remove even that.
 
+use std::sync::Arc;
+
 use super::eval::{Bind, SubsetMap};
 
 /// Per-label bind positions for one match.
 #[derive(Debug, Clone, Default)]
 pub struct BindIndex {
-    /// The label universe: pattern variables followed by subset names.
-    labels: Vec<String>,
+    /// The label universe: pattern variables followed by subset names. Shared
+    /// rather than copied — an index is built per partition *and* per match, and
+    /// cloning the names each time cost 7% on a query with many small partitions.
+    labels: Arc<[String]>,
     /// `lists[slot]` = ascending bind indices whose row is covered by `labels[slot]`.
     lists: Vec<Vec<u32>>,
 }
 
 impl BindIndex {
     /// An empty index over `labels`.
-    pub fn new(labels: &[String]) -> Self {
+    pub fn new(labels: &Arc<[String]>) -> Self {
         BindIndex {
-            labels: labels.to_vec(),
+            labels: Arc::clone(labels),
             lists: vec![Vec::new(); labels.len()],
         }
     }

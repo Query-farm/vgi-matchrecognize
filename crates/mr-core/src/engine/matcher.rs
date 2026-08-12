@@ -96,7 +96,7 @@ impl<'a> Matcher<'a> {
         step_budget: i64,
         partition_label: impl Into<String>,
         first_match_number: i64,
-        labels: &[String],
+        labels: &std::sync::Arc<[String]>,
     ) -> Self {
         Matcher {
             prog: &program.insts,
