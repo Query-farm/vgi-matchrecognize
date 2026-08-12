@@ -1,0 +1,95 @@
+# name: test/sql/batch_index.test
+# description: requires_input_batch_index — input order survives a parallel sink, on any source kind.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# `match_recognize` declares `requires_input_batch_index`, so DuckDB tags every
+# batch with its ordinal in the input and `buffer.rs` sorts the buffered batches by
+# it before matching. Two things have to hold: the buffered relation really is in
+# input order, and declaring the flag never fails a query.
+
+statement ok
+SET threads=8;
+
+# ---------------------------------------------------------------------------
+# Input order survives buffering.
+#
+# Rows tie on `ts` in blocks of 500, so `order_by := ['ts']` does not decide their
+# relative order — the buffered order does. `payload` equal to the output position
+# means the tape was in input order. A base table over many batches with 8 threads
+# so the sink genuinely ingests in parallel: without the flag this fails, because
+# arrival order is then whatever the threads produced (verified by flipping it).
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE ties AS SELECT i // 500 AS ts, i AS payload FROM range(60000) r(i);
+
+query I
+WITH out AS (
+  SELECT p, row_number() OVER () AS rn
+  FROM mr.match_recognize(
+         (SELECT ts, payload FROM ties),
+         order_by := ['ts'], pattern := 'A', define := '{}',
+         measures := '{"p":"A.payload"}', rows := 'all')
+)
+SELECT bool_and(p = rn - 1) FROM out;
+----
+true
+
+# ---------------------------------------------------------------------------
+# Sources that cannot supply a batch index.
+#
+# `range()` and `VALUES` are not batch-index partitionable. Asking for an index
+# anyway used to abort the pipeline inside DuckDB — an INTERNAL Error in a debug
+# build and a segfault in release — so the flag was unusable for any caller who did
+# not first materialize their input. The extension now detects this at plan time,
+# serializes the sink and numbers the batches itself, so these must simply work.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM mr.match_recognize(
+  (SELECT i AS ts FROM range(10) r(i)),
+  order_by := ['ts'], pattern := 'A', define := '{}', measures := '{"n":"COUNT(*)"}');
+----
+10
+
+query I
+SELECT count(*) FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1),(2),(3)) t(ts)),
+  order_by := ['ts'], pattern := 'A', define := '{}', measures := '{"n":"COUNT(*)"}');
+----
+3
+
+# The synthesized numbering follows ingest order on the serialized sink, so the
+# input-order guarantee holds on these sources too.
+query I
+WITH out AS (
+  SELECT p, row_number() OVER () AS rn
+  FROM mr.match_recognize(
+         (SELECT 0 AS ts, i AS payload FROM range(5000) r(i)),
+         order_by := ['ts'], pattern := 'A', define := '{}',
+         measures := '{"p":"A.payload"}', rows := 'all')
+)
+SELECT bool_and(p = rn - 1) FROM out;
+----
+true
+
+# A partitioned query over a non-partitionable source: the fallback has to survive
+# the whole plan, not just the trivial shape.
+query II
+SELECT uid, count(*) FROM mr.match_recognize(
+  (SELECT i % 3 AS uid, i AS ts FROM range(3000) r(i)),
+  partition_by := ['uid'], order_by := ['ts'],
+  pattern := 'A', define := '{}', measures := '{"n":"COUNT(*)"}')
+GROUP BY uid ORDER BY uid;
+----
+0	1000
+1	1000
+2	1000
+
+statement ok
+RESET threads;

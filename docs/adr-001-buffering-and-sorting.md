@@ -93,12 +93,14 @@ whatever order the partitions arrived.
 The other two are mutually exclusive (the extension's header says so) and both
 concern the *input*:
 
-- `requires_input_batch_index` hands us DuckDB's per-chunk batch index, which would
-  give us the true input order — enough to make tie ordering deterministic and to
-  let a future finalize stream partitions. It requires a source that can supply one,
-  which `range()` and `VALUES` cannot.
+- `requires_input_batch_index` hands us DuckDB's per-chunk batch index, giving us the
+  true input order — enough to make tie ordering deterministic and to let a future
+  finalize stream partitions. **We declare it** (`catalog.rs`); `buffer.rs` sorts the
+  buffered batches by it, and `test/sql/batch_index.test` pins the result: among rows
+  tying on the `order_by` key, output order is input order. Flipping the flag off
+  makes that test fail, which is how we know the flag is what buys it.
 
-  Declaring it used to be unusable: DuckDB asserts
+  Declaring it used to be impossible: DuckDB asserts
   `pipeline.source->SupportsPartitioning(BatchIndex())` in `PipelineExecutor`'s
   constructor, so such a query died before any extension code ran — an
   InternalException in a debug build, and a **segfault** (exit 139, no error, no
@@ -108,17 +110,14 @@ concern the *input*:
   an index, serializes the sink and numbers the batches itself, so the worker gets a
   valid monotonic index from any source and no caller has to wrap their input.
 
-  We still do not declare it here, for one reason: the fix is not in a released
-  community extension yet, so declaring it would crash for anyone on the current
-  release. Once the fixed extension ships, declaring it becomes safe and buys
-  deterministic tie ordering — at the cost of a serialized sink on sources that
-  cannot supply an index, which is why it should be weighed then rather than assumed.
-- `sink_order_dependent` forces `ParallelSink=false`, a single-threaded sink. That
-  works with any source, but ingest is ~83% of a realistic query's wall time, so it
-  trades most of the throughput for ordering.
-
-Neither price buys enough. Tie ordering is implementation-defined in SQL:2016, and
-the streaming work can verify ordering directly instead of being told about it.
+  The one cost worth naming: on a source that cannot supply an index the sink is
+  serialized, so ingest — ~83% of a realistic query's wall time — loses its
+  parallelism. Pre-materializing such input (a temp table, a parquet scan) restores
+  it. Sources that can supply an index, which is the interesting case for large
+  inputs, keep the parallel sink.
+- `sink_order_dependent` forces `ParallelSink=false` unconditionally. It works with
+  any source, but it pays that serialized-ingest cost even where a batch index was
+  available, so it buys nothing the flag above does not.
 
 ## Consequences
 
@@ -130,7 +129,7 @@ the streaming work can verify ordering directly instead of being told about it.
   (`mr-core/tests/sorting.rs`, `mr-worker/tests/sort_agreement.rs`).
 - Users with large inputs get most of the available win for free, by writing
   `ORDER BY` in the subquery they were already writing.
-- Row order among ties on the `order_by` key is arrival order, and so may vary
-  between runs when DuckDB parallelises the sink. SQL:2016 leaves it
-  implementation-defined; making it deterministic is what the batch-index flag above
-  would buy, once it is usable.
+- Row order among ties on the `order_by` key is **input order**, and stable between
+  runs. SQL:2016 leaves it implementation-defined; we pin it, because the batch index
+  makes that free. On a source that cannot supply an index the price is a serialized
+  sink — correctness never varies, only ingest throughput.

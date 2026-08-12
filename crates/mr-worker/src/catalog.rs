@@ -174,24 +174,19 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
         description: "SQL:2016 MATCH_RECOGNIZE row pattern matching over a buffered relation"
             .into(),
         tags,
+        // Ask DuckDB for its per-chunk batch index, so `buffer.rs` can put the
+        // buffered relation back into the input's order before matching. That makes
+        // the row order among ties on the `order_by` key deterministic — arrival
+        // order under a parallel sink is not — and it is the prerequisite for a
+        // finalize that streams partitions instead of materializing the relation.
+        //
+        // Safe with any source: a source that cannot supply an index (`range()`,
+        // `VALUES`) used to abort the pipeline, so the extension now serializes the
+        // sink and numbers the batches itself. See ADR 001.
+        requires_input_batch_index: true,
         // Output rows come out partition by partition, in the order the partitions
         // happened to arrive — not in the input's order, and not in `order_by`
         // order across partitions. Say so, so the planner never assumes otherwise.
-        //
-        // Ask for DuckDB's per-chunk batch index — ONE LINE, once the fixed
-        // extension ships. `buffer.rs` already restores input order from it, and
-        // `test/sql/sorting.test` proves it does; without the flag `batch_index` is
-        // None, the stable sort is a no-op, and the buffered relation stays in
-        // arrival order exactly as before. So the machinery is landed and inert.
-        //
-        // Held back only because the extension fix ("table_buffering: don't crash
-        // when the source cannot supply a batch_index") is not in a released
-        // community build yet. Until it is, declaring this fails a query on any
-        // source that cannot supply an index — and `vgi-lint` force-installs vgi
-        // from community, so the metadata gate crashes (86/100, FATAL) even with a
-        // fixed build installed locally.
-        //
-        //   requires_input_batch_index: true,
         order_preservation: Some(
             vgi::protocol::enums::order_preservation::NO_ORDER_GUARANTEE.to_string(),
         ),
