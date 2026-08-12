@@ -145,8 +145,24 @@ struct Accum {
 /// Consuming in index order also means each coalesced group is index-contiguous, which is
 /// what makes coalescing sound at all.
 ///
-/// Peak disk stays at about the size of the relation: a sink file is deleted as soon as its
-/// last record is consumed, so the shards grow as the sinks shrink.
+/// # Peak disk is the spool *plus* the shards
+///
+/// A sink file is deleted as soon as its last record is consumed — but that is the end of the
+/// pass for all of them at once, and measurement says so plainly. Sampling the spool
+/// directory through a sharded 40M-row split (a 787 MB compressed spool, 1245 MB of shards,
+/// 16 sinks, 40 shards) the linked sink bytes sit at 787 MB from the moment the spool is
+/// complete until the pass is nearly over, while the shards grow underneath them; peak temp
+/// usage is 1912 MB, about 1.5x the relation.
+///
+/// That follows from the merge order rather than from anything fixable here: indices are
+/// strided across the sinks, so consuming them in global index order drains all of them
+/// evenly and every file reaches its last record at roughly the same time. Sizing a temp
+/// volume for a query that shards means allowing for both copies.
+///
+/// Bounding the live sink bytes would take segmenting each sink into fixed-size files and
+/// chaining the segments behind one cursor, so that a segment is deleted when it is consumed
+/// rather than when its whole sink is. That is the change to make if peak disk ever has to be
+/// ~1x; it is not what this code does today.
 pub fn split(
     scope: &[u8],
     plan: &Plan,
@@ -181,11 +197,14 @@ pub fn split(
         let Some((index, batch)) = cursors[pick].next_batch()? else {
             continue;
         };
-        if cursors[pick].peek_index().is_none() {
-            // Exhausted: its rows are all in shards or in an accumulator, so the copy on
-            // disk is dead weight. Dropping it here is what keeps peak disk at ~1x.
-            crate::spool::remove_file(cursors[pick].path());
-        }
+        // Exhausted: its rows are all in shards or in an accumulator, so the copy on disk is
+        // dead weight. Take the reader out of the merge now, but hold the unlink until the
+        // end of this iteration — `batch` may still borrow the file's mapping, and a mapped
+        // file cannot be freed (nor, on Windows, deleted at all) while a reference is open.
+        let spent = cursors[pick]
+            .peek_index()
+            .is_none()
+            .then(|| cursors.remove(pick));
 
         let store = BatchRowStore::new(projected_schema.clone(), vec![batch.clone()]);
         let cols: Vec<usize> = part_cols
@@ -220,6 +239,18 @@ pub fn split(
             if accum.bytes >= per_shard_target {
                 flush(&mut writers, s, accum, projected_schema)?;
             }
+        }
+
+        // `take_rows` copied every row that was wanted, so nothing below this point reads the
+        // sink file. Release the mapping *before* unlinking, because unlinking a file that is
+        // still mapped frees nothing: sampled through the 40M-row split above, the older form
+        // (delete, keep the cursor) left ~758 MB unlinked but still allocated until `split`
+        // returned. It does not move the peak — see the header — but it does mean the space
+        // comes back when the delete happens rather than at the end of the pass.
+        if let Some(spent) = spent {
+            drop(store);
+            drop(batch);
+            crate::spool::remove_file(&spent.into_path());
         }
     }
 

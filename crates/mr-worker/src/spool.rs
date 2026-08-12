@@ -48,6 +48,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+// Only the mapped source shares a mapping between the buffers decoded from it.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -579,9 +581,15 @@ enum Source {
     ///
     /// Sound because a spool file is only ever mapped once it is complete — the split maps
     /// sink files in `combine`, after every sink has finished, and shard files are closed
-    /// before any producer opens them — and because nothing ever truncates one. Unlinking
-    /// a mapped file is fine: the inode outlives the mapping.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// before any producer opens them — and because nothing ever truncates one.
+    ///
+    /// Unlinking a mapped file is *sound* — the inode outlives the mapping — but it does not
+    /// free anything until the last reference goes, so a caller that deletes a file to
+    /// reclaim disk must drop the cursor and any batch decoded from it first
+    /// ([`RecordCursor::into_path`]).
+    ///
+    /// Unix only; see [`map_file`].
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
     Mapped { map: Arc<memmap2::Mmap>, at: usize },
     /// Read through a buffer instead, when the file cannot be mapped.
     Streamed(BufReader<File>),
@@ -620,7 +628,7 @@ impl RecordCursor {
     fn read_head(&mut self) -> Result<()> {
         let mut header = [0u8; HEADER];
         let got = match &mut self.source {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(unix, not(target_arch = "wasm32")))]
             Source::Mapped { map, at } => {
                 if *at >= map.len() {
                     false
@@ -667,13 +675,22 @@ impl RecordCursor {
         &self.path
     }
 
+    /// Close the reader and keep its name, for a caller that is about to delete the file.
+    ///
+    /// Taking the cursor by value is the point: it guarantees the mapping (or the open
+    /// handle) is gone before the unlink, which is what makes the unlink actually free the
+    /// blocks. See the deletion in [`crate::shard::split`].
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+
     /// Decode the next record, then read the following header.
     pub fn next_batch(&mut self) -> Result<Option<(i64, RecordBatch)>> {
         let Some(head) = self.head else {
             return Ok(None);
         };
         let payload: Buffer = match &mut self.source {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(all(unix, not(target_arch = "wasm32")))]
             Source::Mapped { map, at } => {
                 let start = *at + HEADER;
                 let end = start + head.stored_len;
@@ -726,9 +743,19 @@ impl RecordCursor {
     }
 }
 
-/// Map a spool file, or `None` if it cannot be mapped (including on wasm, where there is
-/// no spool at all).
-#[cfg(not(target_arch = "wasm32"))]
+/// Map a spool file, or `None` if it cannot be mapped — in which case the cursor reads it
+/// through a buffer instead, which costs a copy and about 15 ns/row.
+///
+/// Unix only, and deliberately so. Windows refuses to delete a file that has a mapping open
+/// at all (`ERROR_USER_MAPPED_FILE`), and the spool's whole cleanup discipline is to unlink
+/// a file the moment its records have been read — the split unlinks each sink as it drains
+/// it, and a producer unlinks its shard as soon as the store is built, while the decoded
+/// batches are still live. Under a mapping those deletions would fail silently there and
+/// leave the entire spool — gigabytes, for the queries that need it — on disk until the TTL
+/// sweep. A copy per record is much the cheaper side of that trade.
+///
+/// Also `None` on wasm, where there is no spool at all.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn map_file(file: &File) -> Option<Source> {
     // SAFETY: the file is complete and nothing truncates a spool file, so the mapping
     // cannot be invalidated under us. See `Source::Mapped`.
@@ -739,7 +766,7 @@ fn map_file(file: &File) -> Option<Source> {
     })
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
 fn map_file(_file: &File) -> Option<Source> {
     None
 }

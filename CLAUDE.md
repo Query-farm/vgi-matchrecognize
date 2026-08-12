@@ -77,7 +77,12 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     is file-backed, so a producer holding a whole shard can be paged rather than having to
     fit in anonymous memory. Which is why **shard records are never compressed** even when
     sink records are: borrowing beats a decompression pass into heap. Mapping is sound only
-    because a spool file is complete before it is mapped and is never truncated.
+    because a spool file is complete before it is mapped and is never truncated. **Mapping is
+    unix-only**: Windows refuses to delete a file that has a mapping open at all
+    (`ERROR_USER_MAPPED_FILE`), and cleanup here unlinks files *while* their records are being
+    read, so there a cursor reads through a buffer and pays the copy. Anywhere a file is
+    deleted to reclaim space, the cursor and any batch decoded from it must be dropped first
+    (`RecordCursor::into_path`) — unlinking a still-mapped file frees nothing.
   - `shard.rs` — splits the spool by partition key when it exceeds the finalize memory
     budget, so peak memory tracks a shard rather than the relation. It **merges the sink
     files in global batch-index order**, which is not optional: sink files carry strided
@@ -89,7 +94,10 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     win**: measured 2× wall clock for 2× less memory (the split is a second full,
     serial pass), so the default budget is high enough that ordinary queries never take
     it. Do not "optimize" it expecting a speedup — hashing was measured and is not the
-    bottleneck.
+    bottleneck. It also costs **peak disk of the spool plus the shards** (~1.5x the relation,
+    measured), and that is not fixable by deleting sinks sooner: the merge consumes strided
+    indices in global order, so every sink reaches its last record at about the same time.
+    Bounding it would take segmenting each sink and chaining the segments behind one cursor.
   - `arrow_in.rs` — a `RowStore` over the buffered `RecordBatch`es, addressed as
     one contiguous row space (deliberately **not** concatenated — a merged copy
     would double peak memory for no gain).
@@ -266,7 +274,17 @@ uv tool install haybarn-unittest
 echo "INSTALL vgi FROM community;" | uvx haybarn-cli
 ```
 `run_tests.sh` builds the worker and runs `haybarn-unittest` with
-`VGI_MATCHRECOGNIZE_WORKER` pointed at the binary.
+`VGI_MATCHRECOGNIZE_WORKER` pointed at the binary. **The `vgi` extension comes from
+haybarn**, which has builds the community repository does not — stock DuckDB on Windows gets
+a 404 for `windows_amd64`, so the e2e there has to go through `uvx haybarn-cli` /
+`haybarn-unittest`.
+
+**Platforms.** CI is Linux only, but the worker was verified by hand on Windows
+(`x86_64-pc-windows-msvc`, rustc 1.97.1 — the MSRV): fmt, `clippy -D warnings`, the release
+build, all 24 test binaries and the full SQLLogic suite (385 assertions) pass, and a sharded
+2M-row query returns bit-identical results to macOS with no spool left behind. Windows needs
+MSVC build tools (`Microsoft.VisualStudio.2022.BuildTools` with the VCTools workload) for the
+bundled SQLite. Wall clock there ran ~1.7x macOS on the same query.
 
 Metadata gate: `uvx --from vgi-lint-check vgi-lint lint
 "$PWD/target/release/vgi-matchrecognize-worker" --fail-on info` → 100/100.
