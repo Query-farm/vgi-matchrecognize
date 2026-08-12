@@ -399,6 +399,8 @@ impl TableBufferingFunction for MatchRecognize {
             store,
             tapes: tapes.into_iter(),
             output_schema: params.output_schema.clone(),
+            ready: std::collections::VecDeque::new(),
+            threads: match_threads(),
         }))
     }
 }
@@ -409,6 +411,39 @@ impl TableBufferingFunction for MatchRecognize {
 /// rows. Coalescing to a target keeps batches a sensible size while still bounding
 /// how many output rows are live at once.
 const TARGET_BATCH_ROWS: usize = 8192;
+
+/// Input rows to match ahead of what the consumer has asked for.
+///
+/// Matching runs in parallel over a *chunk* of partitions, so the chunk has to be
+/// worth the threads: too small and thread setup dominates, too large and more output
+/// rows are live at once than necessary. Sized in input rows because that is what is
+/// known before matching (output rows can be anywhere from zero to one per input row).
+const LOOKAHEAD_ROWS: usize = 8 * TARGET_BATCH_ROWS;
+
+/// Most partitions to match in one chunk, whatever their size — a bound on how many
+/// tapes are in flight when partitions are tiny.
+const MAX_CHUNK_PARTITIONS: usize = 4096;
+
+/// How many threads to match partitions on.
+///
+/// `VGI_MR_MATCH_THREADS` overrides it; 1 forces the serial path, which is what the
+/// determinism tests compare against. Defaults to the machine's parallelism, capped —
+/// the worker is one of several processes DuckDB may be running, so it should not try
+/// to own every core.
+fn match_threads() -> usize {
+    if cfg!(target_arch = "wasm32") {
+        return 1;
+    }
+    if let Some(n) = std::env::var("VGI_MR_MATCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return n.max(1);
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(1)
+}
 
 /// Streams the result, running the matcher one partition at a time and emitting
 /// batches of roughly [`TARGET_BATCH_ROWS`] rows.
@@ -424,6 +459,12 @@ struct PartitionStream {
     /// The execution's storage scope, so the local spool can be deleted when this
     /// producer goes away.
     scope: Vec<u8>,
+    /// Matched partitions waiting to be emitted, each entry one partition's rows, in
+    /// partition order. Keeping them grouped means a partition's rows stay contiguous
+    /// and a match is never split across output batches.
+    ready: std::collections::VecDeque<Vec<Vec<mr_core::value::Value>>>,
+    /// Threads to match on. Read once, so a query cannot change it midway.
+    threads: usize,
 }
 
 impl Drop for PartitionStream {
@@ -438,16 +479,88 @@ impl Drop for PartitionStream {
     }
 }
 
+impl PartitionStream {
+    /// Rows currently queued for emission.
+    fn ready_rows(&self) -> usize {
+        self.ready.iter().map(|g| g.len()).sum()
+    }
+
+    /// Match the next chunk of partitions, appending their rows to `ready`.
+    ///
+    /// Partitions are independent — `run_partition` takes an immutable plan and store,
+    /// its own tape, and MATCH_NUMBER restarts at 1 for each — so a chunk is matched
+    /// concurrently and the results are appended **in partition order**, which keeps
+    /// the output byte-identical to the serial path.
+    fn match_chunk(&mut self) -> Result<bool> {
+        let mut chunk: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut input_rows = 0usize;
+        for tape in self.tapes.by_ref() {
+            input_rows += tape.1.len();
+            chunk.push(tape);
+            if input_rows >= LOOKAHEAD_ROWS || chunk.len() >= MAX_CHUNK_PARTITIONS {
+                break;
+            }
+        }
+        if chunk.is_empty() {
+            return Ok(false);
+        }
+
+        let threads = self.threads.min(chunk.len());
+        // One thread, or too little work to be worth spawning any: stay on this one.
+        if threads <= 1 || input_rows < TARGET_BATCH_ROWS {
+            for (label, tape) in &mut chunk {
+                let mut rows = Vec::new();
+                self.plan
+                    .run_partition(&self.store, label, tape, &mut rows)
+                    .map_err(ve)?;
+                self.ready.push_back(rows);
+            }
+            return Ok(true);
+        }
+
+        // Contiguous slices, so each thread owns its tapes outright and the results
+        // land in their original positions with no synchronisation.
+        let per_thread = chunk.len().div_ceil(threads);
+        let mut slots: Vec<mr_core::error::Result<Vec<Vec<mr_core::value::Value>>>> =
+            (0..chunk.len()).map(|_| Ok(Vec::new())).collect();
+        let plan = &self.plan;
+        let store = &self.store;
+        std::thread::scope(|scope| {
+            for (out_slice, work) in slots
+                .chunks_mut(per_thread)
+                .zip(chunk.chunks_mut(per_thread))
+            {
+                scope.spawn(move || {
+                    for (slot, (label, tape)) in out_slice.iter_mut().zip(work.iter_mut()) {
+                        let mut rows = Vec::new();
+                        *slot = plan
+                            .run_partition(store, label, tape, &mut rows)
+                            .map(|()| rows);
+                    }
+                });
+            }
+        });
+        // First failure in partition order wins, so an error is reproducible.
+        for slot in slots {
+            self.ready.push_back(slot.map_err(ve)?);
+        }
+        Ok(true)
+    }
+}
+
 impl TableProducer for PartitionStream {
     fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        // Match ahead until there is a batch's worth queued, or the input is drained.
+        while self.ready_rows() < TARGET_BATCH_ROWS {
+            if !self.match_chunk()? {
+                break;
+            }
+        }
+        // Emit whole partitions: a single one may overshoot the target, which is
+        // deliberate — a match is never split across output batches.
         let mut rows: Vec<Vec<mr_core::value::Value>> = Vec::new();
-        // Consume partitions until the batch is full enough (a single partition may
-        // overshoot the target — matches are never split across batches) or the
-        // input is drained. Partitions yielding no matches simply add nothing.
-        for (label, mut tape) in self.tapes.by_ref() {
-            self.plan
-                .run_partition(&self.store, &label, &mut tape, &mut rows)
-                .map_err(ve)?;
+        while let Some(group) = self.ready.pop_front() {
+            rows.extend(group);
             if rows.len() >= TARGET_BATCH_ROWS {
                 break;
             }

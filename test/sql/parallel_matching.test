@@ -1,0 +1,55 @@
+# name: test/sql/parallel_matching.test
+# description: Matching partitions concurrently must not change a single row of the result.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# The worker matches a chunk of partitions on several threads and appends their rows
+# in partition order, so the output should be byte-identical to matching them one at a
+# time. That is easy to get wrong in a way no row count would reveal — rows from two
+# partitions interleaved, or a partition emitted twice — so this hashes the whole
+# result rather than counting it.
+#
+# Verified equal across 1, 8 and 16 matching threads. To check by hand:
+#   VGI_MR_MATCH_THREADS=1 ./run_tests.sh test/sql/parallel_matching.test
+# must produce the same hash; that variable is the only way to force the serial path.
+
+statement ok
+CREATE TABLE ticks AS SELECT i % 997 AS uid, i AS ts, (i * 7) % 97 AS price FROM range(300000) r(i);
+
+query II
+SELECT md5(string_agg(uid || ':' || ts || ':' || match_number || ':' || classifier, '|'
+                      ORDER BY uid, ts)) AS h,
+       count(*) AS n
+FROM mr.match_recognize(
+       (SELECT uid, ts, price FROM ticks),
+       partition_by := ['uid'], order_by := ['ts'], pattern := 'DOWN+ UP+',
+       define := '{"DOWN":"price < PREV(price)","UP":"price > PREV(price)"}',
+       measures := '{"n":"RUNNING COUNT(*)"}', rows := 'all');
+----
+3e8558436ea28012ab670650994a19cc	289781
+
+# A single partition holding everything: the chunking must not split it, and one
+# partition cannot be parallelised, so this is the serial path even with threads.
+query II
+SELECT count(*), sum(n)
+FROM mr.match_recognize(
+       (SELECT 0 AS uid, ts, price FROM ticks),
+       partition_by := ['uid'], order_by := ['ts'], pattern := 'DOWN+ UP+',
+       define := '{"DOWN":"price < PREV(price)","UP":"price > PREV(price)"}',
+       measures := '{"n":"FINAL COUNT(*)"}');
+----
+21649	299986
+
+# Many tiny partitions — under the size threshold that makes threading worthwhile, so
+# this exercises the serial fallback inside the parallel path.
+query I
+SELECT count(*) FROM mr.match_recognize(
+       (SELECT i AS uid, i AS ts, i AS price FROM range(2000) r(i)),
+       partition_by := ['uid'], order_by := ['ts'], pattern := 'A',
+       define := '{}', measures := '{"n":"COUNT(*)"}');
+----
+2000
