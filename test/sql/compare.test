@@ -1,0 +1,79 @@
+# name: test/sql/compare.test
+# description: SQL comparison is exact for BIGINT past 2^53, and NaN is unordered.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# f64 has 53 bits of mantissa, so 2^53 and 2^53+1 are the same float. Comparing
+# predicates through it made them equal, and this returned both rows.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 9007199254740993), (2, 9007199254740992)) AS t(id, v)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"v = 9007199254740992"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+2
+
+# Nanosecond epochs carried as BIGINT sit where the f64 spacing is 256, so
+# adjacent real timestamps compared equal and this ordering predicate never fired.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 1700000000000000000), (2, 1700000000000000001)) AS t(id, v)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"v > PREV(v)"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+2
+
+# ORDER BY and a DEFINE predicate must agree about which rows are equal. Sorting
+# compared integers exactly while the predicate compared them as floats, so a
+# strictly-increasing run looked flat to `v > PREV(v)`.
+query I
+SELECT n FROM mr.main.match_recognize(
+       (SELECT i AS id, 9007199254740992 + i AS v FROM range(0, 5) AS r(i)),
+       order_by := ['v'], pattern := 'A+',
+       define   := '{"A":"v > PREV(v) OR PREV(v) IS NULL"}',
+       measures := '{"n":"COUNT(*)"}');
+----
+5
+
+# NaN is unordered, so every comparison against it is NULL and no row binds.
+# Reporting it as Equal made `d = 1.0` true for a NaN row.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 'NaN'::DOUBLE), (2, 1.0::DOUBLE)) AS t(id, d)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"d = 1.0"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+2
+
+# ... and `<>` against NaN is NULL too, not true — the two used to disagree.
+query I
+SELECT id FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 'NaN'::DOUBLE), (2, 5.0::DOUBLE)) AS t(id, d)),
+       order_by := ['id'], pattern := 'A', after := 'to next row',
+       define   := '{"A":"d <> 1.0"}',
+       measures := '{"id":"LAST(id)"}')
+ORDER BY id;
+----
+2
+
+# MIN/MAX fold through the same comparator, so they must pick the true extreme
+# rather than the first of several values that merely looked equal.
+query II
+SELECT lo, hi FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1, 9007199254740993), (2, 9007199254740992), (3, 9007199254740994))
+          AS t(id, v)),
+       order_by := ['id'], pattern := 'A+',
+       define   := '{}',
+       measures := '{"lo":"MIN(v)","hi":"MAX(v)"}');
+----
+9007199254740992	9007199254740994

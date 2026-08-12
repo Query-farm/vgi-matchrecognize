@@ -22,9 +22,26 @@ fn unit_nanos(unit: TimeUnit) -> i64 {
     }
 }
 
-/// Total ordering comparison of two non-null values, if comparable.
+/// SQL comparison of two values: `None` means "unordered", which every caller
+/// turns into SQL NULL rather than into an ordering.
+///
+/// This is **not** a total order — see [`cmp_for_sort`] for that. NULL is
+/// unordered against everything, and so is NaN, because SQL comparison against
+/// an unknown is unknown rather than false.
+///
+/// Two things here used to be answered through `as_f64`, and both were wrong:
+///
+/// - **Integers.** `f64` has 53 bits of mantissa, so every pair of `BIGINT`s
+///   past 2^53 collapsed onto one float: `9007199254740993 = 9007199254740992`
+///   was TRUE, and `1700000000000000001 > 1700000000000000000` was FALSE.
+///   Nanosecond epochs and snowflake ids live in exactly that range. Worse, the
+///   *sort* comparator had already been fixed to compare integers exactly, so
+///   `ORDER BY` and a DEFINE predicate disagreed about whether two rows were
+///   equal. [`cmp_ints`] is now shared by both, and `tests/compare.rs`
+///   (`comparators_agree`) pins them together.
+/// - **NaN.** `partial_cmp(...).or(Some(Equal))` reported NaN as *equal to
+///   everything*, so `NaN = 1.0` was TRUE and `NaN <> 1.0` was FALSE.
 pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
     use Value::*;
     match (a, b) {
         (Null, _) | (_, Null) => None,
@@ -47,11 +64,36 @@ pub fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         } else {
             (*x as i128 * unit_nanos(*ux) as i128).cmp(&(*y as i128 * unit_nanos(*uy) as i128))
         }),
-        _ => {
-            // Numeric comparison.
-            let (x, y) = (a.as_f64()?, b.as_f64()?);
-            x.partial_cmp(&y).or(Some(Ordering::Equal))
+        // Exact within the integer family, before anything can reach `as_f64`.
+        _ => match cmp_ints(a, b) {
+            Some(ord) => Some(ord),
+            // Anything else numeric: DOUBLE, DECIMAL, and the mixed pairs.
+            // `partial_cmp` yields None for NaN, which is the right answer —
+            // unordered, hence SQL NULL.
+            None => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        },
+    }
+}
+
+/// Exact ordering within the integer family (`BIGINT` / `HUGEINT`), or `None`
+/// when either side is outside it.
+///
+/// Widening to `i128` is lossless for every `i64`, which is the whole point:
+/// `as_f64` is not, and collapses adjacent values past 2^53 onto one float.
+///
+/// Shared by [`compare`] (SQL semantics) and [`cmp_present`] (the total sort
+/// order) so the two cannot answer differently. A divergence there sorts the
+/// tape differently from what a DEFINE predicate sees, which is not a wrong
+/// output value but a wrong *match*.
+///
+/// DECIMAL against an integer is deliberately left out and still goes through
+/// `as_f64` — a pre-existing precision wart, not widened here.
+fn cmp_ints(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Int(_) | Value::HugeInt(_), Value::Int(_) | Value::HugeInt(_)) => {
+            Some(a.as_i128()?.cmp(&b.as_i128()?))
         }
+        _ => None,
     }
 }
 
@@ -323,10 +365,15 @@ pub fn cmp_for_sort(a: &Value, b: &Value, desc: bool, nulls_first: bool) -> std:
 /// Total order over two non-NULL values.
 fn cmp_present(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
+    // Exact where possible: `as_f64` would lose precision past 2^53. The
+    // integer family goes through the same helper `compare` uses, so the SQL
+    // comparison and the sort order cannot disagree about which of two rows is
+    // larger — including for a mixed `BIGINT`/`HUGEINT` pair, which these arms
+    // used to drop to `as_f64`.
+    if let Some(ord) = cmp_ints(a, b) {
+        return ord;
+    }
     match (a, b) {
-        // Exact where possible: `as_f64` would lose precision past 2^53.
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::HugeInt(x), Value::HugeInt(y)) => x.cmp(y),
         (Value::Decimal(x, sx), Value::Decimal(y, sy)) if sx == sy => x.cmp(y),
         (Value::Double(x), Value::Double(y)) => x.total_cmp(y),
         _ => match (a.as_f64(), b.as_f64()) {
