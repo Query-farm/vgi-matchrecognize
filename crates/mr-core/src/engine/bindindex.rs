@@ -45,13 +45,16 @@ impl BindIndex {
         }
     }
 
-    /// The index for a finished bind sequence, for the emit path.
-    pub fn build(labels: &[String], binds: &[Bind], subsets: &SubsetMap) -> Self {
-        let mut idx = BindIndex::new(labels);
+    /// Refill for a finished bind sequence, keeping the allocated lists.
+    ///
+    /// The emit path calls this once per match and reuses one index across the whole
+    /// partition — building a fresh one per match allocated a `Vec` per label per
+    /// match, which cost 36% on a partition of many tiny matches.
+    pub fn refill(&mut self, binds: &[Bind], subsets: &SubsetMap) {
+        self.clear();
         for (i, b) in binds.iter().enumerate() {
-            idx.push(i, &b.var, subsets);
+            self.push(i, &b.var, subsets);
         }
-        idx
     }
 
     /// Record that bind `bind_idx` bound the variable `var`.

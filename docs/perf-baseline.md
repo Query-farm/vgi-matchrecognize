@@ -81,6 +81,41 @@ Measured separately (see ADR 001); not yet part of the probe:
 Matching is single-threaded regardless of `threads`, so the only thing that scales is
 ingest — which caps the whole query at ~1.5×.
 
+## After the quadratic work — commit `94fa482`
+
+Same machine, same probes. `ns/row/L` is now ~0 for every shape, which is the whole
+point: cost per row no longer depends on how long the match is.
+
+| Shape (ns/row) | L=1,000 | L=4,000 | L=16,000 | L=32,000 | ns/row/L | vs before |
+|---|---|---|---|---|---|---|
+| control `B: k >= 0` | 106 | 74 | 71 | 68 | ~0.00 | — |
+| `B: k >= A.k` | 88 | 85 | 84 | 85 | **0.00** | **600×** at L=32k |
+| control `RUNNING COUNT(*)` | 162 | 159 | 173 | — | ~0.01 | — |
+| `RUNNING SUM(k)` | 201 | 190 | 188 | — | **0.01** | **1,230×** at L=16k |
+| `LAST(k)` | 137 | 137 | 132 | — | **0.01** | **830×** at L=16k |
+| `FINAL SUM(k)` | 163 | 156 | 157 | — | **0.01** | **2,900×** at L=16k |
+
+A qualified reference now costs the same as reading a plain column, and a running
+aggregate costs about what `COUNT(*)` costs. Extrapolating the old 1.9 ns/row/L line,
+a 1M-row match with one `A.k` reference went from ~30 minutes to roughly 0.1 s.
+
+Matcher throughput over the same period (1M rows, ns/row), which is where the
+allocation work shows up:
+
+| Shape | baseline | now |
+|---|---|---|
+| never matches (VM floor) | 64 | **52** |
+| `A` — one match per row | 142 | 131–164 |
+| `A+` — one match, ONE ROW | 84 | **65** |
+| `A+` — one match, ALL ROWS | 142 | **135** |
+| v-shape, `PREV` predicates | 105 | 108 |
+
+Two regressions were found and fixed while measuring rather than shipped: building the
+per-label index fresh per match cost 36% on a partition of many tiny matches (fixed by
+reusing one index per partition), and memoizing `COUNT(*)` — already O(1) — added two
+hash lookups per output row (fixed by not memoizing it). The v-shape is ~3% down on
+the index's per-bind push cost, which interning labels should return.
+
 ## Compiler-flag experiment
 
 `opt-level` and LTO, measured on `perf_matcher` (two runs each, single-threaded):

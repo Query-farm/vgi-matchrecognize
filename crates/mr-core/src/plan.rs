@@ -310,6 +310,9 @@ impl Plan {
             &self.labels,
         );
         let matches = matcher.find_all()?;
+        // One index for the whole partition, refilled per match: the lists keep their
+        // capacity, so a partition of many short matches pays no per-match allocation.
+        let mut index = crate::engine::BindIndex::new(&self.labels);
         for m in &matches {
             if m.binds.is_empty() {
                 // An empty match produces exactly one output row (SQL:2016 SHOW
@@ -325,7 +328,7 @@ impl Plan {
             }
             // Both emit paths resolve `LAST(label)` repeatedly, so index this
             // match's binds by label once instead of scanning it per lookup.
-            let index = crate::engine::BindIndex::build(&self.labels, &m.binds, &self.subsets);
+            index.refill(&m.binds, &self.subsets);
             if self.rows_all {
                 // One memo per match: the accumulators describe this bind sequence.
                 let memo = crate::engine::AggMemo::new();

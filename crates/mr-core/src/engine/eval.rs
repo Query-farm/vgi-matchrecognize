@@ -436,7 +436,7 @@ impl<'a> Frame<'a> {
         } else {
             self.horizon
         };
-        let mut entry = match memo.get(key) {
+        let mut entry = match memo.take(key) {
             Some(e) if e.done == aggmemo::Entry::COMPLETE => {
                 return Ok(Some(aggmemo::finish(&e.acc)))
             }

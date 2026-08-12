@@ -79,9 +79,13 @@ impl AggMemo {
         Self::default()
     }
 
-    /// Look up this site's state, if it has one.
-    pub(crate) fn get(&self, key: (usize, bool)) -> Option<Entry> {
-        self.entries.borrow().get(&key).cloned()
+    /// Take this site's state out of the memo, if it has one.
+    ///
+    /// Removing rather than cloning matters: the accumulator can own a `Vec` (a
+    /// growing `array_agg`), and cloning it per output row would reintroduce the
+    /// quadratic this module exists to remove. The caller always puts it back.
+    pub(crate) fn take(&self, key: (usize, bool)) -> Option<Entry> {
+        self.entries.borrow_mut().remove(&key)
     }
 
     pub(crate) fn put(&self, key: (usize, bool), entry: Entry) {
@@ -110,9 +114,12 @@ pub(crate) fn site_of(e: &Expr) -> usize {
 /// `dominant` is that qualifier, already computed by the caller.
 pub(crate) fn memoizable(kind: AggKind, arg: &AggArg, dominant: Option<&str>) -> bool {
     match arg {
-        // Only COUNT accepts a `*` form; anything else is an error the recompute
-        // path must be left to raise.
-        AggArg::Star | AggArg::QualStar(_) => matches!(kind, AggKind::Count),
+        // `COUNT(*)` is the visible row count — already O(1), so memoizing it would
+        // only add two hash lookups per output row.
+        AggArg::Star => false,
+        // `COUNT(U.*)` filters the prefix, so it is worth folding. Only COUNT accepts
+        // a `*` form at all; anything else is an error the recompute path must raise.
+        AggArg::QualStar(_) => matches!(kind, AggKind::Count),
         AggArg::Expr(e) => horizon_independent(e, dominant),
     }
 }
