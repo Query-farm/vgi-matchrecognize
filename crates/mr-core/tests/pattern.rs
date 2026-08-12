@@ -182,11 +182,23 @@ fn unbounded_quantifier_over_nullable_rejected() {
 
 #[test]
 fn compiles_to_program_with_match_terminator() {
-    let prog = compile(&p("A B")).unwrap();
+    let pat = p("A B");
+    // Compiling resolves each pattern variable to its id in the plan's label set,
+    // so the VM never carries label strings.
+    let labels = mr_core::engine::LabelSet::new(pat.variables(), &[]);
+    let prog = compile(&pat, &labels).unwrap();
     assert!(matches!(
         prog.insts.last(),
         Some(mr_core::pattern::compile::Inst::Match)
     ));
+    // `A` and `B` are the first two ids, in declaration order.
+    assert_eq!(
+        prog.insts.first(),
+        Some(&mr_core::pattern::compile::Inst::Char(0))
+    );
+    assert!(prog
+        .insts
+        .contains(&mr_core::pattern::compile::Inst::Char(1)));
 }
 
 #[test]

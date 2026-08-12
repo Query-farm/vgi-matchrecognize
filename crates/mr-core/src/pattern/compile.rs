@@ -6,13 +6,18 @@
 //! quantifiers differ only in the order of the two `Split` targets.
 
 use super::parser::{Anchor, Pattern};
-use crate::error::Result;
+use crate::engine::labels::{LabelSet, VarId};
+use crate::error::{MrError, Result};
 
 /// A backtracking-VM instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inst {
     /// Consume one row that satisfies `DEFINE[var]`, binding it to `var`.
-    Char(String),
+    ///
+    /// The label is an id into the plan's [`LabelSet`], not a name: the VM executes
+    /// this instruction once per tentative binding, and carrying a `String` here
+    /// meant an allocation per step.
+    Char(VarId),
     /// Try the first target; on failure, try the second.
     Split(usize, usize),
     /// Unconditional jump.
@@ -31,11 +36,15 @@ pub struct Program {
     pub insts: Vec<Inst>,
 }
 
-struct Compiler {
+struct Compiler<'a> {
     insts: Vec<Inst>,
+    labels: &'a LabelSet,
+    /// The first label the set did not know, if any. Recorded rather than returned
+    /// so `emit` can stay infallible and recursive.
+    missing: Option<String>,
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn here(&self) -> usize {
         self.insts.len()
     }
@@ -45,7 +54,14 @@ impl Compiler {
             Pattern::Empty => {}
             Pattern::Anchor(Anchor::Start) => self.insts.push(Inst::AnchorStart),
             Pattern::Anchor(Anchor::End) => self.insts.push(Inst::AnchorEnd),
-            Pattern::Var(v) => self.insts.push(Inst::Char(v.clone())),
+            Pattern::Var(v) => match self.labels.id_of(v) {
+                Some(id) => self.insts.push(Inst::Char(id)),
+                None => {
+                    if self.missing.is_none() {
+                        self.missing = Some(v.clone());
+                    }
+                }
+            },
             Pattern::Concat(items) => {
                 for it in items {
                     self.emit(it);
@@ -133,9 +149,18 @@ impl Compiler {
 }
 
 /// Compile a [`Pattern`] AST into a [`Program`] (terminated by `Match`).
-pub fn compile(pat: &Pattern) -> Result<Program> {
-    let mut c = Compiler { insts: Vec::new() };
+pub fn compile(pat: &Pattern, labels: &LabelSet) -> Result<Program> {
+    let mut c = Compiler {
+        insts: Vec::new(),
+        labels,
+        missing: None,
+    };
     c.emit(pat);
+    if let Some(name) = c.missing {
+        return Err(MrError::Bind(format!(
+            "internal: pattern variable '{name}' is missing from the label set"
+        )));
+    }
     c.insts.push(Inst::Match);
     Ok(Program { insts: c.insts })
 }

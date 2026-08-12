@@ -6,11 +6,10 @@
 //! recursion, so match length is bounded by the step budget rather than by the OS
 //! stack: a single match may span millions of rows.
 
-use std::collections::HashMap;
-
 use super::aggmemo::AggMemo;
 use super::bindindex::BindIndex;
-use super::eval::{Bind, Frame, SubsetMap};
+use super::eval::{Bind, Frame};
+use super::labels::{LabelSet, VarId};
 use super::rowstore::RowStore;
 use crate::error::{MrError, Result};
 use crate::expr::ast::Expr;
@@ -25,9 +24,9 @@ pub enum AfterSkip {
     /// Resume at the row after the match start (overlapping matches).
     ToNextRow,
     /// Resume at the first row bound to the named variable.
-    ToFirstVar(String),
+    ToFirstVar(VarId),
     /// Resume at the last row bound to the named variable.
-    ToLastVar(String),
+    ToLastVar(VarId),
 }
 
 /// A successful match within a partition.
@@ -60,8 +59,10 @@ pub struct Matcher<'a> {
     prog: &'a [Inst],
     store: &'a dyn RowStore,
     tape: &'a [usize],
-    define: &'a HashMap<String, Expr>,
-    subsets: &'a SubsetMap,
+    /// DEFINE predicates indexed by label id; `None` means "always true", the
+    /// standard's default for an undefined variable.
+    define: &'a [Option<Expr>],
+    labels: &'a LabelSet,
     after: &'a AfterSkip,
     budget: i64,
     partition_label: String,
@@ -90,20 +91,19 @@ impl<'a> Matcher<'a> {
         program: &'a Program,
         store: &'a dyn RowStore,
         tape: &'a [usize],
-        define: &'a HashMap<String, Expr>,
-        subsets: &'a SubsetMap,
+        define: &'a [Option<Expr>],
+        labels: &'a LabelSet,
         after: &'a AfterSkip,
         step_budget: i64,
         partition_label: impl Into<String>,
         first_match_number: i64,
-        labels: &std::sync::Arc<[String]>,
     ) -> Self {
         Matcher {
             prog: &program.insts,
             store,
             tape,
             define,
-            subsets,
+            labels,
             after,
             budget: step_budget,
             partition_label: partition_label.into(),
@@ -170,16 +170,6 @@ impl<'a> Matcher<'a> {
         self.agg_memo.clear();
     }
 
-    /// Whether a row bound to `bound` is covered by `label` — the same variable,
-    /// or a SUBSET that lists it.
-    fn label_covers(&self, label: &str, bound: &str) -> bool {
-        label == bound
-            || self
-                .subsets
-                .get(label)
-                .is_some_and(|ms| ms.iter().any(|m| m == bound))
-    }
-
     fn skip_target(&self, start: usize, m: &Match) -> Result<usize> {
         let pos = match self.after {
             AfterSkip::PastLastRow => m.end,
@@ -187,14 +177,14 @@ impl<'a> Matcher<'a> {
             AfterSkip::ToFirstVar(v) => m
                 .binds
                 .iter()
-                .find(|b| self.label_covers(v, &b.var))
+                .find(|b| self.labels.covers(*v, b.var))
                 .map(|b| b.tape_pos)
                 .unwrap_or(m.end),
             AfterSkip::ToLastVar(v) => m
                 .binds
                 .iter()
                 .rev()
-                .find(|b| self.label_covers(v, &b.var))
+                .find(|b| self.labels.covers(*v, b.var))
                 .map(|b| b.tape_pos)
                 .unwrap_or(m.end),
         };
@@ -268,12 +258,12 @@ impl<'a> Matcher<'a> {
                     if pos >= self.tape.len() {
                         false
                     } else {
-                        self.label_index.push(binds.len(), var, self.subsets);
+                        self.label_index.push(binds.len(), *var, self.labels);
                         binds.push(Bind {
                             tape_pos: pos,
-                            var: var.clone(),
+                            var: *var,
                         });
-                        if self.predicate_holds(var, binds)? {
+                        if self.predicate_holds(*var, binds)? {
                             ip += 1;
                             pos += 1;
                             true
@@ -306,8 +296,8 @@ impl<'a> Matcher<'a> {
         }
     }
 
-    fn predicate_holds(&self, var: &str, binds: &[Bind]) -> Result<bool> {
-        let expr = match self.define.get(var) {
+    fn predicate_holds(&self, var: VarId, binds: &[Bind]) -> Result<bool> {
+        let expr = match self.define.get(var as usize).and_then(|e| e.as_ref()) {
             Some(e) => e,
             // Undefined variables default to "always true" (SQL standard).
             None => return Ok(true),
@@ -318,7 +308,7 @@ impl<'a> Matcher<'a> {
             binds,
             horizon: binds.len(),
             match_number: self.match_number,
-            subsets: self.subsets,
+            labels: self.labels,
             label_index: Some(&self.label_index),
             // Sound because every path that shrinks `binds` also clears this; see
             // `invalidate_aggs`.

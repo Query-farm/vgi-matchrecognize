@@ -7,6 +7,7 @@
 
 use super::aggmemo::{self, AggMemo};
 use super::bindindex::BindIndex;
+use super::labels::{LabelSet, VarId};
 use super::rowstore::RowStore;
 use super::valops;
 use crate::error::{MrError, Result};
@@ -15,10 +16,13 @@ use crate::value::{Interval, Value};
 
 /// One matched row: its position on the partition tape and the variable it
 /// matched.
-#[derive(Debug, Clone)]
+///
+/// `Copy`, and small: the matcher pushes one of these per tentative binding, so a
+/// heap-allocated label here cost an allocation per VM step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bind {
     pub tape_pos: usize,
-    pub var: String,
+    pub var: VarId,
 }
 
 /// An evaluation frame: the store, the partition tape (sorted row indices), the
@@ -30,9 +34,9 @@ pub struct Frame<'a> {
     /// Number of binds visible under RUNNING semantics (current index + 1).
     pub horizon: usize,
     pub match_number: i64,
-    /// SUBSET name -> member variables. A qualifier naming a subset matches any
-    /// of its members, so `U.price` and `COUNT(U.*)` range over all of them.
-    pub subsets: &'a SubsetMap,
+    /// The plan's labels: id <-> name, plus which variables each SUBSET covers, so
+    /// `U.price` and `COUNT(U.*)` range over all of them.
+    pub labels: &'a LabelSet,
     /// Where each label was last bound, so `LAST(A.x)` is a lookup rather than a
     /// backwards scan of the match. `None` falls back to the scan.
     pub label_index: Option<&'a BindIndex>,
@@ -43,15 +47,12 @@ pub struct Frame<'a> {
     pub agg_memo: Option<&'a AggMemo>,
 }
 
-/// SUBSET declarations: union-variable name -> the pattern variables it covers.
-pub type SubsetMap = std::collections::HashMap<String, Vec<String>>;
-
 impl<'a> Frame<'a> {
     /// Evaluate a measure expression. `final_default` is FINAL for ONE ROW PER
     /// MATCH, RUNNING for ALL ROWS PER MATCH (overridable per-subexpr).
     pub fn eval_measure(&self, e: &Expr, final_default: bool) -> Result<Value> {
         match self.horizon.checked_sub(1).and_then(|i| self.binds.get(i)) {
-            Some(cur) => self.eval(e, cur.tape_pos, Some(cur.var.as_str()), final_default),
+            Some(cur) => self.eval(e, cur.tape_pos, Some(cur.var), final_default),
             // An empty match binds no rows, so it has no current row: every
             // row-dependent reference is NULL (see `is_empty_match`). The tape
             // position passed here is never read.
@@ -71,7 +72,7 @@ impl<'a> Frame<'a> {
     /// Evaluate a DEFINE predicate (always RUNNING; current = last bind).
     pub fn eval_predicate(&self, e: &Expr) -> Result<Value> {
         let cur = &self.binds[self.horizon - 1];
-        self.eval(e, cur.tape_pos, Some(cur.var.as_str()), false)
+        self.eval(e, cur.tape_pos, Some(cur.var), false)
     }
 
     fn visible(&self, final_sem: bool) -> &[Bind] {
@@ -88,23 +89,21 @@ impl<'a> Frame<'a> {
     /// is strictly increasing in `tape_pos`. This is on the hot path — every
     /// PREV/NEXT evaluation calls it — so a linear scan here made a DEFINE
     /// predicate like `x <= PREV(x) + 1` quadratic in the match length.
-    fn var_at_tp(&self, tp: usize, final_sem: bool) -> Option<String> {
+    fn var_at_tp(&self, tp: usize, final_sem: bool) -> Option<VarId> {
         let binds = self.visible(final_sem);
         binds
             .binary_search_by_key(&tp, |b| b.tape_pos)
             .ok()
-            .map(|i| binds[i].var.clone())
+            .map(|i| binds[i].var)
     }
 
-    /// Whether a row bound to `bound` is covered by the label `label` — either the
-    /// same variable, or a SUBSET that lists it.
-    fn label_covers(&self, label: &str, bound: &str) -> bool {
-        if label == bound {
-            return true;
-        }
-        self.subsets
-            .get(label)
-            .is_some_and(|members| members.iter().any(|m| m == bound))
+    /// Whether a row bound to `bound` is covered by the written label `label` —
+    /// either the same variable, or a SUBSET that lists it. `false` when the plan
+    /// does not know the label at all, which binding has already ruled out.
+    fn label_covers(&self, label: &str, bound: VarId) -> bool {
+        self.labels
+            .id_of(label)
+            .is_some_and(|id| self.labels.covers(id, bound))
     }
 
     /// The last visible bind covered by `label` (logical `LAST` of that label).
@@ -114,15 +113,13 @@ impl<'a> Frame<'a> {
     /// of a long match is the whole match, on every evaluation.
     fn last_bind_labelled(&self, label: &str, final_sem: bool) -> Option<&Bind> {
         let visible = self.visible(final_sem);
-        if let Some(idx) = self.label_index.filter(|ix| ix.knows(label)) {
+        let id = self.labels.id_of(label)?;
+        if let Some(idx) = self.label_index {
             return idx
-                .last_before(label, visible.len())
+                .last_before(id, visible.len())
                 .and_then(|i| visible.get(i));
         }
-        visible
-            .iter()
-            .rev()
-            .find(|b| self.label_covers(label, &b.var))
+        visible.iter().rev().find(|b| self.labels.covers(id, b.var))
     }
 
     /// Tape position of the last visible row bound to `var` (logical `LAST`).
@@ -142,7 +139,7 @@ impl<'a> Frame<'a> {
         &self,
         e: &Expr,
         cur_tp: usize,
-        cur_var: Option<&str>,
+        cur_var: Option<VarId>,
         final_sem: bool,
     ) -> Result<Value> {
         match e {
@@ -192,21 +189,21 @@ impl<'a> Frame<'a> {
             // navigation has pinned `cur_var` to a qualifier.
             Expr::Classifier(None) => Ok(self
                 .var_at_tp(cur_tp, final_sem)
-                .or_else(|| cur_var.map(|v| v.to_string()))
-                .map(Value::Str)
+                .or(cur_var)
+                .map(|id| Value::Str(self.labels.name(id).to_string()))
                 .unwrap_or(Value::Null)),
             // `CLASSIFIER(label)`: the last visible row covered by that label.
             Expr::Classifier(Some(label)) => {
                 // Inside a FIRST/LAST/aggregate scope walk the row is already
                 // pinned to a member of the label, so report that row.
                 if let Some(v) = self.var_at_tp(cur_tp, final_sem) {
-                    if self.label_covers(label, &v) {
-                        return Ok(Value::Str(v));
+                    if self.label_covers(label, v) {
+                        return Ok(Value::Str(self.labels.name(v).to_string()));
                     }
                 }
                 Ok(self
                     .last_bind_labelled(label, final_sem)
-                    .map(|b| Value::Str(b.var.clone()))
+                    .map(|b| Value::Str(self.labels.name(b.var).to_string()))
                     .unwrap_or(Value::Null))
             }
             Expr::MatchNumber => Ok(Value::Int(self.match_number)),
@@ -378,8 +375,13 @@ impl<'a> Frame<'a> {
                         // Pin `cur_var` to the qualifier so reading a qualified
                         // column at the navigated row is a physical read, rather
                         // than resolving to LAST all over again.
-                        let v = dominant_qualifier(read).or_else(|| self.var_at_tp(tp, sem));
-                        self.eval(read, tp, v.as_deref(), sem)
+                        // The qualifier written in the expression wins, so a
+                        // qualified read at the navigated row stays a physical read;
+                        // otherwise use whatever that row is actually bound to.
+                        let v = dominant_qualifier(read)
+                            .and_then(|q| self.labels.id_of(&q))
+                            .or_else(|| self.var_at_tp(tp, sem));
+                        self.eval(read, tp, v, sem)
                     }
                     _ => Ok(Value::Null),
                 }
@@ -391,8 +393,8 @@ impl<'a> Frame<'a> {
                 let from_end = matches!(kind, NavKind::Last);
                 match self.scope_nth(qual.as_deref(), final_sem, offset, from_end) {
                     Some(b) => {
-                        let (tp, var) = (b.tape_pos, b.var.clone());
-                        self.eval(arg, tp, Some(var.as_str()), final_sem)
+                        let (tp, var) = (b.tape_pos, b.var);
+                        self.eval(arg, tp, Some(var), final_sem)
                     }
                     None => Ok(Value::Null),
                 }
@@ -465,7 +467,7 @@ impl<'a> Frame<'a> {
                 // variable covers. There is no value to fold in either case.
                 AggArg::Star => aggmemo::count_row(&mut entry.acc),
                 AggArg::QualStar(v) => {
-                    if self.label_covers(v, &b.var) {
+                    if self.label_covers(v, b.var) {
                         aggmemo::count_row(&mut entry.acc);
                     }
                 }
@@ -473,11 +475,11 @@ impl<'a> Frame<'a> {
                     // The same scope filter `scope()` applies: an aggregate ranges
                     // over the rows its dominant qualifier covers.
                     let in_scope = match &qual {
-                        Some(v) => self.label_covers(v, &b.var),
+                        Some(v) => self.label_covers(v, b.var),
                         None => true,
                     };
                     if in_scope {
-                        let v = self.eval(e, b.tape_pos, Some(b.var.as_str()), final_sem)?;
+                        let v = self.eval(e, b.tape_pos, Some(b.var), final_sem)?;
                         // Every aggregate skips NULLs, and COUNT(expr) counts the
                         // non-NULL values.
                         if !v.is_null() {
@@ -500,7 +502,7 @@ impl<'a> Frame<'a> {
             (AggKind::Count, AggArg::QualStar(var)) => {
                 let n = visible
                     .iter()
-                    .filter(|b| self.label_covers(var, &b.var))
+                    .filter(|b| self.label_covers(var, b.var))
                     .count();
                 Ok(Value::Int(n as i64))
             }
@@ -511,13 +513,13 @@ impl<'a> Frame<'a> {
                 // The recompute path, for shapes `aggmemo` declines. Still no
                 // materialized scope: only the surviving values are collected.
                 let qual = dominant_qualifier(e);
-                let rows: Vec<(usize, String)> = self
+                let rows: Vec<Bind> = self
                     .scope_iter(qual.as_deref(), final_sem)
-                    .map(|b| (b.tape_pos, b.var.clone()))
+                    .copied()
                     .collect();
                 let mut vals: Vec<Value> = Vec::new();
-                for (tp, var) in &rows {
-                    let v = self.eval(e, *tp, Some(var.as_str()), final_sem)?;
+                for b in &rows {
+                    let v = self.eval(e, b.tape_pos, Some(b.var), final_sem)?;
                     if !v.is_null() {
                         vals.push(v);
                     }
@@ -551,7 +553,7 @@ impl<'a> Frame<'a> {
         final_sem: bool,
     ) -> impl Iterator<Item = &'s Bind> + 's {
         self.visible(final_sem).iter().filter(move |b| match qual {
-            Some(v) => self.label_covers(v, &b.var),
+            Some(v) => self.label_covers(v, b.var),
             None => true,
         })
     }
@@ -579,11 +581,11 @@ impl<'a> Frame<'a> {
             Some(v) if from_end => visible
                 .iter()
                 .rev()
-                .filter(|b| self.label_covers(v, &b.var))
+                .filter(|b| self.label_covers(v, b.var))
                 .nth(n),
             Some(v) => visible
                 .iter()
-                .filter(|b| self.label_covers(v, &b.var))
+                .filter(|b| self.label_covers(v, b.var))
                 .nth(n),
         }
     }

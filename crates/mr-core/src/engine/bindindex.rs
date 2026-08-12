@@ -18,33 +18,26 @@
 //!   [`BindIndex::truncate`] pops the tails. The horizon there is always the whole
 //!   prefix, so the answer is the last element of a list.
 //! - **While emitting**, the binds are already final and the horizon ascends through
-//!   the match, so the lists are [`BindIndex::build`]-ed once and queried with a
+//!   the match, so the lists are [`BindIndex::refill`]-ed once and queried with a
 //!   binary search bounded by the horizon.
 //!
-//! Lookups are by label *name* against a small universe (the pattern variables plus
-//! the subset names), so `slot_of` is a short linear scan of strings rather than a
-//! hash. Interning labels as integer ids would remove even that.
+//! Lookups are by [`VarId`], so finding a label's list is an array index.
 
-use std::sync::Arc;
-
-use super::eval::{Bind, SubsetMap};
+use super::eval::Bind;
+use super::labels::{LabelSet, VarId};
 
 /// Per-label bind positions for one match.
 #[derive(Debug, Clone, Default)]
 pub struct BindIndex {
-    /// The label universe: pattern variables followed by subset names. Shared
-    /// rather than copied — an index is built per partition *and* per match, and
-    /// cloning the names each time cost 7% on a query with many small partitions.
-    labels: Arc<[String]>,
-    /// `lists[slot]` = ascending bind indices whose row is covered by `labels[slot]`.
+    /// `lists[label]` = ascending bind indices whose row that label covers.
+    /// Indexed by [`VarId`], so a lookup is an array index.
     lists: Vec<Vec<u32>>,
 }
 
 impl BindIndex {
-    /// An empty index over `labels`.
-    pub fn new(labels: &Arc<[String]>) -> Self {
+    /// An empty index over a plan's labels.
+    pub fn new(labels: &LabelSet) -> Self {
         BindIndex {
-            labels: Arc::clone(labels),
             lists: vec![Vec::new(); labels.len()],
         }
     }
@@ -54,10 +47,10 @@ impl BindIndex {
     /// The emit path calls this once per match and reuses one index across the whole
     /// partition — building a fresh one per match allocated a `Vec` per label per
     /// match, which cost 36% on a partition of many tiny matches.
-    pub fn refill(&mut self, binds: &[Bind], subsets: &SubsetMap) {
+    pub fn refill(&mut self, binds: &[Bind], labels: &LabelSet) {
         self.clear();
         for (i, b) in binds.iter().enumerate() {
-            self.push(i, &b.var, subsets);
+            self.push(i, b.var, labels);
         }
     }
 
@@ -65,15 +58,11 @@ impl BindIndex {
     ///
     /// Appends to that variable's list and to every subset that lists it, which is
     /// what makes a union variable's `LAST` as cheap as a plain one's.
-    pub fn push(&mut self, bind_idx: usize, var: &str, subsets: &SubsetMap) {
+    pub fn push(&mut self, bind_idx: usize, var: VarId, labels: &LabelSet) {
         let i = bind_idx as u32;
-        for (slot, label) in self.labels.iter().enumerate() {
-            let covers = label == var
-                || subsets
-                    .get(label)
-                    .is_some_and(|ms| ms.iter().any(|m| m == var));
-            if covers {
-                self.lists[slot].push(i);
+        for label in 0..self.lists.len() as VarId {
+            if labels.covers(label, var) {
+                self.lists[label as usize].push(i);
             }
         }
     }
@@ -96,28 +85,16 @@ impl BindIndex {
         }
     }
 
-    /// The slot for `label`, if it is in the universe.
-    fn slot_of(&self, label: &str) -> Option<usize> {
-        self.labels.iter().position(|l| l == label)
-    }
-
     /// The greatest recorded bind index for `label` that is below `horizon`.
     ///
     /// `None` means the label has no visible bind — which is a real answer (an
     /// unbound qualifier reads as NULL), not a lookup failure. A label outside the
     /// universe also gives `None`; callers that must distinguish the two use
     /// [`BindIndex::knows`].
-    pub fn last_before(&self, label: &str, horizon: usize) -> Option<usize> {
-        let slot = self.slot_of(label)?;
-        let list = &self.lists[slot];
+    pub fn last_before(&self, label: VarId, horizon: usize) -> Option<usize> {
+        let list = self.lists.get(label as usize)?;
         // Ascending, so the answer is the element before the first one >= horizon.
         let cut = list.partition_point(|&i| (i as usize) < horizon);
         cut.checked_sub(1).map(|i| list[i] as usize)
-    }
-
-    /// Whether this index tracks `label` at all, so a caller can tell "no visible
-    /// bind" from "not indexed" and fall back rather than answer wrongly.
-    pub fn knows(&self, label: &str) -> bool {
-        self.slot_of(label).is_some()
     }
 }

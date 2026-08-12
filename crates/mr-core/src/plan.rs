@@ -7,8 +7,9 @@
 
 use std::collections::HashMap;
 
+use crate::engine::labels::{LabelSet, VarId};
 use crate::engine::matcher::{AfterSkip, Matcher};
-use crate::engine::{Frame, RowStore, SubsetMap};
+use crate::engine::{Frame, RowStore};
 use crate::error::{MrError, Result};
 use crate::expr::ast::{AggArg, Expr};
 use crate::expr::parser::{parse as parse_expr, parse_type_name};
@@ -92,8 +93,8 @@ pub struct OutputColumn {
 /// A fully bound, executable plan.
 pub struct Plan {
     program: Program,
-    define: HashMap<String, Expr>,
-    subsets: SubsetMap,
+    /// DEFINE predicates indexed by label id. `None` = undefined, i.e. always true.
+    define: Vec<Option<Expr>>,
     measures: Vec<Measure>,
     partition_by: Vec<String>,
     order_by: Vec<OrderKey>,
@@ -106,29 +107,38 @@ pub struct Plan {
     /// Auto `classifier` column emitted (ALL ROWS, not shadowed by a measure).
     auto_classifier: bool,
     output_columns: Vec<OutputColumn>,
-    /// Pattern variables followed by subset names — the labels a qualifier may name.
-    /// Held so the matcher and the emit path can index binds by label; shared so
-    /// building a per-partition index does not copy the names.
-    labels: std::sync::Arc<[String]>,
+    /// The labels a qualifier may name — pattern variables then subset names — with
+    /// their ids and subset membership. Everything downstream carries ids.
+    labels: LabelSet,
 }
 
 impl Plan {
     /// Bind-time: parse, type-check, and compute the output column layout.
     pub fn build(cfg: &PlanConfig, schema: &dyn BindSchema) -> Result<Plan> {
         let pattern = parse_pattern(&cfg.pattern)?;
-        let program = compile(&pattern)?;
         let vars = pattern.variables();
 
         // SUBSET. Union variables are usable anywhere a pattern variable is, so
         // the label universe that DEFINE/MEASURES resolve against is the pattern
         // variables plus the subset names.
         let subsets = parse_subsets(&cfg.subset_json, &vars)?;
-        let mut labels = vars.clone();
+        let mut labels: Vec<String> = vars.clone();
         labels.extend(subsets.keys().cloned());
+        // Ids are assigned here, once, and everything downstream uses them.
+        let mut subset_members: Vec<(String, Vec<String>)> = subsets.into_iter().collect();
+        subset_members.sort_by(|a, b| a.0.cmp(&b.0));
+        let label_set = LabelSet::new(labels.clone(), &subset_members);
+        let program = compile(&pattern, &label_set)?;
 
         // DEFINE. Only real pattern variables may be defined, but a predicate may
         // reference subsets.
-        let define = parse_define(&cfg.define_json, &vars, &labels)?;
+        let define_map = parse_define(&cfg.define_json, &vars, &labels)?;
+        let mut define: Vec<Option<Expr>> = vec![None; label_set.len()];
+        for (name, expr) in define_map {
+            if let Some(id) = label_set.id_of(&name) {
+                define[id as usize] = Some(expr);
+            }
+        }
 
         // MEASURES.
         let measures = parse_measures(cfg.measures_json.as_deref(), schema, &labels)?;
@@ -155,7 +165,7 @@ impl Plan {
         }
 
         // AFTER MATCH SKIP.
-        let after = parse_after(&cfg.after, &labels)?;
+        let after = parse_after(&cfg.after, &labels, &label_set)?;
 
         if cfg.step_budget.is_some_and(|b| b <= 0) {
             return Err(MrError::Bind("step_budget must be positive".into()));
@@ -203,9 +213,8 @@ impl Plan {
 
         Ok(Plan {
             program,
-            labels: labels.into(),
+            labels: label_set,
             define,
-            subsets,
             measures,
             partition_by: cfg.partition_by.clone(),
             order_by,
@@ -252,7 +261,7 @@ impl Plan {
         for k in &self.order_by {
             add(&k.col, &mut out);
         }
-        for e in self.define.values() {
+        for e in self.define.iter().flatten() {
             collect_columns(e, &mut out);
         }
         for m in &self.measures {
@@ -302,13 +311,12 @@ impl Plan {
             store,
             tape,
             &self.define,
-            &self.subsets,
+            &self.labels,
             &self.after,
             self.step_budget
                 .unwrap_or_else(|| auto_step_budget(tape.len())),
             label,
             1,
-            &self.labels,
         );
         let matches = matcher.find_all()?;
         // One index for the whole partition, refilled per match: the lists keep their
@@ -329,7 +337,7 @@ impl Plan {
             }
             // Both emit paths resolve `LAST(label)` repeatedly, so index this
             // match's binds by label once instead of scanning it per lookup.
-            index.refill(&m.binds, &self.subsets);
+            index.refill(&m.binds, &self.labels);
             if self.rows_all {
                 // One memo per match: the accumulators describe this bind sequence.
                 let memo = crate::engine::AggMemo::new();
@@ -356,7 +364,7 @@ impl Plan {
             binds: &m.binds,
             horizon: m.binds.len(),
             match_number: m.match_number,
-            subsets: &self.subsets,
+            labels: &self.labels,
             label_index: Some(index),
             // A single output row has no later rows to share a fold with.
             agg_memo: None,
@@ -389,7 +397,7 @@ impl Plan {
             binds: &m.binds,
             horizon: 0,
             match_number: m.match_number,
-            subsets: &self.subsets,
+            labels: &self.labels,
             // Nothing is bound, so there is nothing to index.
             label_index: None,
             agg_memo: None,
@@ -434,7 +442,7 @@ impl Plan {
             binds: &m.binds,
             horizon: k + 1,
             match_number: m.match_number,
-            subsets: &self.subsets,
+            labels: &self.labels,
             label_index: Some(index),
             // `k` ascends through the match, so the horizon only ever advances and
             // each aggregate can extend its fold by the one newly visible bind.
@@ -452,7 +460,7 @@ impl Plan {
             row.push(Value::Int(m.match_number));
         }
         if self.auto_classifier {
-            row.push(Value::Str(m.binds[k].var.clone()));
+            row.push(Value::Str(self.labels.name(m.binds[k].var).to_string()));
         }
         for meas in &self.measures {
             let v = frame.eval_measure(&meas.expr, false)?;
@@ -824,7 +832,7 @@ fn parse_order_key(spec: &str, schema: &dyn BindSchema) -> Result<OrderKey> {
     })
 }
 
-fn parse_after(s: &str, vars: &[String]) -> Result<AfterSkip> {
+fn parse_after(s: &str, vars: &[String], labels: &LabelSet) -> Result<AfterSkip> {
     let t = s.trim().to_ascii_lowercase();
     let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
     if t == "past last row" {
@@ -833,15 +841,12 @@ fn parse_after(s: &str, vars: &[String]) -> Result<AfterSkip> {
     if t == "to next row" {
         return Ok(AfterSkip::ToNextRow);
     }
-    let resolve = |var: &str| -> Result<String> {
+    let resolve = |var: &str| -> Result<VarId> {
         let v = resolve_var(var, vars).unwrap_or_else(|| var.to_ascii_uppercase());
-        if vars.iter().any(|x| x.eq_ignore_ascii_case(&v)) {
-            Ok(v)
-        } else {
-            Err(MrError::Bind(format!(
-                "after: '{var}' is not a pattern variable"
-            )))
-        }
+        labels
+            .id_of(&v)
+            .filter(|_| vars.iter().any(|x| x.eq_ignore_ascii_case(&v)))
+            .ok_or_else(|| MrError::Bind(format!("after: '{var}' is not a pattern variable")))
     };
     if let Some(rest) = t.strip_prefix("to first ") {
         return Ok(AfterSkip::ToFirstVar(resolve(rest.trim())?));
@@ -1012,14 +1017,14 @@ pub fn subset_names(subset_json: &str) -> Result<Vec<String>> {
 }
 
 /// Parse the `subset` argument: `{"U": ["A", "B"], …}`.
-fn parse_subsets(json: &str, vars: &[String]) -> Result<SubsetMap> {
+fn parse_subsets(json: &str, vars: &[String]) -> Result<HashMap<String, Vec<String>>> {
     let trimmed = json.trim();
     if trimmed.is_empty() {
-        return Ok(SubsetMap::new());
+        return Ok(HashMap::new());
     }
     let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(trimmed)
         .map_err(|e| MrError::Bind(format!("subset is not a JSON object: {e}")))?;
-    let mut out = SubsetMap::new();
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for (name, v) in map {
         // A subset name canonicalizes like any label, and must not collide with a
         // pattern variable (it would be ambiguous in a qualifier).
