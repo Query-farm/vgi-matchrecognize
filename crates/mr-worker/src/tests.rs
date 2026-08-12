@@ -154,3 +154,71 @@ fn memory_backend_is_refused_only_when_phases_can_be_separate_processes() {
         assert!(storage_backend_ok(backend, false).is_ok(), "{backend:?}");
     }
 }
+
+/// A NULL element in a `VARCHAR[]` argument is rejected the same way whichever
+/// string width DuckDB happened to build the list with.
+///
+/// The two arms had drifted: `Utf8` raised, while `LargeUtf8` read the NULL as
+/// `""` and carried on, so `partition_by := ['a', NULL]` was either an error or
+/// a phantom empty column name depending on nothing the user controls.
+#[test]
+fn a_null_in_a_varchar_list_argument_is_refused_at_either_width() {
+    use arrow_array::builder::{LargeStringBuilder, ListBuilder, StringBuilder};
+    use vgi::arguments::Arguments;
+
+    // Utf8 (i32 offsets).
+    let mut narrow = ListBuilder::new(StringBuilder::new());
+    narrow.values().append_value("a");
+    narrow.values().append_null();
+    narrow.append(true);
+    // LargeUtf8 (i64 offsets).
+    let mut wide = ListBuilder::new(LargeStringBuilder::new());
+    wide.values().append_value("a");
+    wide.values().append_null();
+    wide.append(true);
+
+    for (label, array) in [
+        ("Utf8", Arc::new(narrow.finish()) as arrow_array::ArrayRef),
+        (
+            "LargeUtf8",
+            Arc::new(wide.finish()) as arrow_array::ArrayRef,
+        ),
+    ] {
+        let mut args = Arguments::default();
+        args.named.insert("partition_by".to_string(), array);
+        let err = crate::match_recognize::named_str_list(&args, "partition_by")
+            .expect_err("a NULL element must be refused");
+        assert!(
+            err.to_string().contains("must not contain NULL"),
+            "{label}: {err}"
+        );
+    }
+}
+
+/// And a list with no NULLs reads identically at both widths.
+#[test]
+fn a_varchar_list_argument_reads_the_same_at_either_width() {
+    use arrow_array::builder::{LargeStringBuilder, ListBuilder, StringBuilder};
+    use vgi::arguments::Arguments;
+
+    let mut narrow = ListBuilder::new(StringBuilder::new());
+    narrow.values().append_value("sym");
+    narrow.values().append_value("ts");
+    narrow.append(true);
+    let mut wide = ListBuilder::new(LargeStringBuilder::new());
+    wide.values().append_value("sym");
+    wide.values().append_value("ts");
+    wide.append(true);
+
+    for array in [
+        Arc::new(narrow.finish()) as arrow_array::ArrayRef,
+        Arc::new(wide.finish()) as arrow_array::ArrayRef,
+    ] {
+        let mut args = Arguments::default();
+        args.named.insert("order_by".to_string(), array);
+        assert_eq!(
+            crate::match_recognize::named_str_list(&args, "order_by").unwrap(),
+            vec!["sym".to_string(), "ts".to_string()]
+        );
+    }
+}

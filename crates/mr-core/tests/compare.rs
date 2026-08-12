@@ -420,3 +420,47 @@ fn scalar_functions_inherit_exact_comparison() {
         big
     );
 }
+
+// --- decimal scale corners -------------------------------------------------
+
+/// Arrow permits a negative DECIMAL scale (a `DECIMAL(p, -2)` counts hundreds),
+/// which `10i128.pow(scale as u32)` turned into a ~4e9 exponent and a panic.
+/// `format_decimal` had always read `scale <= 0` as "already integral", so the
+/// divisor is 1 and the value passes through.
+#[test]
+fn a_negative_decimal_scale_does_not_panic() {
+    use mr_core::engine::valops::coerce;
+    // CAST(DECIMAL(p,-2) AS BIGINT): the unscaled value is the answer.
+    assert_eq!(
+        coerce(Value::Decimal(1234, -2), &Ty::Int64).unwrap(),
+        Value::Int(1234)
+    );
+    // ... and through the rounding functions, which shared the same expression.
+    for f in ["ceil", "floor", "round"] {
+        assert_eq!(
+            mr_core::engine::scalar::call(f, &[Value::Decimal(1234, -2)]).unwrap(),
+            Value::Decimal(1234, -2),
+            "{f} of a negative-scale decimal"
+        );
+    }
+    // Scale 0 is the ordinary integral case and behaves the same way.
+    assert_eq!(
+        coerce(Value::Decimal(7, 0), &Ty::Int64).unwrap(),
+        Value::Int(7)
+    );
+}
+
+/// The ordinary positive-scale path is unchanged.
+#[test]
+fn a_positive_decimal_scale_still_divides() {
+    use mr_core::engine::valops::coerce;
+    // 123.45 -> 123
+    assert_eq!(
+        coerce(Value::Decimal(12_345, 2), &Ty::Int64).unwrap(),
+        Value::Int(123)
+    );
+    assert_eq!(
+        mr_core::engine::scalar::call("ceil", &[Value::Decimal(12_345, 2)]).unwrap(),
+        Value::Decimal(12_400, 2)
+    );
+}

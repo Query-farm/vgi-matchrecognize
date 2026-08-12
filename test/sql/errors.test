@@ -74,3 +74,21 @@ SELECT * FROM mr.main.match_recognize(
        order_by := ['ts'], pattern := 'A B', define := '{"B":"prcie < PREV(price)"}');
 ----
 unknown column 'prcie'
+
+# A bounded quantifier is expanded by copying its body, so the repeat counts
+# multiply. Nothing bounded that: A{100000000} was an allocation failure that
+# killed the worker rather than an error that failed the query.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1)) AS t(ts)),
+       order_by := ['ts'], pattern := 'A{100000000}', define := '{}');
+----
+instruction limit
+
+# Nesting multiplies, so each level looks reasonable while the product does not.
+statement error
+SELECT * FROM mr.main.match_recognize(
+       (SELECT * FROM (VALUES (1)) AS t(ts)),
+       order_by := ['ts'], pattern := '((A{1000}){1000}){1000}', define := '{}');
+----
+instruction limit

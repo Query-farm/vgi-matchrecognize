@@ -38,7 +38,7 @@ fn ve(e: impl std::fmt::Display) -> RpcError {
 }
 
 /// Read a named VARCHAR[] argument into a `Vec<String>` (empty if absent/NULL).
-fn named_str_list(args: &Arguments, name: &str) -> Result<Vec<String>> {
+pub(crate) fn named_str_list(args: &Arguments, name: &str) -> Result<Vec<String>> {
     let Some(arr) = args.named(name) else {
         return Ok(Vec::new());
     };
@@ -50,22 +50,25 @@ fn named_str_list(args: &Arguments, name: &str) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     let inner = list.value(0);
-    let mut out = Vec::new();
-    if let Some(s) = inner.as_string_opt::<i32>() {
-        for i in 0..s.len() {
-            if s.is_null(i) {
-                return Err(ve(format!("argument '{name}' must not contain NULL")));
-            }
-            out.push(s.value(i).to_string());
-        }
+    // Both string widths, read identically. They used to differ: the `i32` arm
+    // rejected a NULL element while the `i64` arm silently turned it into `""`,
+    // so `partition_by := ['a', NULL]` was an error or a phantom column name
+    // depending only on how wide DuckDB happened to make the list.
+    let elems: Vec<Option<String>> = if let Some(s) = inner.as_string_opt::<i32>() {
+        (0..s.len())
+            .map(|i| (!s.is_null(i)).then(|| s.value(i).to_string()))
+            .collect()
     } else if let Some(s) = inner.as_string_opt::<i64>() {
-        for i in 0..s.len() {
-            out.push(s.value(i).to_string());
-        }
+        (0..s.len())
+            .map(|i| (!s.is_null(i)).then(|| s.value(i).to_string()))
+            .collect()
     } else {
         return Err(ve(format!("argument '{name}' must be a VARCHAR[] list")));
-    }
-    Ok(out)
+    };
+    elems
+        .into_iter()
+        .map(|e| e.ok_or_else(|| ve(format!("argument '{name}' must not contain NULL"))))
+        .collect()
 }
 
 /// Assemble the [`PlanConfig`] from the call arguments.

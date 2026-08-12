@@ -36,12 +36,30 @@ pub struct Program {
     pub insts: Vec<Inst>,
 }
 
+/// Ceiling on a compiled program's size.
+///
+/// A bounded quantifier is expanded by *copying* its body, so the instruction
+/// count is the product of the repeat counts around it — and nothing bounded
+/// those. `A{100000}` compiled to 100,001 instructions, and
+/// `((A{1000}){1000}){1000}` to 10^9, which is an allocation failure rather
+/// than an error: the process dies instead of the query. `MAX_DEPTH` guards the
+/// parser's recursion and `MAX_PERMUTE_ARGS` guards the factorial expansion;
+/// this is the third way a short pattern string can turn into something huge.
+///
+/// A million instructions is ~24 MB, far above any real pattern — `A{1000}`
+/// costs 1001 — so this only ever fires on input that was going to fail anyway.
+const MAX_PROGRAM_INSTS: usize = 1_000_000;
+
 struct Compiler<'a> {
     insts: Vec<Inst>,
     labels: &'a LabelSet,
     /// The first label the set did not know, if any. Recorded rather than returned
     /// so `emit` can stay infallible and recursive.
     missing: Option<String>,
+    /// Set once the program outgrew [`MAX_PROGRAM_INSTS`]. Recorded rather than
+    /// returned for the same reason as `missing`, and checked at the top of
+    /// `emit` so an expansion already in flight stops immediately.
+    too_big: bool,
 }
 
 impl Compiler<'_> {
@@ -49,7 +67,24 @@ impl Compiler<'_> {
         self.insts.len()
     }
 
+    /// Whether `n` more instructions would exceed the ceiling; records the
+    /// failure if so, so callers can simply stop.
+    fn would_overflow(&mut self, n: usize) -> bool {
+        if self.too_big {
+            return true;
+        }
+        if self.insts.len().saturating_add(n) > MAX_PROGRAM_INSTS {
+            self.too_big = true;
+        }
+        self.too_big
+    }
+
     fn emit(&mut self, node: &Pattern) {
+        // Stop the moment the budget is gone: an outer quantifier may be part
+        // way through copying a body, and every nested level is still looping.
+        if self.would_overflow(1) {
+            return;
+        }
         match node {
             Pattern::Empty => {}
             Pattern::Anchor(Anchor::Start) => self.insts.push(Inst::AnchorStart),
@@ -104,6 +139,15 @@ impl Compiler<'_> {
     }
 
     fn emit_quant(&mut self, inner: &Pattern, min: usize, max: Option<usize>, greedy: bool) {
+        // Reject the count itself before looping over it. The per-`emit` check
+        // would stop the *output* growing, but `A{4000000000}` would still spin
+        // through four billion no-op iterations to get there — each copy of the
+        // body is at least one instruction, so the count alone is a lower bound
+        // on the program size.
+        let copies = max.unwrap_or(min).max(min);
+        if self.would_overflow(copies) {
+            return;
+        }
         // `min` mandatory copies.
         for _ in 0..min {
             self.emit(inner);
@@ -113,6 +157,9 @@ impl Compiler<'_> {
             Some(m) => {
                 for _ in 0..(m - min) {
                     self.emit_opt(inner, greedy);
+                    if self.too_big {
+                        return;
+                    }
                 }
             }
         }
@@ -154,8 +201,16 @@ pub fn compile(pat: &Pattern, labels: &LabelSet) -> Result<Program> {
         insts: Vec::new(),
         labels,
         missing: None,
+        too_big: false,
     };
     c.emit(pat);
+    if c.too_big {
+        return Err(MrError::Pattern(format!(
+            "pattern compiles to more than the {MAX_PROGRAM_INSTS}-instruction limit; a bounded \
+             quantifier is expanded by copying its body, so the repeat counts multiply — use \
+             smaller bounds, or an unbounded '*'/'+' where the exact count does not matter"
+        )));
+    }
     if let Some(name) = c.missing {
         return Err(MrError::Bind(format!(
             "internal: pattern variable '{name}' is missing from the label set"

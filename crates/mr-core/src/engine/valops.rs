@@ -191,6 +191,23 @@ pub fn to_string(v: &Value) -> String {
     }
 }
 
+/// `10^scale` as the divisor that turns an unscaled decimal into a whole number.
+///
+/// `scale` is an `i8` and Arrow permits it to be negative (a `DECIMAL(p, -2)`
+/// counts hundreds), which `10i128.pow(scale as u32)` turned into a ~4e9
+/// exponent and a panic. A non-positive scale means the unscaled value is
+/// *already* integral or larger, so the divisor is 1 — the same reading
+/// `format_decimal` has always had for `scale <= 0`.
+///
+/// Clamped at 38, the widest DECIMAL Arrow can carry, so the exponent cannot
+/// overflow i128 either.
+pub(crate) fn pow10(scale: i8) -> i128 {
+    if scale <= 0 {
+        return 1;
+    }
+    10i128.pow(scale.min(38) as u32)
+}
+
 fn format_decimal(unscaled: i128, scale: i8) -> String {
     if scale <= 0 {
         return unscaled.to_string();
@@ -477,7 +494,7 @@ pub fn coerce(v: Value, ty: &Ty) -> Result<Value> {
             Value::Int(_) => Ok(v),
             Value::HugeInt(i) => Ok(Value::Int(*i as i64)),
             Value::Double(d) => Ok(Value::Int(*d as i64)),
-            Value::Decimal(u, s) => Ok(Value::Int((*u / 10i128.pow(*s as u32)) as i64)),
+            Value::Decimal(u, s) => Ok(Value::Int((*u / pow10(*s)) as i64)),
             Value::Bool(b) => Ok(Value::Int(*b as i64)),
             Value::Str(s) => s
                 .trim()

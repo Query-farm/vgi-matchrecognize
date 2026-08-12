@@ -197,12 +197,24 @@ fn to_decimal(v: &Value, scale: i8) -> Option<i128> {
     }
 }
 
+/// Move an unscaled decimal between scales, saturating rather than wrapping.
+///
+/// Scaling *up* can leave i128 — `DECIMAL(38, 0)` widened to scale 10 needs 48
+/// digits — and this multiplied unchecked, so it wrapped to an unrelated (often
+/// negative) value in release. There is no honest answer for a value that does
+/// not fit the target scale, and this sits under `Option`-returning builders
+/// where the column is already NULL-able, so saturating keeps it out of range
+/// visibly instead of silently landing somewhere plausible.
+///
+/// The exponents are bounded by Arrow's 38-digit maximum, so `pow` itself
+/// cannot overflow; the guard is on the multiply.
 fn rescale(unscaled: i128, from: i8, to: i8) -> i128 {
     use std::cmp::Ordering::*;
+    let shift = |n: i8| 10i128.pow(n.clamp(0, 38) as u32);
     match from.cmp(&to) {
         Equal => unscaled,
-        Less => unscaled * 10i128.pow((to - from) as u32),
-        Greater => unscaled / 10i128.pow((from - to) as u32),
+        Less => unscaled.saturating_mul(shift(to - from)),
+        Greater => unscaled / shift(from - to),
     }
 }
 

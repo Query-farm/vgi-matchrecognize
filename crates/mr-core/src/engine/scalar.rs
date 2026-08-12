@@ -191,7 +191,11 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
                     _ => d.round(),
                 })),
                 Value::Decimal(v, s) => {
-                    let scale = 10i128.pow(*s as u32);
+                    // `pow10` rather than `10i128.pow(*s as u32)`: Arrow allows a
+                    // negative scale, which that cast turned into a ~4e9 exponent
+                    // and a panic. A non-positive scale is already integral, so
+                    // the divisor is 1 and the value passes through unrounded.
+                    let scale = super::valops::pow10(*s);
                     let q = v / scale;
                     let r = v % scale;
                     let adj = match name {

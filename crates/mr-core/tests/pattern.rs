@@ -207,3 +207,57 @@ fn explain_renders() {
     assert!(s.contains("START"));
     assert!(s.contains("greedy"));
 }
+
+// --- program size ----------------------------------------------------------
+//
+// A bounded quantifier is expanded by copying its body, so the instruction
+// count is the product of the repeat counts around it. Nothing bounded that:
+// `A{100000}` compiled to 100,001 instructions and `((A{1000}){1000}){1000}` to
+// 10^9, which is an allocation failure — the process dies rather than the query.
+
+fn compile_src(src: &str) -> mr_core::error::Result<usize> {
+    let pat = mr_core::pattern::parse(src)?;
+    let labels = mr_core::engine::labels::LabelSet::new(pat.variables(), &[]);
+    Ok(mr_core::pattern::compile::compile(&pat, &labels)?
+        .insts
+        .len())
+}
+
+#[test]
+fn an_ordinary_quantifier_still_compiles() {
+    // The cap must sit far above anything a person would write.
+    assert_eq!(compile_src("A{3}").unwrap(), 4);
+    assert_eq!(compile_src("A{1000}").unwrap(), 1001);
+    assert!(compile_src("(A|B){500}").is_ok());
+}
+
+#[test]
+fn a_huge_quantifier_is_a_clean_error() {
+    let err = compile_src("A{100000000}").unwrap_err();
+    assert!(
+        matches!(err, mr_core::error::MrError::Pattern(ref m) if m.contains("instruction limit")),
+        "expected a clean pattern error, got {err:?}"
+    );
+}
+
+/// The count alone is rejected before the loop runs, so an absurd bound cannot
+/// spin through billions of no-op iterations on its way to the ceiling.
+#[test]
+fn an_absurd_quantifier_bound_fails_promptly() {
+    let err = compile_src("A{4000000000}").unwrap_err();
+    assert!(
+        matches!(err, mr_core::error::MrError::Pattern(_)),
+        "got {err:?}"
+    );
+}
+
+/// Nesting multiplies, so each level is individually reasonable while the
+/// product is not — this is the shape a per-quantifier limit would miss.
+#[test]
+fn nested_quantifiers_multiply_into_the_cap() {
+    let err = compile_src("((A{1000}){1000}){1000}").unwrap_err();
+    assert!(
+        matches!(err, mr_core::error::MrError::Pattern(ref m) if m.contains("instruction limit")),
+        "expected a clean pattern error, got {err:?}"
+    );
+}
