@@ -437,8 +437,13 @@ impl<'a> Frame<'a> {
             self.horizon
         };
         let mut entry = match memo.take(key) {
+            // Already complete: read it and put it straight back. `take` removes the
+            // entry, so returning early without re-inserting would make every later
+            // row re-fold the whole match — the quadratic, restored by accident.
             Some(e) if e.done == aggmemo::Entry::COMPLETE => {
-                return Ok(Some(aggmemo::finish(&e.acc)))
+                let out = aggmemo::finish(&e.acc);
+                memo.put(key, e);
+                return Ok(Some(out));
             }
             Some(e) if e.done <= self.horizon => e,
             // Either nothing folded yet, or the horizon moved backwards.

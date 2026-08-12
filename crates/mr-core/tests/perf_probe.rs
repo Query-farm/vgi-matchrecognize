@@ -263,7 +263,7 @@ fn perf_matcher() {
 #[ignore = "perf measurement; run with --release --ignored"]
 fn perf_match_length() {
     // `sum` at L=32k is ~15s on its own, so the aggregate cases stop at 16k.
-    let cases: [(&str, &str, &str, bool, &[usize]); 6] = [
+    let cases: [(&str, &str, &str, bool, &[usize]); 7] = [
         // Control: predicate reads the row only.
         (
             "control:  B: k >= 0            (ONE ROW)",
@@ -310,6 +310,16 @@ fn perf_match_length() {
             "{\"B\":\"k >= 0\"}",
             r#"{"n":"FINAL SUM(k)"}"#,
             true,
+            &[1_000, 4_000, 16_000],
+        ),
+        // An aggregate inside DEFINE is evaluated once per VM step, during matching,
+        // so it is the matcher's own quadratic (and it runs under backtracking, where
+        // an extend-only fold has to be invalidated rather than extended).
+        (
+            "agg in DEFINE:  B: SUM(k) >= 0 (ONE ROW)",
+            "{\"B\":\"SUM(k) >= 0\"}",
+            r#"{"n":"COUNT(*)"}"#,
+            false,
             &[1_000, 4_000, 16_000],
         ),
     ];

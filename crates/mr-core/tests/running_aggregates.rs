@@ -253,12 +253,16 @@ fn aggregate_over_navigation_stays_correct() {
     assert_eq!(out, sums(&[0, -1, -3, -6, -10]));
 }
 
-/// The point of the whole exercise: a long match must be linear. This runs a
-/// 20,000-row match with a RUNNING and a FINAL aggregate, which cost ~5.7 billion
-/// fold steps before the incremental path and now cost ~40,000.
+/// The point of the whole exercise: a long match must be linear.
+///
+/// A 40,000-row match with a RUNNING and a FINAL aggregate. Recomputing each row's
+/// aggregate from scratch would be ~1.6 billion fold steps; extending the fold makes
+/// it 40,000. This has already earned its keep twice — it is what caught the FINAL
+/// entry being removed from the memo and never put back, which silently restored the
+/// quadratic (9.6s here, against 0.02s now).
 #[test]
 fn long_match_running_aggregate_is_linear() {
-    let n = 20_000usize;
+    let n = 40_000usize;
     let vs: Vec<Option<i64>> = (1..=n as i64).map(Some).collect();
     let out = measure("A+", "{}", "", r#"{"n":"RUNNING SUM(v)"}"#, &vs);
     assert_eq!(out.len(), n);
@@ -275,4 +279,42 @@ fn long_match_running_aggregate_is_linear() {
 
     let fin = measure("A+", "{}", "", r#"{"n":"FINAL SUM(v)"}"#, &vs);
     assert!(fin.iter().all(|v| *v == Value::HugeInt(total as i128)));
+}
+
+/// An aggregate inside DEFINE is evaluated during *matching*, where the bind
+/// sequence shrinks as well as grows — so its incremental state has to be discarded
+/// whenever the matcher gives a row back, not extended.
+///
+/// `A+ B` over 5,5,5 with `B: SUM(A.v) = 10`: greedy A takes all three rows (sum 15)
+/// and B has no row left, so it fails; unwinding one row leaves A = 5,5 (sum 10) and
+/// B on row 3, where the predicate holds. An accumulator carried over from the
+/// abandoned path would still say 15, B would fail again, and there would be no match
+/// at all.
+#[test]
+fn define_aggregate_is_refolded_after_backtracking() {
+    let cfg = PlanConfig {
+        pattern: "A+ B".into(),
+        define_json: r#"{"A":"v > 0","B":"SUM(A.v) = 10"}"#.into(),
+        subset_json: String::new(),
+        measures_json: Some(r#"{"n":"COUNT(*)","sa":"FINAL SUM(A.v)"}"#.into()),
+        partition_by: vec![],
+        order_by: vec!["id".into()],
+        rows_all: false,
+        omit_empty_matches: false,
+        after: "past last row".into(),
+        step_budget: Some(50_000_000),
+    };
+    let sch = Sch {
+        cols: [("id".to_string(), Ty::Int64), ("v".to_string(), Ty::Int64)]
+            .into_iter()
+            .collect(),
+        labels: ["A", "B"].iter().map(|s| s.to_string()).collect(),
+    };
+    let out = Plan::build(&cfg, &sch)
+        .unwrap()
+        .run(&store(&[Some(5), Some(5), Some(5)]))
+        .unwrap();
+    assert_eq!(out.len(), 1, "the unwound path should match");
+    assert_eq!(out[0][0], Value::Int(3), "all three rows are in the match");
+    assert_eq!(out[0][1], Value::HugeInt(10), "two A rows, not three");
 }

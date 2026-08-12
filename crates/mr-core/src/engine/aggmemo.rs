@@ -91,6 +91,16 @@ impl AggMemo {
     pub(crate) fn put(&self, key: (usize, bool), entry: Entry) {
         self.entries.borrow_mut().insert(key, entry);
     }
+
+    /// Discard every partial fold.
+    ///
+    /// The matcher calls this wherever `binds` shrinks. An accumulator describes a
+    /// specific bind sequence, and after backtracking the same prefix length may hold
+    /// *different* rows — so a fold cannot be trusted, or un-done, only rebuilt.
+    /// Keeps the map's capacity, since it is refilled immediately.
+    pub fn clear(&self) {
+        self.entries.borrow_mut().clear();
+    }
 }
 
 /// The identity of an aggregate site: the address of its `Expr` node.

@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use super::aggmemo::AggMemo;
 use super::bindindex::BindIndex;
 use super::eval::{Bind, Frame, SubsetMap};
 use super::rowstore::RowStore;
@@ -71,6 +72,15 @@ pub struct Matcher<'a> {
     /// Where each label is currently bound, maintained in lockstep with `binds` so a
     /// DEFINE predicate referencing `A.x` does not scan the match to find `A`.
     label_index: BindIndex,
+    /// Incremental state for aggregates that appear in DEFINE predicates, which are
+    /// evaluated once per VM step and so are the matcher's own quadratic.
+    ///
+    /// Only valid while `binds` grows. Backtracking un-binds rows an accumulator has
+    /// already absorbed, and the path taken next may bind *different* rows to the same
+    /// prefix length, so a fold cannot be un-done — it is discarded and rebuilt (see
+    /// `invalidate_aggs`). A greedy run that consumes rows without giving any back —
+    /// the shape where the quadratic actually bites — never triggers that.
+    agg_memo: AggMemo,
 }
 
 impl<'a> Matcher<'a> {
@@ -100,6 +110,7 @@ impl<'a> Matcher<'a> {
             match_number: first_match_number,
             stack: Vec::new(),
             label_index: BindIndex::new(labels),
+            agg_memo: AggMemo::new(),
         }
     }
 
@@ -128,6 +139,7 @@ impl<'a> Matcher<'a> {
         while i < self.tape.len() {
             binds.clear();
             self.label_index.clear();
+            self.invalidate_aggs();
             let res = self.run(i, &mut binds)?;
             match res {
                 Some(end) => {
@@ -150,6 +162,12 @@ impl<'a> Matcher<'a> {
             }
         }
         Ok(matches)
+    }
+
+    /// Drop every partially folded aggregate. Called wherever `binds` shrinks: the
+    /// accumulators describe a bind sequence that no longer exists.
+    fn invalidate_aggs(&mut self) {
+        self.agg_memo.clear();
     }
 
     /// Whether a row bound to `bound` is covered by `label` — the same variable,
@@ -262,6 +280,7 @@ impl<'a> Matcher<'a> {
                         } else {
                             binds.pop();
                             self.label_index.truncate(binds.len());
+                            self.invalidate_aggs();
                             false
                         }
                     }
@@ -274,10 +293,12 @@ impl<'a> Matcher<'a> {
                         pos = alt.pos;
                         binds.truncate(alt.binds_len);
                         self.label_index.truncate(alt.binds_len);
+                        self.invalidate_aggs();
                     }
                     None => {
                         binds.truncate(base);
                         self.label_index.truncate(base);
+                        self.invalidate_aggs();
                         return Ok(None);
                     }
                 }
@@ -299,11 +320,9 @@ impl<'a> Matcher<'a> {
             match_number: self.match_number,
             subsets: self.subsets,
             label_index: Some(&self.label_index),
-            // Backtracking moves the horizon in both directions, so an extend-only
-            // fold would be unsound here: a popped alternative un-binds rows that an
-            // accumulator has already absorbed. DEFINE aggregates therefore still
-            // recompute (see the plan's W5).
-            agg_memo: None,
+            // Sound because every path that shrinks `binds` also clears this; see
+            // `invalidate_aggs`.
+            agg_memo: Some(&self.agg_memo),
         };
         let v = frame.eval_predicate(expr)?;
         Ok(matches!(v, Value::Bool(true)))
