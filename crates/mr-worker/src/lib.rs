@@ -13,6 +13,7 @@
 //!   define:=, measures:=, rows:=, after:=)` — row pattern matching (table-in/out)
 //! - `mr.main.explain_pattern(p)` — pretty-print a compiled pattern (no data)
 
+pub mod args;
 pub mod arrow_in;
 mod arrow_out;
 pub mod buffer;

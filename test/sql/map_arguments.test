@@ -1,0 +1,154 @@
+# name: test/sql/map_arguments.test
+# description: define/subset/measures accept a DuckDB MAP or STRUCT, not only a JSON string.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+statement ok
+CREATE TABLE auth AS SELECT * FROM (VALUES
+  (1,1,'fail'),(1,2,'fail'),(1,3,'fail'),(1,4,'success'),
+  (2,1,'fail'),(2,2,'success')) t(user_id,ts,outcome);
+
+# ---------------------------------------------------------------------------
+# The three name-to-something arguments are maps, so they can be written as one.
+#
+# Note what does and does not fix quoting: a MAP's values are still SQL string
+# literals, so a predicate containing a string literal still needs doubled quotes
+# unless it is dollar-quoted. Both spellings appear below, on purpose.
+# ---------------------------------------------------------------------------
+query II
+SELECT user_id, n_fails FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL{3,} OK',
+  define := MAP {'FAIL': $$outcome = 'fail'$$, 'OK': $$outcome = 'success'$$},
+  measures := MAP {'n_fails': 'COUNT(FAIL.*)'})
+ORDER BY user_id;
+----
+1	3
+
+# Doubled quotes inside a MAP value — the same query, the escaping way.
+query II
+SELECT user_id, n_fails FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL{3,} OK',
+  define := MAP {'FAIL': 'outcome = ''fail''', 'OK': 'outcome = ''success'''},
+  measures := MAP {'n_fails': 'COUNT(FAIL.*)'})
+ORDER BY user_id;
+----
+1	3
+
+# A STRUCT literal is keyed by field name, so it reads the same way.
+query II
+SELECT user_id, n_fails FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL{3,} OK',
+  define := {'FAIL': $$outcome = 'fail'$$, 'OK': $$outcome = 'success'$$},
+  measures := {'n_fails': 'COUNT(FAIL.*)'})
+ORDER BY user_id;
+----
+1	3
+
+# A JSON string still works, and dollar-quoting the whole object removes the
+# doubling there too. Same answer, three spellings.
+query II
+SELECT user_id, n_fails FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL{3,} OK',
+  define := $${"FAIL": "outcome = 'fail'", "OK": "outcome = 'success'"}$$,
+  measures := $${"n_fails": "COUNT(FAIL.*)"}$$)
+ORDER BY user_id;
+----
+1	3
+
+# Forms mix freely: they are resolved one argument at a time.
+query II
+SELECT user_id, n_fails FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL{3,} OK',
+  define := MAP {'FAIL': $$outcome = 'fail'$$, 'OK': $$outcome = 'success'$$},
+  measures := '{"n_fails": "COUNT(FAIL.*)"}')
+ORDER BY user_id;
+----
+1	3
+
+# ---------------------------------------------------------------------------
+# A measures MAP's key order is the output column order.
+#
+# A DuckDB MAP is an ordered list of entries, not a hash table, so the order
+# survives — the keys here are deliberately not alphabetical, and `two` must come
+# out before `one`.
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL{3,} OK',
+  measures := MAP {'two': 'COUNT(*)', 'one': 'FIRST(ts)'},
+  define := MAP {'FAIL': $$outcome = 'fail'$$, 'OK': $$outcome = 'success'$$});
+----
+1	4	1
+
+# ---------------------------------------------------------------------------
+# SUBSET is a map to *lists*, so the conversion recurses.
+# ---------------------------------------------------------------------------
+query II
+SELECT user_id, n_any FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL{3,} OK',
+  define := MAP {'FAIL': $$outcome = 'fail'$$, 'OK': $$outcome = 'success'$$},
+  subset := MAP {'U': ['FAIL', 'OK']},
+  measures := MAP {'n_any': 'COUNT(U.*)'})
+ORDER BY user_id;
+----
+1	4
+
+# ---------------------------------------------------------------------------
+# The measures list form, which pins an output type, as a LIST of STRUCTs.
+#
+# DuckDB unifies the struct types in a list, so the second entry — written without
+# a `type` — arrives with a NULL one. A NULL `type` means "infer it", exactly as an
+# absent key does in the JSON form, which is what lets the two entries differ.
+# ---------------------------------------------------------------------------
+query IIT
+SELECT user_id, ratio, label FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL{3,} OK',
+  define := MAP {'FAIL': $$outcome = 'fail'$$, 'OK': $$outcome = 'success'$$},
+  measures := [{'as': 'ratio', 'expr': 'COUNT(FAIL.*)', 'type': 'DECIMAL(18,6)'},
+               {'as': 'label', 'expr': 'LAST(CLASSIFIER())', 'type': NULL}])
+ORDER BY user_id;
+----
+1	3.000000	OK
+
+# ---------------------------------------------------------------------------
+# Errors still name the argument, and now also the type it arrived as — which
+# matters precisely because more than one type is accepted.
+# ---------------------------------------------------------------------------
+statement error
+SELECT * FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL',
+  define := DATE '2020-01-01');
+----
+must be a JSON string, a MAP or a STRUCT
+
+# A map keyed by something other than a name is not a define.
+statement error
+SELECT * FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL',
+  define := MAP {1: $$outcome = 'fail'$$});
+----
+keyed by VARCHAR
+
+# A scalar that is not an object at all fails in the JSON parser, with the same
+# message it gives for a string that is not an object.
+statement error
+SELECT * FROM mr.match_recognize(
+  (SELECT user_id, ts, outcome FROM auth),
+  partition_by := ['user_id'], order_by := ['ts'], pattern := 'FAIL',
+  define := 42);
+----
+define is not a JSON object

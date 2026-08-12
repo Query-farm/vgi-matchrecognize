@@ -45,17 +45,17 @@ FROM mr.match_recognize(
        partition_by := ['symbol'],
        order_by     := ['ts'],
        pattern      := 'START DOWN+ UP+',
-       define       := '{
-         "DOWN": "price < PREV(price)",
-         "UP":   "price > PREV(price)"
-       }',
-       measures     := '{
-         "match_no":  "MATCH_NUMBER()",
-         "start_ts":  "FIRST(START.ts)",
-         "bottom_ts": "LAST(DOWN.ts)",
-         "end_ts":    "LAST(UP.ts)",
-         "drawdown":  "FIRST(START.price) - LAST(DOWN.price)"
-       }');
+       define       := MAP {
+         'DOWN': 'price < PREV(price)',
+         'UP':   'price > PREV(price)'
+       },
+       measures     := MAP {
+         'match_no':  'MATCH_NUMBER()',
+         'start_ts':  'FIRST(START.ts)',
+         'bottom_ts': 'LAST(DOWN.ts)',
+         'end_ts':    'LAST(UP.ts)',
+         'drawdown':  'FIRST(START.price) - LAST(DOWN.price)'
+       });
 ```
 
 ```text
@@ -83,15 +83,51 @@ mr.match_recognize(
     partition_by  := ['col', …], -- VARCHAR[]  (default [] = one global partition)
     order_by      := ['col', …], -- VARCHAR[]  (required; 'col DESC', 'col NULLS FIRST')
     pattern       := '…',        -- the row pattern: a regex over variables
-    define        := '{…}',      -- JSON: { "VAR": "<boolean predicate>", … }
-    subset        := '{…}',      -- JSON: { "U": ["A","B"], … }   (SQL:2016 SUBSET)
-    measures      := '{…}',      -- JSON: { "out_col": "<expression>", … }
+    define        := MAP {…},    -- VAR      -> boolean predicate
+    subset        := MAP {…},    -- union var -> list of members    (SQL:2016 SUBSET)
+    measures      := MAP {…},    -- out column -> expression
     rows          := 'one'|'all',-- ONE (default) | ALL ROWS PER MATCH
     empty_matches := 'show'|'omit', -- SHOW (default) | OMIT EMPTY MATCHES
     after         := '…',        -- AFTER MATCH SKIP mode (default 'past last row')
     step_budget   := 5000000     -- backtracking guard; omit to scale with partition size
 ) -> TABLE
 ```
+
+### `define`, `subset` and `measures`: a MAP, a STRUCT, or JSON
+
+Each of the three maps a name to something, so write it as a `MAP` and let DuckDB
+check the syntax:
+
+```sql
+define   := MAP {'DOWN': $$price < PREV(price)$$}
+subset   := MAP {'U': ['A', 'B']}
+measures := MAP {'match_no': 'MATCH_NUMBER()', 'low': 'LAST(DOWN.price)'}
+```
+
+A `STRUCT` — `{'DOWN': $$…$$}` — works the same way, and so does the JSON string the
+map is equivalent to, which is the easier form for a tool assembling a query:
+
+```sql
+define := '{"DOWN": "price < PREV(price)"}'
+```
+
+Key order is the output column order for `measures`, in every form.
+
+**Use `$$…$$` for predicates containing string literals.** This is the part that
+actually removes escaping, and it is independent of which form you choose — a `MAP`'s
+values are still SQL string literals, so `'outcome = ''fail'''` needs its quotes
+doubled just as it would inside JSON. Dollar-quoting does not:
+
+```sql
+define := MAP {'FAIL': $$outcome = 'fail'$$}          -- clear
+define := $${"FAIL": "outcome = 'fail'"}$$            -- also clear
+define := MAP {'FAIL': 'outcome = ''fail'''}          -- same thing, harder to read
+```
+
+The list form of `measures`, which pins an output type, is a list of structs:
+`[{'as': 'ratio', 'expr': '…', 'type': 'DECIMAL(18,6)'}, …]`. DuckDB unifies the
+struct fields across the list, so an entry that should infer its type writes
+`'type': NULL`.
 
 ### `order_by` is the matching order, not the output order
 
@@ -173,7 +209,7 @@ unqualified `PREV(price)` steps back from the current row.
 (`BIGINT[]`, `VARCHAR[]`, …). Over an empty match it is an empty list, not NULL —
 so a RUNNING `array_agg` grows row by row.
 
-**`subset := '{"U": ["A","B"]}'`** declares SQL:2016 union variables. `U` then
+**`subset := MAP {'U': ['A', 'B']}`** declares SQL:2016 union variables. `U` then
 stands for any of its members wherever a pattern variable may appear: `U.price`,
 `COUNT(U.*)`, `SUM(U.price)`, `CLASSIFIER(U)`, `after := 'to last U'`. A union
 variable may not have its own DEFINE predicate.
@@ -286,16 +322,16 @@ FROM mr.match_recognize(
        partition_by := ['user_id'],
        order_by     := ['ts'],
        pattern      := 'FAIL{3,} OK',
-       define       := '{
-         "FAIL": "outcome = ''fail''",
-         "OK":   "outcome = ''success''"
-       }',
-       measures     := '{
-         "var":        "CLASSIFIER()",
-         "n_fails":    "FINAL COUNT(FAIL.*)",
-         "first_fail": "FIRST(FAIL.ts)",
-         "breach_ts":  "LAST(OK.ts)"
-       }',
+       define       := MAP {
+         'FAIL': $$outcome = 'fail'$$,
+         'OK':   $$outcome = 'success'$$
+       },
+       measures     := MAP {
+         'var':        'CLASSIFIER()',
+         'n_fails':    'FINAL COUNT(FAIL.*)',
+         'first_fail': 'FIRST(FAIL.ts)',
+         'breach_ts':  'LAST(OK.ts)'
+       },
        rows := 'all');   -- every event in the burst, tagged by classifier
 ```
 

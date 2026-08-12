@@ -20,7 +20,13 @@ intra-workspace `mr-core`. License **MIT**.
   function: a **table-in / table-out buffering function**. The relation is a
   subquery (NOT a correlated `LATERAL`); everything else is a scalar `const_arg`
   (named). `partition_by`/`order_by` are `VARCHAR[]`; `pattern`/`rows`/`after`
-  are `VARCHAR`; `define`/`measures` are JSON strings.
+  are `VARCHAR`; `define`/`subset`/`measures` are declared **`any`** and accept a
+  DuckDB `MAP`, a `STRUCT` or a JSON string — `args.rs::structured_arg` normalises
+  all three to JSON text so there is one parser and one set of error messages.
+  A `MAP` is an ordered entry list, so `measures` key order (= output column order)
+  survives. Note what does *not* help there: a `MAP`'s values are still SQL string
+  literals, so quoting is only fixed by dollar-quoting (`$$outcome = 'fail'$$`),
+  which works on either form.
 - `mr.main.explain_pattern(p)` — pretty-print a compiled pattern; no data.
 - `mr.main.after_match_skip_modes` — a browsable reference view of the AFTER
   MATCH SKIP modes the `after` argument accepts (inline `VALUES`, no data access).
@@ -139,6 +145,14 @@ by itself, since the relation still has to be read back to match it.
 
 - All algorithms live in `mr-core` with unit + property tests; the worker is a
   thin adapter. The pure core is testable with `VecRowStore` — no IPC, no DuckDB.
+- **`vgi-lint` greps argument descriptions, so wording is load-bearing.** Two rules
+  bite in `argument_specs()`: VGI313 fires when a description contains its own
+  declared type name — which made the word "any" unusable in `define`/`subset` the
+  moment those became type `any` ("avoids doubling **any** quotes" cost a point) —
+  and VGI317 fires on phrasing that reads as enumerating allowed values, which
+  "matches a row bound to **one of** its members" did. Both are substring
+  heuristics, so reword rather than argue; re-run the lint after touching any
+  description, since the metadata gate wants 100/100.
 - Logs go to **stderr** — stdout is the Arrow-IPC channel.
 - The catalog name must match the ATTACH name; `main.rs` defaults
   `VGI_WORKER_CATALOG_NAME` to `mr`.

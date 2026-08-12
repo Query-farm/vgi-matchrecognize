@@ -73,9 +73,11 @@ fn plan_config(args: &Arguments) -> Result<PlanConfig> {
     let pattern = args
         .named_str("pattern")
         .ok_or_else(|| ve("match_recognize: 'pattern' is required"))?;
-    let define_json = args.named_str("define").unwrap_or_default();
-    let subset_json = args.named_str("subset").unwrap_or_default();
-    let measures_json = args.named_str("measures");
+    // These three are maps from a name to something, so they accept a DuckDB MAP or STRUCT
+    // as well as a JSON string; `crate::args` normalises the shape to JSON text.
+    let define_json = crate::args::structured_arg(args, "define")?.unwrap_or_default();
+    let subset_json = crate::args::structured_arg(args, "subset")?.unwrap_or_default();
+    let measures_json = crate::args::structured_arg(args, "measures")?;
     let partition_by = named_str_list(args, "partition_by")?;
     let order_by = named_str_list(args, "order_by")?;
     let rows = args
@@ -302,35 +304,40 @@ impl TableBufferingFunction for MatchRecognize {
             ArgSpec::const_arg(
                 "define",
                 -1,
-                "varchar",
-                "A JSON object mapping each pattern variable to a predicate over the current row \
-                 that decides whether the row can match that variable, e.g. '{\"DOWN\":\"price < \
-                 PREV(price)\"}'. Variables not listed default to always-match. Predicates may use \
-                 column refs, PREV/NEXT/FIRST/LAST, running aggregates, and \
-                 arithmetic/comparison/logical operators.",
+                "any",
+                "Maps each pattern variable to a predicate over the current row that decides \
+                 whether the row can match that variable. Write it as a MAP, as in a single-entry \
+                 map from the key DOWN to the predicate price < PREV(price), or as the equivalent \
+                 JSON object in a string. A STRUCT is also accepted. Variables not listed default \
+                 to always-match. Predicates may use column refs, PREV/NEXT/FIRST/LAST, running \
+                 aggregates, and arithmetic/comparison/logical operators. Dollar-quoting a \
+                 predicate avoids doubling the quotes inside it.",
             ),
             ArgSpec::const_arg(
                 "subset",
                 -1,
-                "varchar",
-                "SQL:2016 SUBSET: a JSON object declaring union variables. Each key names a new \
-                 union variable and its value is a JSON array naming the pattern variables that \
-                 union covers — for instance a key U whose array names the variables A and B. A \
-                 union variable stands for any of its members wherever a pattern variable may \
-                 appear, such as in a qualified column reference or an aggregate. Giving a union \
-                 variable its own predicate in define is an error. This argument is free-form \
-                 JSON, not a fixed vocabulary of keywords.",
+                "any",
+                "SQL:2016 SUBSET: declares union variables, as a MAP (or the equivalent JSON \
+                 object in a string). Each key names a new union variable and its value is a list \
+                 naming the pattern variables that union covers — for instance a key U whose list \
+                 names the variables A and B. A union variable then matches rows bound to its \
+                 members, wherever a pattern variable may be written, such as in a qualified \
+                 column reference or an aggregate. Giving a union variable its own predicate in \
+                 define is an error. This argument is free-form JSON, not a fixed vocabulary of \
+                 keywords.",
             ),
             ArgSpec::const_arg(
                 "measures",
                 -1,
-                "varchar",
-                "A JSON object mapping each output column name to a measure expression over the \
-                 match — for example a single-key object like {\"n\": \"COUNT(*)\"}. An \
-                 alternative array form lets each measure additionally pin an explicit output \
-                 type via an object carrying as / expr / type keys. Expression output types are \
-                 otherwise inferred from the input schema at bind time. This argument is \
-                 free-form JSON, not a fixed vocabulary of keywords.",
+                "any",
+                "Maps each output column name to a measure expression over the match. Write it as \
+                 a MAP, as in a single-entry map from the key n to the expression COUNT(*), or as \
+                 the equivalent JSON object in a string; a STRUCT is also accepted, and key order \
+                 is the output column order in every form. An alternative list form lets each \
+                 measure additionally pin an explicit output type, as entries carrying as / expr \
+                 / type keys. Expression output types are otherwise inferred from the input \
+                 schema at bind time. This argument is free-form, not a fixed vocabulary of \
+                 keywords.",
             ),
             ArgSpec::const_arg(
                 "rows",
