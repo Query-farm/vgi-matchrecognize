@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 arrow.workspace = true
 arrow-array.workspace = true
+lz4_flex.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true

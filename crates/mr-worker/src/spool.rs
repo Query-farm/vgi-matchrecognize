@@ -54,8 +54,19 @@ use arrow_array::RecordBatch;
 use vgi::ipc;
 use vgi_rpc::{Result, RpcError};
 
-/// Fixed-width record header: the batch index, then the IPC payload length.
-const HEADER: usize = 8 + 4;
+/// Fixed-width record header: the batch index, the payload length, and how the payload
+/// is encoded.
+///
+/// The codec is per *record* rather than per build, so a spool stays readable when the
+/// setting changes between one query and the next — and so a fallback record and a
+/// compressed one can sit in the same directory.
+const HEADER: usize = 8 + 4 + 1;
+
+/// Payload is a plain Arrow IPC stream.
+const CODEC_NONE: u8 = 0;
+/// Payload is an Arrow IPC stream, LZ4-compressed whole, with its uncompressed length
+/// prepended by `lz4_flex`.
+const CODEC_LZ4_FRAME: u8 = 1;
 
 /// Default age at which an orphaned spool directory is swept.
 const DEFAULT_TTL_SECS: u64 = 24 * 60 * 60;
@@ -64,10 +75,86 @@ fn re(e: impl std::fmt::Display) -> RpcError {
     RpcError::runtime_error(e.to_string())
 }
 
+/// Bytes a sink writes uncompressed before it starts compressing.
+///
+/// Compression is worth CPU only when the bytes are going to hurt, and for a small query
+/// they never do — the whole spool stays in the page cache and is deleted seconds later.
+/// So a sink starts plain and switches once it has written this much, which costs a short
+/// query nothing and still compresses all but the first slice of a large one. The codec
+/// lives in each record's header, so a file may hold both kinds.
+const COMPRESS_AFTER_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Whether to compress spooled batches, given how much this sink has already written.
+///
+/// `VGI_MR_SPOOL_COMPRESSION` overrides the size rule: `lz4`/`on` compresses from the
+/// first record, `none`/`off` never compresses.
+///
+/// Compression is applied to the **whole IPC payload as one blob**, not through Arrow's
+/// `IpcWriteOptions`. Arrow's scheme compresses each buffer separately — one per column,
+/// plus each validity bitmap — which is the wrong granularity here: the shard split
+/// fragments a 2048-row batch into ~205-row slivers, so those buffers are around a
+/// kilobyte and per-call overhead swamps the payload. Measured that way, reading shards
+/// back cost 346-507 ns/row against 16 uncompressed. One call per record instead of one
+/// per buffer also gives the codec a bigger window, so the ratio is better.
+///
+/// We can choose freely because the spool is ours end to end: written here, read back by
+/// [`crate::buffer::read_batches`], never shipped anywhere.
+fn compression(written: u64) -> u8 {
+    match std::env::var("VGI_MR_SPOOL_COMPRESSION")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "lz4" | "on" | "1" => CODEC_LZ4_FRAME,
+        "none" | "off" | "0" => CODEC_NONE,
+        // Unset, or a typo: decide by size rather than failing a query over an
+        // environment variable.
+        _ if written >= COMPRESS_AFTER_BYTES => CODEC_LZ4_FRAME,
+        _ => CODEC_NONE,
+    }
+}
+
+/// Serialise one batch, and say how.
+fn encode_batch(batch: &RecordBatch, written: u64) -> Result<(u8, Vec<u8>)> {
+    let ipc_bytes = ipc::write_batch(batch)?;
+    match compression(written) {
+        CODEC_LZ4_FRAME => Ok((
+            CODEC_LZ4_FRAME,
+            lz4_flex::block::compress_prepend_size(&ipc_bytes),
+        )),
+        _ => Ok((CODEC_NONE, ipc_bytes)),
+    }
+}
+
+/// Decode a record's payload, whatever it was written with.
+fn decode_batch(codec: u8, payload: &[u8]) -> Result<RecordBatch> {
+    match codec {
+        CODEC_NONE => ipc::read_batch(payload),
+        CODEC_LZ4_FRAME => {
+            let raw = lz4_flex::block::decompress_size_prepended(payload).map_err(|e| {
+                re(format!(
+                    "match_recognize: corrupt compressed spool record: {e}"
+                ))
+            })?;
+            ipc::read_batch(&raw)
+        }
+        other => Err(re(format!(
+            "match_recognize: spool record has unknown codec {other}; the file was written \
+             by a different version of this worker"
+        ))),
+    }
+}
+
+/// One thread's open spool file for one execution, and how much it has written.
+struct SinkFile {
+    file: File,
+    written: u64,
+}
+
 thread_local! {
     /// Open spool files for this thread, keyed by execution scope. Thread-local so
     /// appending needs no lock, and so each file has exactly one writer.
-    static FILES: RefCell<HashMap<Vec<u8>, File>> = RefCell::new(HashMap::new());
+    static FILES: RefCell<HashMap<Vec<u8>, SinkFile>> = RefCell::new(HashMap::new());
     /// This thread's number, for its file name.
     static THREAD_NO: u64 = NEXT_THREAD_NO.fetch_add(1, Ordering::Relaxed);
 }
@@ -142,17 +229,7 @@ pub fn append(scope: &[u8], batch: &RecordBatch, batch_index: Option<i64>) -> Re
     let Some(dir) = dir(scope) else {
         return Ok(false);
     };
-    let payload = ipc::write_batch(batch)?;
-    let mut record = Vec::with_capacity(HEADER + payload.len());
-    // An absent index sorts before every real one, and the merge is stable, so a run
-    // without indices keeps arrival order — the same convention the SDK log uses.
-    record.extend_from_slice(&batch_index.unwrap_or(i64::MIN).to_le_bytes());
-    let Ok(len) = u32::try_from(payload.len()) else {
-        return Err(re("match_recognize: buffered batch exceeds 4 GiB"));
-    };
-    record.extend_from_slice(&len.to_le_bytes());
-    record.extend_from_slice(&payload);
-
+    let mut record = Vec::new();
     FILES.with(|files| {
         let mut files = files.borrow_mut();
         if !files.contains_key(scope) {
@@ -164,15 +241,29 @@ pub fn append(scope: &[u8], batch: &RecordBatch, batch_index: Option<i64>) -> Re
             let no = THREAD_NO.with(|n| *n);
             let path = dir.join(format!("sink-{}-{}.mrspool", std::process::id(), no));
             match OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(f) => {
-                    files.insert(scope.to_vec(), f);
+                Ok(file) => {
+                    files.insert(scope.to_vec(), SinkFile { file, written: 0 });
                 }
                 // Unwritable temp dir: fall back rather than failing the query.
                 Err(_) => return Ok(false),
             }
         }
         let f = files.get_mut(scope).expect("just inserted");
-        f.write_all(&record).map_err(|e| {
+        // How much this sink has written decides whether the record is compressed; see
+        // `COMPRESS_AFTER_BYTES`.
+        let (codec, payload) = encode_batch(batch, f.written)?;
+        record.reserve(HEADER + payload.len());
+        // An absent index sorts before every real one, and the merge is stable, so a run
+        // without indices keeps arrival order — the same convention the SDK log uses.
+        record.extend_from_slice(&batch_index.unwrap_or(i64::MIN).to_le_bytes());
+        let Ok(len) = u32::try_from(payload.len()) else {
+            return Err(re("match_recognize: buffered batch exceeds 4 GiB"));
+        };
+        record.extend_from_slice(&len.to_le_bytes());
+        record.push(codec);
+        record.extend_from_slice(&payload);
+        f.written += record.len() as u64;
+        f.file.write_all(&record).map_err(|e| {
             re(format!(
                 "match_recognize: writing the buffered batch to {} failed: {e}",
                 dir.display()
@@ -255,7 +346,10 @@ impl ShardWriters {
 
     /// Append one batch to a shard, in the same framing the sink uses.
     pub fn append(&mut self, shard: usize, batch: &RecordBatch, batch_index: i64) -> Result<()> {
-        let payload = ipc::write_batch(batch)?;
+        // A split only happens for an input past the memory budget, which is far past
+        // the size where compression is worth it — so shard records always compress
+        // (unless the environment says otherwise).
+        let (codec, payload) = encode_batch(batch, u64::MAX)?;
         let len = u32::try_from(payload.len())
             .map_err(|_| re("match_recognize: buffered batch exceeds 4 GiB"))?;
         let capacity = self.buffer_capacity;
@@ -282,6 +376,7 @@ impl ShardWriters {
         let mut record = Vec::with_capacity(HEADER + payload.len());
         record.extend_from_slice(&batch_index.to_le_bytes());
         record.extend_from_slice(&len.to_le_bytes());
+        record.push(codec);
         record.extend_from_slice(&payload);
         w.write_all(&record)
             .map_err(|e| re(format!("match_recognize: writing a shard failed: {e}")))
@@ -347,8 +442,9 @@ pub fn read_files(paths: &[PathBuf]) -> Result<Vec<(i64, RecordBatch)>> {
                 )));
             }
             let index = i64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
-            let len = u32::from_le_bytes(bytes[at + 8..at + HEADER].try_into().expect("4 bytes"))
-                as usize;
+            let len =
+                u32::from_le_bytes(bytes[at + 8..at + 12].try_into().expect("4 bytes")) as usize;
+            let codec = bytes[at + 12];
             at += HEADER;
             let end = at
                 .checked_add(len)
@@ -359,7 +455,7 @@ pub fn read_files(paths: &[PathBuf]) -> Result<Vec<(i64, RecordBatch)>> {
                         path.display()
                     ))
                 })?;
-            out.push((index, ipc::read_batch(&bytes[at..end])?));
+            out.push((index, decode_batch(codec, &bytes[at..end])?));
             at = end;
         }
     }

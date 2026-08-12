@@ -25,6 +25,11 @@ repository = "https://github.com/Query-farm/vgi-matchrecognize"
 vgi = { version = "0.29", default-features = false }
 vgi-rpc = { version = "0.21", default-features = false, features = ["macros"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
+# LZ4 for the buffered-batch spool, applied to a whole record rather than through
+# arrow's IPC buffer compression — see `spool::compression`. Pure Rust, so the wasm32
+# build still links; `zstd` would drag in a C dependency, and for a spool written once
+# and read once throughput beats ratio anyway.
+lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
 arrow-array = "59"
 arrow-buffer = "59"
 arrow-data = "59"

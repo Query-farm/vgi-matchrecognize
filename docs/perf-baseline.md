@@ -217,6 +217,43 @@ Index widths are not a limit at this scale: tape positions, step budget, match n
 and batch indices are all `i64`, and the `u32` bind indices only cap a single *match* at
 4.29B rows.
 
+## Spool compression: granularity decides it
+
+Same 10M-row probe, ns/row and bytes/row on disk. "Arrow" is
+`IpcWriteOptions::try_with_compression`, which compresses each *buffer* — one per column
+plus each validity bitmap. "Frame" compresses the whole IPC payload as one blob with
+`lz4_flex`, with the codec recorded in our own record header.
+
+| repetitive data | off | Arrow per-buffer | **frame** |
+|---|---|---|---|
+| on disk | 24.6 | 8.7 | **8.4** bytes/row |
+| spool write | 25 | 25 | 25 |
+| read + decode | 12 | 12 | **10** |
+| shard split | 77 | 87 | 90 |
+| read shards back | 16 | 46 | **21** |
+
+| random data | off | Arrow per-buffer | **frame** |
+|---|---|---|---|
+| on disk | 24.6 | 16.7 | 16.5 bytes/row |
+| spool write | 28 | 36–48 | **28** |
+| shard split | 74 | 174–202 | **73** |
+| read shards back | 17 | **346–507** | **20** |
+
+Arrow's granularity is the whole story. The split fragments each 2048-row batch into
+~205-row slivers, so a per-buffer codec is compressing ~1.6 KB at a time and per-call
+overhead swamps the payload — 20-30× on read-back, and worse on data that does not
+compress. One call per record instead of one per column per batch removes that and gives
+the codec a bigger window, so the ratio improves too.
+
+LZ4 rather than zstd because `zstd` is a C binding and the wasm32 build cannot take one;
+`lz4_flex` is pure Rust. For a spool written once and read once, throughput beats ratio.
+
+The default is size-triggered — plain until a sink has written 32 MB, then LZ4 — because
+these numbers show all of compression's cost and none of its benefit: 0.25 GB sits
+entirely in the page cache, so nothing reaches a disk. A short query therefore pays
+nothing, and a large one (where the spool is many times RAM) gets 1.5–2.9× fewer bytes
+for ~20 ns/row. At 10M rows the mixed default lands at 10.7 bytes/row against 24.6.
+
 ## Measured and declined
 
 Two things the plan proposed that measurement argued against. Recorded so they are not

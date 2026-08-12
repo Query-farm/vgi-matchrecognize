@@ -12,6 +12,9 @@
 //! `vgi-match` idiom) — but the partition is the natural streaming unit, so the
 //! whole result set never has to be live at once.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -143,6 +146,51 @@ fn projection(plan: &Plan, input_schema: &SchemaRef) -> Vec<usize> {
             needed.iter().any(|n| n.eq_ignore_ascii_case(name))
         })
         .collect()
+}
+
+thread_local! {
+    /// Buffered-column projections, keyed by execution, for the sink path.
+    ///
+    /// `process` is called once per input batch and was rebuilding the whole plan each
+    /// time — parsing the pattern, parsing every DEFINE and MEASURES expression, and
+    /// re-running type inference. That is 5.3 us per batch, so ~26 ms per 10M rows, for
+    /// an answer that cannot change within an execution: the arguments and the input
+    /// schema are fixed at bind time.
+    ///
+    /// Thread-local rather than shared, so concurrent sinks never contend on a lock —
+    /// the cost is one build per thread per execution instead of one per batch. Bounded
+    /// and cleared wholesale when it grows, since an execution's entry is dead the
+    /// moment its query ends and nothing tells the worker when that was.
+    static SINK_PROJECTIONS: RefCell<HashMap<Vec<u8>, Rc<Vec<usize>>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Most executions to keep projections for. Small: a worker serves a handful of
+/// concurrent queries, and rebuilding after a flush costs microseconds.
+const SINK_PLAN_CACHE_MAX: usize = 16;
+
+/// The columns this execution buffers, computed once per thread.
+///
+/// The plan itself is not kept: `process` needs it only to work out which columns the
+/// pattern reads, and that answer is what gets reused.
+fn sink_projection(
+    execution_id: &[u8],
+    args: &Arguments,
+    input_schema: &SchemaRef,
+) -> Result<Rc<Vec<usize>>> {
+    if let Some(hit) = SINK_PROJECTIONS.with(|c| c.borrow().get(execution_id).map(Rc::clone)) {
+        return Ok(hit);
+    }
+    let plan = build_plan(args, input_schema)?;
+    let entry = Rc::new(projection(&plan, input_schema));
+    SINK_PROJECTIONS.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= SINK_PLAN_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(execution_id.to_vec(), Rc::clone(&entry));
+    });
+    Ok(entry)
 }
 
 /// The schema the sinks wrote: the input schema projected to the columns the plan
@@ -354,9 +402,9 @@ impl TableBufferingFunction for MatchRecognize {
             .input_schema
             .clone()
             .ok_or_else(|| ve("match_recognize: missing input schema while buffering"))?;
-        let plan = build_plan(&params.arguments, &input_schema)?;
+        let columns = sink_projection(&params.execution_id, &params.arguments, &input_schema)?;
         let projected = batch
-            .project(&projection(&plan, &input_schema))
+            .project(&columns)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         crate::buffer::append_batch(
             &params.storage,
