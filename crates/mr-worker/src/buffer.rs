@@ -101,12 +101,28 @@ pub fn scan_log(storage: &SharedStorage, scope: &[u8], ns: &[u8]) -> Vec<Vec<u8>
 
 /// Buffer one (already projected) batch, plus its independent row-count record.
 ///
+/// `batch_index` is DuckDB's per-chunk index, present because the function declares
+/// `requires_input_batch_index`. It is written as a fixed-width header on the batch
+/// record itself rather than into a side namespace: two logs would have to be paired
+/// positionally, and a parallel sink can interleave appends so that the k-th batch
+/// and the k-th side record come from different `process` calls. Self-describing
+/// records need no pairing.
+///
 /// `append` is infallible by signature but reports failure through its return
 /// value — the SQLite backend logs and returns `-1` without storing the row — so
 /// both ids are checked. Dropping a batch here would otherwise surface as a
 /// quietly short result rather than an error.
-pub fn append_batch(storage: &SharedStorage, scope: &[u8], batch: &RecordBatch) -> Result<()> {
-    let batch_id = storage.append(scope, NS_BATCHES, b"", ipc::write_batch(batch)?);
+pub fn append_batch(
+    storage: &SharedStorage,
+    scope: &[u8],
+    batch: &RecordBatch,
+    batch_index: Option<i64>,
+) -> Result<()> {
+    // Absent index sorts before every real one, and the sort below is stable, so a
+    // run without indices keeps arrival order — exactly the old behaviour.
+    let mut record = batch_index.unwrap_or(i64::MIN).to_le_bytes().to_vec();
+    record.extend_from_slice(&ipc::write_batch(batch)?);
+    let batch_id = storage.append(scope, NS_BATCHES, b"", record);
     let count_id = storage.append(
         scope,
         NS_ROWS,
@@ -134,13 +150,24 @@ pub fn append_batch(storage: &SharedStorage, scope: &[u8], batch: &RecordBatch) 
 ///    agree, or the store dropped or duplicated something.
 pub fn read_batches(storage: &SharedStorage, state: &FinalizeState) -> Result<Vec<RecordBatch>> {
     let scope = &state.scope;
-    let mut batches = Vec::new();
+    let mut indexed: Vec<(i64, RecordBatch)> = Vec::new();
     let mut buffered_rows = 0usize;
     for bytes in scan_log(storage, scope, NS_BATCHES) {
-        let b = ipc::read_batch(&bytes)?;
+        if bytes.len() < 8 {
+            return Err(re("match_recognize: truncated buffered batch record"));
+        }
+        let (head, payload) = bytes.split_at(8);
+        let index = i64::from_le_bytes(head.try_into().expect("8 bytes"));
+        let b = ipc::read_batch(payload)?;
         buffered_rows += b.num_rows();
-        batches.push(b);
+        indexed.push((index, b));
     }
+    // Restore the input order. Batches arrive in whatever order a parallel sink
+    // produced them, so without this the buffered relation is in arrival order and
+    // rows tying on the ORDER BY key would come out differently run to run.
+    // A stable sort keeps arrival order among equal indices.
+    indexed.sort_by_key(|(index, _)| *index);
+    let batches: Vec<RecordBatch> = indexed.into_iter().map(|(_, b)| b).collect();
 
     let mut expected_rows = 0usize;
     for bytes in scan_log(storage, scope, NS_ROWS) {

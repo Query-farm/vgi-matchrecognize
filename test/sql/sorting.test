@@ -102,3 +102,28 @@ FROM mr.match_recognize(
        measures := '{"n":"COUNT(*)"}');
 ----
 0
+
+# Input order must survive buffering. All rows tie on k, so the emitted order IS the
+# buffered order: id ascending with position means nothing was reordered on the way
+# through. A base table is used deliberately, because that is the source kind that
+# can supply real batch indices.
+#
+# Note what this does and does not prove *today*. With `requires_input_batch_index`
+# not yet declared (see catalog.rs), `batch_index` is None, the stable sort in
+# buffer.rs is a no-op, and this passes only because DuckDB happened to deliver the
+# batches in order — so right now it is a weak guard that could pass vacuously. It
+# becomes a real one the moment the flag is declared, which is why it is written
+# against the guarantee rather than against the current behaviour.
+statement ok
+CREATE TABLE ties AS SELECT 0 AS k, i AS id FROM range(20000) r(i);
+
+query I
+SELECT CASE WHEN count(*) = 0 THEN 'PASS' ELSE 'reordered: ' || count(*) END
+FROM (SELECT id, pos, lag(id) OVER (ORDER BY pos) AS prev
+      FROM mr.match_recognize(
+             (SELECT k, id FROM ties),
+             order_by := ['k'], pattern := 'A+', define := '{}',
+             measures := '{"pos":"RUNNING COUNT(*)","id":"LAST(id)"}', rows := 'all')) t
+WHERE prev IS NOT NULL AND id <> prev + 1;
+----
+PASS

@@ -330,7 +330,12 @@ impl TableBufferingFunction for MatchRecognize {
         let projected = batch
             .project(&projection(&plan, &input_schema))
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
-        crate::buffer::append_batch(&params.storage, &params.execution_id, &projected)?;
+        crate::buffer::append_batch(
+            &params.storage,
+            &params.execution_id,
+            &projected,
+            params.batch_index,
+        )?;
         Ok(params.execution_id.clone())
     }
 
