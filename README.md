@@ -308,6 +308,12 @@ process memory.
   rest are projected away first. This matters more than it sounds: buffering
   volume dominates runtime, and on 2M rows a single unused 200-byte column cost
   1.02s → **2.83s** before this was added.
+- **Pre-sorting the input pays for itself.** DuckDB's sort is parallel, vectorized
+  and spills; ours is a single-threaded comparison sort over the buffered rows. It
+  sorted 4M rows in 0.039s where we take ~2.4s, and adding `ORDER BY` to the input
+  subquery — `(SELECT … FROM t ORDER BY user_id, ts)` — took a 4M-row query from
+  **3.96s to 1.52s**. We still sort defensively, so this is purely a speedup and
+  never a correctness dependency: an already-ordered run is nearly free to re-sort.
 - **Output streams.** Matching runs one partition at a time and emits ~8k-row
   batches, so the result set is never fully live: 5M *output* rows peak at **349 MB**
   of worker RSS, less than a 1.3M-match query over a wider input. DuckDB can also
@@ -321,7 +327,9 @@ process memory.
 
 Matching cannot be made fully streaming: a match may span an entire partition, so
 the partition must be complete first, and DuckDB does not deliver input clustered
-by partition key.
+by partition key. [ADR 001](docs/adr-001-buffering-and-sorting.md) records why the
+buffer is a plain Arrow-IPC log rather than an embedded DuckDB, and what the path
+to inputs larger than RAM looks like.
 
 Leave `VGI_WORKER_SHARED_STORAGE` alone. The buffering and producing phases may run
 in *different worker processes*, so the store has to outlive a process. Two
