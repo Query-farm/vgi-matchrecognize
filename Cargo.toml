@@ -35,5 +35,7 @@ arrow-cast = "59"
 mr-core = { path = "crates/mr-core" }
 
 [profile.release]
-opt-level = 2
+opt-level = 3
+lto = "thin"
 strip = true
+
