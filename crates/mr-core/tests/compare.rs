@@ -193,6 +193,7 @@ impl BindSchema for Sch {
 
 fn ids_matching(define: &str, rows: Vec<Vec<Value>>) -> Vec<i64> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A".into(),
         define_json: define.into(),
         subset_json: String::new(),

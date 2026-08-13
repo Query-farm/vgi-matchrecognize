@@ -109,6 +109,10 @@ fn re(e: impl std::fmt::Display) -> RpcError {
     RpcError::runtime_error(e.to_string())
 }
 
+/// Floor for [`compress_after_bytes`], so a tiny configured budget cannot make a
+/// short query compress.
+const MIN_COMPRESS_AFTER_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Bytes a sink writes uncompressed before it starts compressing.
 ///
 /// Compression is worth CPU only where the bytes hurt, and for a small query they never
@@ -116,9 +120,28 @@ fn re(e: impl std::fmt::Display) -> RpcError {
 /// starts plain and switches once it has written this much — which costs a short query
 /// nothing and still compresses all but the first slice of a large one. Counted
 /// *uncompressed*, so the threshold means the same thing on both sides of itself.
-const COMPRESS_AFTER_BYTES: u64 = 32 * 1024 * 1024;
+///
+/// It is derived from the finalize memory budget rather than being a constant, because
+/// compression *costs* resident memory on the path that reads the spool back. An
+/// uncompressed record is decoded straight out of the mapping and its arrays borrow it,
+/// so those pages are file-backed and evictable; a compressed one has to be inflated
+/// into the heap and stays there for the producer's whole life. A fixed 32 MB threshold
+/// meant an unsharded query — one whose spool fits the budget, and which therefore was
+/// going to be read back whole — turned most of the relation into anonymous memory to
+/// save disk it was never short of. Measured on 8M rows x 3 BIGINT: 314 MB peak RSS
+/// uncompressed against 432 MB with the fixed threshold.
+///
+/// Half the budget is the largest value that still compresses everything sharding will
+/// ever look at: past `sinks x budget/2` bytes the split has certainly been triggered,
+/// and the split's own output is never compressed (its records are read back by
+/// borrowing). A single-sink query keeps one window, between half the budget and the
+/// budget, where it stays plain and could have compressed — that is at most one budget's
+/// worth of disk.
+fn compress_after_bytes() -> u64 {
+    (crate::shard::budget_bytes() / 2).max(MIN_COMPRESS_AFTER_BYTES)
+}
 
-/// Whether to compress spooled batches: on past [`COMPRESS_AFTER_BYTES`], and
+/// Whether to compress spooled batches: on past [`compress_after_bytes`], and
 /// `VGI_MR_SPOOL_COMPRESSION=lz4|none` forces it either way.
 ///
 /// This was briefly off by default, for a reason now fixed. The finalize phase decides
@@ -155,7 +178,7 @@ fn compression(written: u64) -> u8 {
         "none" | "off" | "0" => CODEC_NONE,
         // Unset, or a typo: decide by size rather than failing a query over an
         // environment variable.
-        _ if written >= COMPRESS_AFTER_BYTES => CODEC_LZ4_FRAME,
+        _ if written >= compress_after_bytes() => CODEC_LZ4_FRAME,
         _ => CODEC_NONE,
     }
 }
@@ -374,7 +397,7 @@ pub fn append(scope: &[u8], batch: &RecordBatch, batch_index: Option<i64>) -> Re
         }
         let f = files.get_mut(scope).expect("just inserted");
         // How much this sink has written decides whether the record is compressed; see
-        // `COMPRESS_AFTER_BYTES`. Counted uncompressed, so the threshold means what it
+        // `compress_after_bytes`. Counted uncompressed, so the threshold means what it
         // says whichever side of it the sink is on.
         let enc = encode_batch(batch, f.written)?;
         // An absent index sorts before every real one, and the merge is stable, so a run

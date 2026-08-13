@@ -63,6 +63,7 @@ fn run(q: Q, rows: &[(i64, i64, &str)]) -> Vec<Vec<Value>> {
 
 fn try_run(q: Q, rows: &[(i64, i64, &str)]) -> mr_core::error::Result<Vec<Vec<Value>>> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: q.pattern.into(),
         define_json: q.define.into(),
         subset_json: q.subset.into(),
@@ -340,6 +341,7 @@ fn array_agg_of_empty_match_is_an_empty_list() {
 #[test]
 fn array_agg_infers_a_list_type() {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A+".into(),
         define_json: r#"{"A":"v > 0"}"#.into(),
         subset_json: String::new(),

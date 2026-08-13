@@ -51,6 +51,7 @@ fn sch() -> Sch {
 /// One `A+` match over every row, with `measures := {"m": <expr>}`.
 fn measure(expr: &str, rows: Vec<Vec<Value>>) -> mr_core::error::Result<Value> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A+".into(),
         define_json: "{}".into(),
         subset_json: String::new(),

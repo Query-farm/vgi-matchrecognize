@@ -55,7 +55,32 @@ use crate::arrow_in::BatchRowStore;
 
 /// Spooled bytes above which the finalize phase shards. Roughly the peak the
 /// producer will hold, since the IPC form and the in-memory form are close in size.
-const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+///
+/// Halved from 256 MB, because the split no longer costs what it did when that
+/// number was chosen. The note this file used to carry — ~2x the time for ~2x less
+/// memory — predates coalesced shard records and the mapped spool. Re-measured, with
+/// the budget as the only variable:
+///
+/// | input | budget | wall | peak RSS |
+/// |---|---|---|---|
+/// | 8M x 3 BIGINT | 256 MB (no split) | 1.61-1.68 s | 362 MB |
+/// | | **128 MB** | 1.74 s | **216 MB** |
+/// | | 64 MB | 1.79-1.82 s | 162 MB |
+/// | 40M x 4 BIGINT | 2 GB (no split) | 12.6 s | 1774 MB |
+/// | | 256 MB | 15.8 s | 643 MB |
+/// | | **128 MB** | 16.3 s | **634 MB** |
+/// | | 64 MB | 18.9 s | 604 MB |
+///
+/// 128 MB is where the two ends agree: at 8M it halves peak memory for ~5% of wall
+/// clock, and at 40M it is within 3% of not lowering it at all. Going further to 64 MB
+/// buys almost nothing on the large query — by then the peak is the *split pass* (the
+/// sink files it maps count as resident), not the shard — while costing 16% more time.
+///
+/// What sharding still costs is temp disk, roughly 1.5-2x the relation while the split
+/// runs, and time once the spool outgrows the page cache, since the split is a second
+/// full pass. Both are reasons to raise `VGI_MR_FINALIZE_MEMORY_BYTES` on a very large
+/// query rather than lower it.
+const DEFAULT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Ceiling on shards. Each one is a file and a finalize stream, so this bounds how many
 /// of both a single query can create.
@@ -63,8 +88,9 @@ const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// It has to be high enough that the memory budget stays a *bound* rather than a
 /// suggestion: with 64 the budget stopped binding above 64 x 256 MB = 16 GB of buffered
 /// input, and peak memory went back to growing linearly with the relation — which is
-/// precisely what sharding exists to prevent. At 1024 the budget holds to ~256 GB of
-/// input at the default, and further with a smaller one.
+/// precisely what sharding exists to prevent. At 1024 the budget holds to 128 GB of
+/// input at the default, and further with a larger one — which is the other reason to
+/// raise `VGI_MR_FINALIZE_MEMORY_BYTES` on a very large query.
 ///
 /// The cost of a high ceiling is file descriptors and finalize streams, and neither is
 /// paid unless the input actually needs the shards: the count comes from

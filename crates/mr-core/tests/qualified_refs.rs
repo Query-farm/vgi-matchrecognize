@@ -63,6 +63,7 @@ fn run_cfg(
     rows_all: bool,
 ) -> Vec<Vec<Value>> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: pattern.into(),
         define_json: define.into(),
         subset_json: String::new(),

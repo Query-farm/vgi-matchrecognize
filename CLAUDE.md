@@ -16,10 +16,10 @@ intra-workspace `mr-core`. License **MIT**.
 ## SQL surface
 
 - `mr.main.match_recognize((<relation>), partition_by:=, order_by:=, pattern:=,
-  define:=, measures:=, rows:=, after:=, [step_budget:=])` — the one real
-  function: a **table-in / table-out buffering function**. The relation is a
+  define:=, measures:=, rows:=, after:=, [include:=], [step_budget:=])` — the one
+  real function: a **table-in / table-out buffering function**. The relation is a
   subquery (NOT a correlated `LATERAL`); everything else is a scalar `const_arg`
-  (named). `partition_by`/`order_by` are `VARCHAR[]`; `pattern`/`rows`/`after`
+  (named). `partition_by`/`order_by`/`include` are `VARCHAR[]`; `pattern`/`rows`/`after`
   are `VARCHAR`; `define`/`subset`/`measures` are declared **`any`** and accept a
   DuckDB `MAP`, a `STRUCT` or a JSON string — `args.rs::structured_arg` normalises
   all three to JSON text so there is one parser and one set of error messages.
@@ -27,6 +27,12 @@ intra-workspace `mr-core`. License **MIT**.
   survives. Note what does *not* help there: a `MAP`'s values are still SQL string
   literals, so quoting is only fixed by dollar-quoting (`$$outcome = 'fail'$$`),
   which works on either form.
+- `include` is the passthrough escape hatch: SQL:2016 ALL ROWS emits every input
+  column, we emit only what the query reads (buffering one unread column measured
+  2.8x), so a column you want carried through has to be named. It lands right after
+  the partition keys, valued on each matched row under `rows := 'all'` and on the
+  match's first row under `'one'`; a column already emitted (a partition key, or an
+  order key under ALL ROWS) is dropped rather than duplicated.
 - `mr.main.explain_pattern(p)` — pretty-print a compiled pattern; no data.
 - `mr.main.after_match_skip_modes` — a browsable reference view of the AFTER
   MATCH SKIP modes the `after` argument accepts (inline `VALUES`, no data access).
@@ -55,8 +61,19 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
     budget + AFTER MATCH SKIP).
   - `plan` — `Plan::build` (bind: parse + type-check + compute the output column
     layout) and `Plan::run` (produce: group → sort → match → evaluate → rows).
-    `Plan::partition_tapes` + `Plan::run_partition` are the streaming form of
-    `run`: one partition at a time, threading the match number across calls.
+    The streaming form is `Plan::partitions` → `Plan::match_partition` →
+    `Plan::emit_rows(limit)`: `partitions` returns the **CSR** `Partitions` (one
+    contiguous `rows` buffer + per-partition `bounds` + labels, built by a counting
+    pass, so no per-partition `Vec` and no doubling slack); `match_partition` sorts
+    one tape in place and finds every match, handing back an owned `PartitionRun`;
+    `emit_rows` drains that run into a `RowBuf` **up to a row limit**, keeping a
+    `(match, row-within-match)` cursor plus the `BindIndex`/`AggMemo` so a batch
+    boundary may fall inside a match. That last part is the memory bound: a single
+    partition under ALL ROWS used to materialise its whole output first.
+  - `rows` — `RowBuf`, the output rows row-major in one `Vec<Value>` with a column
+    stride. A `Vec<Value>` per row cost a 24-byte header plus a `malloc` per row for
+    a 32-byte-per-cell payload; on an 8M-row ALL ROWS result that was ~1 GB and 8M
+    allocations.
 - **`crates/mr-worker`** — thin Arrow/VGI adapter:
   - `match_recognize.rs` — the `TableBufferingFunction` (`on_bind` / `process` /
     `combine` / `finalize_producer`); spools each batch, then builds the `Plan` and
@@ -107,7 +124,7 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
   - `arrow_in.rs` — a `RowStore` over the buffered `RecordBatch`es, addressed as
     one contiguous row space (deliberately **not** concatenated — a merged copy
     would double peak memory for no gain).
-  - `arrow_out.rs` — `Vec<Vec<Value>>` + output `Ty`s → a `RecordBatch`.
+  - `arrow_out.rs` — a `RowBuf` + output `Ty`s → a `RecordBatch`.
   - `schema.rs` — `Ty` ↔ Arrow `DataType` + the `ArrowBindSchema` for inference.
   - `scalar/` — `explain_pattern`.
   - `catalog.rs` / `meta.rs` — catalog/schema/function metadata for `vgi-lint`.
@@ -123,7 +140,11 @@ A Cargo **workspace** mirroring `../vgi-fixedformat`:
    so a partition must be complete before it can be matched — but partitions are
    independent, so a chunk of them is matched concurrently, and when the relation is
    too big for the memory budget `combine` splits it into per-partition-key shards
-   and returns one finalize state per shard.
+   and returns one finalize state per shard. **Matching is per partition; emitting is
+   not.** Output rows come out in fixed-size batches with a cursor that can stop
+   inside a match (`Plan::emit_rows`), so the result never scales with a partition —
+   which matters because sharding cannot split a partition, so a single big one has
+   no other defence.
 2. **Output schema is fixed at `on_bind`** — before any data flows. The measure
    types are **inferred statically** from `params.input_schema` + the parsed
    measure ASTs (`mr-core::types::infer`), with an explicit `{"as","expr","type"}`
@@ -278,7 +299,21 @@ by itself, since the relation still has to be read back to match it.
   key or an expression reference) to the canonical one, exact match first.
 - `Ty` is NOT `Copy` (it owns `List`'s element type); clone it.
 - The worker buffers only `Plan::referenced_columns()`. Buffering volume dominates
-  runtime — one unused 200-byte column measured 2.8x on 2M rows.
+  runtime — one unused 200-byte column measured 2.8x on 2M rows. `include` columns
+  are in that set: naming one is what makes it available at produce time.
+- **`emit_rows` may stop mid-match, so its cursor is the whole correctness story.**
+  `PartitionRun` carries `(mi, ri)` plus the `BindIndex` and `AggMemo` for the match
+  in progress, and `loaded` says whether those two describe `matches[mi]` yet. The
+  RUNNING horizon is `ri`, so a resumed row evaluates exactly as an uninterrupted one
+  — but only because the index and the memo are *kept*, not rebuilt: rebuilding the
+  memo mid-match would restart every running aggregate at zero. `tests/streaming_emit.rs`
+  pins this by driving every limit from 1 upwards against `Plan::run`.
+- **`sort_tape_on_keys` applies its permutation in place** by following cycles
+  (`apply_permutation`), marking each slot with the `u32` permutation's top bit — so
+  the key-sort path is capped at `MAX_ROWS_FOR_KEY_SORT` rows and anything larger
+  falls back to `cmp_cells`. The cap is also the fix for a latent `n as u32` that
+  wrapped silently. Copying the tape instead cost another 8 bytes per row of the
+  partition, on the one shape (one huge partition) that has no other relief.
 - **Sorting reads fixed-width keys out once** (`plan.rs::sort_tape_on_keys`) instead
   of calling `cmp_cells` per comparison, which re-located the row in the store every
   time. Integer-family keys are packed as `i64` + a null flag; VARCHAR/LIST stay on
@@ -340,8 +375,8 @@ by itself, since the relation still has to be read back to match it.
 | | |
 |---|---|
 | `VGI_MR_MATCH_THREADS` | Threads matching partitions. `1` forces the serial path, which is what the determinism checks compare against. Default: machine parallelism, capped at 8. |
-| `VGI_MR_FINALIZE_MEMORY_BYTES` | Spooled bytes above which the relation is sharded by partition key. Default 256 MB, at most 64 shards. Small values are how the sharded path gets exercised by hand. |
-| `VGI_MR_SPOOL_COMPRESSION` | `lz4` compresses every spooled record, `none` never does. Unset is size-triggered: a sink writes plain until it has written 32 MB *uncompressed*, then switches, so a short query pays nothing. Safe now that the shard count is derived from each record's uncompressed length rather than from file sizes — measuring bytes on disk let compression loosen the memory bound by its own ratio. |
+| `VGI_MR_FINALIZE_MEMORY_BYTES` | Spooled bytes above which the relation is sharded by partition key. Default 128 MB, at most 1024 shards. Halved from 256 MB once the split measured nearly free (see `shard.rs` for the table). Small values are how the sharded path gets exercised by hand; large ones are for a query whose spool outgrows the page cache, where the split's second pass does cost real time. |
+| `VGI_MR_SPOOL_COMPRESSION` | `lz4` compresses every spooled record, `none` never does. Unset is size-triggered: a sink writes plain until it has written **half the finalize budget** (floor 32 MB) *uncompressed*, then switches, so a short query pays nothing — and, more importantly, a spool that will stay unsharded stays mappable, since a compressed record has to be inflated into the heap while an uncompressed one is borrowed from the mapping (measured 432 -> 314 MB peak RSS on 8M rows). Safe now that the shard count is derived from each record's uncompressed length rather than from file sizes — measuring bytes on disk let compression loosen the memory bound by its own ratio. |
 | `VGI_BUFFERING_STORE_TTL_SECS` | Age at which orphaned spool directories are swept (also the SDK store's own knob). Default 24h. |
 | `VGI_WORKER_SHARED_STORAGE` | SDK store backend. `memory` is refused off-wasm — the control records must outlive a process. |
 

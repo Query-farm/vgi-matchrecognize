@@ -84,6 +84,7 @@ impl Default for Q<'_> {
 fn plan_of(q: &Q) -> mr_core::error::Result<Plan> {
     Plan::build(
         &PlanConfig {
+            include: Vec::new(),
             pattern: q.pattern.into(),
             define_json: q.define.into(),
             subset_json: String::new(),

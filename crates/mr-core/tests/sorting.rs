@@ -67,6 +67,7 @@ fn tape_order_with(
     measures: &str,
 ) -> Vec<Vec<Value>> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A+".into(),
         define_json: "{}".into(), // undefined variable: binds any row
         subset_json: String::new(),

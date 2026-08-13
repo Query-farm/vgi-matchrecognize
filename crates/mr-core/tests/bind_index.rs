@@ -43,6 +43,7 @@ fn store(vs: &[i64]) -> VecRowStore {
 /// ONE ROW PER MATCH; returns each match's measure values.
 fn run(pattern: &str, define: &str, subset: &str, measures: &str, vs: &[i64]) -> Vec<Vec<Value>> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: pattern.into(),
         define_json: define.into(),
         subset_json: subset.into(),

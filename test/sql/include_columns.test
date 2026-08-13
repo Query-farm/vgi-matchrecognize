@@ -1,0 +1,74 @@
+# name: test/sql/include_columns.test
+# description: include := carries extra input columns through to the output.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+statement ok
+CREATE TABLE ticks AS SELECT * FROM (VALUES
+  ('ACME', 1, 10, 'open'),
+  ('ACME', 2, 8,  'dip'),
+  ('ACME', 3, 6,  'low'),
+  ('ACME', 4, 9,  'up')
+) AS t(symbol, ts, price, memo);
+
+# Without include, a column the pattern never reads is not in the output at all.
+query TI
+SELECT * FROM mr.main.match_recognize(
+  (SELECT * FROM ticks),
+  partition_by := ['symbol'], order_by := ['ts'],
+  pattern := 'DOWN+',
+  define := MAP {'DOWN': $$price < PREV(price)$$},
+  measures := MAP {'n': 'COUNT(*)'});
+----
+ACME	2
+
+# include adds it, right after the partition keys, with its own name and type.
+query TTI
+SELECT * FROM mr.main.match_recognize(
+  (SELECT * FROM ticks),
+  partition_by := ['symbol'], include := ['memo'], order_by := ['ts'],
+  pattern := 'DOWN+',
+  define := MAP {'DOWN': $$price < PREV(price)$$},
+  measures := MAP {'n': 'COUNT(*)'});
+----
+ACME	dip	2
+
+# ALL ROWS: the column of each matched row, not of the match's first row.
+query TTIIITI
+SELECT * FROM mr.main.match_recognize(
+  (SELECT * FROM ticks),
+  partition_by := ['symbol'], include := ['memo', 'price'], order_by := ['ts'],
+  pattern := 'DOWN+',
+  define := MAP {'DOWN': $$price < PREV(price)$$},
+  measures := MAP {'n': 'COUNT(*)'}, rows := 'all');
+----
+ACME	dip	8	2	1	DOWN	1
+ACME	low	6	3	1	DOWN	2
+
+# A column already emitted is not repeated: symbol is a partition key, ts an order
+# key, so this is the same shape as the plain ALL ROWS output.
+query TIITI
+SELECT * FROM mr.main.match_recognize(
+  (SELECT * FROM ticks),
+  partition_by := ['symbol'], include := ['symbol', 'ts'], order_by := ['ts'],
+  pattern := 'DOWN+',
+  define := MAP {'DOWN': $$price < PREV(price)$$},
+  measures := MAP {'n': 'COUNT(*)'}, rows := 'all');
+----
+ACME	2	1	DOWN	1
+ACME	3	1	DOWN	2
+
+# An unknown column fails at bind, naming itself.
+statement error
+SELECT * FROM mr.main.match_recognize(
+  (SELECT * FROM ticks),
+  partition_by := ['symbol'], include := ['nope'], order_by := ['ts'],
+  pattern := 'DOWN+',
+  define := MAP {'DOWN': $$price < PREV(price)$$},
+  measures := MAP {'n': 'COUNT(*)'});
+----
+include column 'nope' not found

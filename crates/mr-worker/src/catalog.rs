@@ -113,7 +113,8 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
          aggregates, arithmetic/comparison/logical operators), `measures` is a JSON object/array \
          of output expressions whose types are inferred at bind time (with an explicit `type` \
          override available via the array form), `rows` selects ONE ROW PER MATCH (default) or ALL \
-         ROWS PER MATCH, and `after` selects the AFTER MATCH SKIP mode. The matcher backtracks \
+         ROWS PER MATCH, `include` names input columns to carry through to the output \
+         unchanged, and `after` selects the AFTER MATCH SKIP mode. The matcher backtracks \
          with a per-partition step budget so it never hangs. Use it for funnel analysis, \
          sessionization, sequence/anomaly detection, and time-series pattern search — and to keep \
          Oracle/Trino/Snowflake MATCH_RECOGNIZE queries working on DuckDB.",
@@ -121,8 +122,9 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
          `partition_by`, order with `order_by`, match a `pattern` (variables + concat / `|` / \
          quantifiers / grouping / anchors), constrain variables with a JSON `define`, project a \
          JSON `measures` (types inferred at bind), pick `rows` ('one'/'all') and `after` (AFTER \
-         MATCH SKIP). Returns the partition columns plus the measures (ONE ROW) or partition + \
-         order + match_number + classifier + measures (ALL ROWS).",
+         MATCH SKIP). Returns the partition columns plus any `include` columns and the \
+         measures (ONE ROW) or partition + include + order + match_number + classifier + \
+         measures (ALL ROWS).",
         "match_recognize, row pattern matching, MATCH_RECOGNIZE, SQL:2016, funnel, sessionization, \
          sequence detection, anomaly detection, time series, pattern, define, measures, classifier, \
          match_number, partition by, order by, after match skip, Oracle, Trino, Snowflake",
@@ -143,8 +145,9 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
          BOOLEAN, and `||` gives VARCHAR; the array measures form can override any inferred \
          type.\n\n\
          ## ONE ROW PER MATCH (`rows := 'one'`, the default)\n\n\
-         The `partition_by` columns (carried through with their original names and types) \
-         followed by one column per measure, named by the measures key (or its `as`) and \
+         The `partition_by` columns (carried through with their original names and types), \
+         then any `include` columns (likewise, valued on the match's first row), followed by \
+         one column per measure, named by the measures key (or its `as`) and \
          nullable. The names below are those of the one-row worked example.\n\n\
          | Name | Type | Description |\n\
          | --- | --- | --- |\n\
@@ -152,8 +155,8 @@ pub fn match_recognize_metadata() -> FunctionMetadata {
          | match_no | BIGINT | A measure column; here `MATCH_NUMBER()`, the 1-based match ordinal. |\n\
          | bottom | INTEGER | A measure column; here `LAST(DOWN.price)`, so it inherits the price column's type. |\n\n\
          ## ALL ROWS PER MATCH (`rows := 'all'`)\n\n\
-         The `partition_by` columns, then the `order_by` columns, then `match_number` and \
-         `classifier` (added automatically unless a measure of the same name shadows them), then \
+         The `partition_by` columns, then any `include` columns (valued on each matched \
+         row), then the `order_by` columns, then `match_number` and `classifier` (added automatically unless a measure of the same name shadows them), then \
          one column per measure. The names below are those of the all-rows worked example.\n\n\
          | Name | Type | Description |\n\
          | --- | --- | --- |\n\

@@ -38,6 +38,7 @@ fn schema() -> SchemaRef {
 
 fn plan() -> Plan {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A+".into(),
         define_json: "{}".into(),
         subset_json: String::new(),

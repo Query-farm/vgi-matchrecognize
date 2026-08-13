@@ -50,7 +50,7 @@ proptest! {
         pat in pattern_strategy(),
         data in prop::collection::vec(0i64..3, 0..12),
     ) {
-        let cfg = PlanConfig {
+        let cfg = PlanConfig { include: Vec::new(),
             pattern: pat,
             // A,B,C distinguish by x; some rows match none.
             define_json: r#"{"A":"x = 0","B":"x = 1","C":"x = 2"}"#.into(),
@@ -106,7 +106,7 @@ proptest! {
         (dominant, len) in (0i64..3, 12_000usize..20_000),
     ) {
         let data: Vec<i64> = std::iter::repeat_n(dominant, len).collect();
-        let cfg = PlanConfig {
+        let cfg = PlanConfig { include: Vec::new(),
             pattern: pat,
             define_json: r#"{"A":"x = 0","B":"x = 1","C":"x = 2"}"#.into(),
             subset_json: String::new(),

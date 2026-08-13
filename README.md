@@ -81,6 +81,7 @@ catalog `mr`, schema `main` — `mr.match_recognize(…)` and
 mr.match_recognize(
     (<relation>),                -- positional: the input relation, buffered whole
     partition_by  := ['col', …], -- VARCHAR[]  (default [] = one global partition)
+    include       := ['col', …], -- VARCHAR[]  input columns carried through as-is
     order_by      := ['col', …], -- VARCHAR[]  (required; 'col DESC', 'col NULLS FIRST')
     pattern       := '…',        -- the row pattern: a regex over variables
     define        := MAP {…},    -- VAR      -> boolean predicate
@@ -249,14 +250,23 @@ against.
 
 The output schema is fixed at bind time, before any data flows.
 
-- **`rows := 'one'`** — the `partition_by` columns, then one column per measure.
-- **`rows := 'all'`** — the `partition_by` columns, the `order_by` columns,
-  `match_number BIGINT` and `classifier VARCHAR` (automatic unless a measure of
-  that name shadows them), then one column per measure.
+- **`rows := 'one'`** — the `partition_by` columns, the `include` columns, then one
+  column per measure.
+- **`rows := 'all'`** — the `partition_by` columns, the `include` columns, the
+  `order_by` columns, `match_number BIGINT` and `classifier VARCHAR` (automatic
+  unless a measure of that name shadows them), then one column per measure.
 
 > **Deviation from Trino/Oracle.** Under `ALL ROWS PER MATCH` they emit *every*
-> input column and no automatic `match_number`/`classifier`. Project any other
-> input column through a measure — `{"value": "value"}` — if you need it.
+> input column and no automatic `match_number`/`classifier`. Name the ones you want
+> in `include` — `include := ['value']` — which both buffers and emits them; a
+> measure of the same expression works too. Everything else stays unbuffered, which
+> is what keeps an unread column from costing anything.
+
+`include` carries an input column through with its own name and type: under
+`rows := 'all'` it is the value on each matched row, under `rows := 'one'` the value
+on the match's first row (where the partition keys are read from). A column that is
+already emitted — a partition key, or an order key under `rows := 'all'` — is not
+repeated.
 
 Measure **types are inferred** from the input schema: `MATCH_NUMBER()` and
 `COUNT(…)` → `BIGINT`; `CLASSIFIER()` → `VARCHAR`;
@@ -393,15 +403,17 @@ process memory.
   byte-identical to matching one at a time. `VGI_MR_MATCH_THREADS` pins the count;
   1 forces the serial path.
 - **Memory is bounded, and tunable.** If the buffered input exceeds
-  `VGI_MR_FINALIZE_MEMORY_BYTES` (default 256 MB), it is split by partition key into
+  `VGI_MR_FINALIZE_MEMORY_BYTES` (default 128 MB), it is split by partition key into
   shards and each is matched separately, so peak memory tracks a shard rather than
   the relation. Lowering the budget trades time for memory: the split is a second
   pass over the input. Two things cannot be divided that way — a query with no
   `partition_by` is a single partition by definition, and one enormous partition is
   irreducible, because a match may span all of it.
-- **Output streams.** Matching emits ~8k-row batches, so the result set is never
-  fully live however many rows it produces. DuckDB can also stop pulling, and a
-  `LIMIT` then skips the matching it does not need.
+- **Output streams, including inside a match.** Rows are emitted in ~8k-row batches
+  and the producer stops filling one the moment it is full, even in the middle of a
+  long match — so a single partition emitting millions of rows costs one batch of
+  memory, not a partition's worth. DuckDB can also stop pulling, and a `LIMIT` then
+  skips the matching it does not need.
 - **Pre-sorting the input still helps a little.** Ours is a single-threaded sort over
   the buffered rows; DuckDB's is parallel and vectorized. Adding `ORDER BY` to the
   input subquery — `(SELECT … FROM t ORDER BY user_id, ts)` — lets our sort see an

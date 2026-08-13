@@ -358,3 +358,107 @@ So `opt-level = 3` *on its own* is worse than `2` — inlining without cross-cra
 visibility, presumably — and only pays off with thin LTO, which then gives a
 consistent 6–8%. Adopted. The cost is link time: a full release build goes from
 ~35 s to ~1 m 40 s, which CI pays once per job.
+
+## Memory: streaming the output, and what the budget is worth
+
+Measured end to end through DuckDB (haybarn 1.5.5, `SET threads=8`), sampling every
+worker process's RSS at 30-50 ms and the spool directory alongside it. The worker is a
+separate process, so DuckDB's own `memory_limit` does not bound any of this. Peak RSS is
+the sum over worker processes; in practice one process holds essentially all of it (the
+producer — the sinks stay at 7-11 MB).
+
+### The output was the unbounded term
+
+`rows := 'all'` over a relation with **one** partition, 3 BIGINT columns, three
+measures. Sharding cannot help here by construction: it splits by partition key, and
+there is one key.
+
+| rows | before | after | spool |
+|---|---|---|---|
+| 2M | 648 MB / 0.76 s | **153 MB / 0.58 s** | 26 MB |
+| 4M | 1326 MB / 1.54 s | **258 MB / 1.10 s** | 46 MB |
+| 8M | 2702 MB / 3.00 s | **629 MB / 2.16 s** | 76 MB |
+
+Before, peak tracked the *result*: ~340 bytes per output row, all of it live before the
+first batch went out, because `run_partition` materialized a whole partition's rows as
+`Vec<Vec<Value>>`. Now emission stops at a batch boundary — inside a match if that is
+where the batch fills — so what is live is one chunk's matches plus one batch of rows.
+What remains is per input row: the tape, the sort keys, and the match's binds.
+
+The same query with 1000 partitions barely moved (138 → 116 MB at 2M), because the old
+code already streamed *between* partitions. That was the whole gap: it did not stream
+*within* one.
+
+### The budget, re-measured
+
+8M rows x 3 BIGINT, 1000 partitions, and 40M rows x 4 BIGINT, 4000 partitions, varying
+only `VGI_MR_FINALIZE_MEMORY_BYTES`:
+
+| input | budget | wall | peak RSS | peak spool |
+|---|---|---|---|---|
+| 8M | 256 MB — no split | 1.61-1.68 s | 362 MB | 151 MB |
+| | **128 MB (new default)** | 1.74 s | **216 MB** | 271 MB |
+| | 64 MB | 1.79-1.82 s | 162 MB | 225 MB |
+| 40M | 2 GB — no split | 12.6 s | 1774 MB | 1129 MB |
+| | 256 MB | 15.8 s | 643 MB | 1856 MB |
+| | **128 MB (new default)** | 16.3 s | **634 MB** | 1813 MB |
+| | 64 MB | 18.9 s | 604 MB | 1817 MB |
+
+Two things changed since the "~2x the time for ~2x less memory" note above: shard
+records are coalesced and the spool is mapped. The split is now ~5% at 8M and ~3%
+(against 256 MB) at 40M. Below 128 MB the return falls off sharply — at 40M the peak is
+the *split pass itself*, whose mapped sink files count as resident, not the shard — so
+64 MB costs 16% more wall clock for 5% less memory. Hence 128 MB.
+
+Peak temp disk still roughly doubles while a split runs, and the split is a second full
+pass, so a query whose spool outgrows the page cache should *raise* the budget.
+
+### Compression is not free in memory
+
+Same 8M-row query, unsharded (budget pinned at 256 MB), varying only
+`VGI_MR_SPOOL_COMPRESSION`:
+
+| | wall | peak RSS | spool |
+|---|---|---|---|
+| `none` | 1.34 s | **314 MB** | 168 MB |
+| fixed 32 MB trigger (old default) | 1.54 s | 432 MB | 95 MB |
+| `lz4` (all records) | 1.66 s | 359 MB | 75 MB |
+
+An uncompressed record's arrays borrow the mapping, so those pages are file-backed and
+evictable; a compressed one must be inflated into the heap, where it stays for the
+producer's life. The trigger is therefore tied to the budget (half of it, floor 32 MB):
+a spool that will stay unsharded stays mappable, and compression engages where the bytes
+actually hurt.
+
+### Compute phases after the change
+
+Same probe, same machine, `--test-threads=1`. The probe now drives `run_buf` — the
+buffer the worker builds batches from — rather than `run`, which copies it into a `Vec`
+per row; on `A — one match per row` that copy alone was ~30%.
+
+| Phase | before | after |
+|---|---|---|
+| matcher VM floor | 39 | 35-36 ns/row |
+| `A` — one match per row | 96 | **79-80** ns/row |
+| `A+` one match, ONE ROW | 37 | 39 ns/row |
+| `A+` one match, ALL ROWS | 100 | **76-79** ns/row |
+| v-shape, `PREV` predicates | 66 | 66 ns/row |
+| sort, BIGINT key, 1.6M | 211 | 205 ns/row |
+| sort, VARCHAR key, 1.6M | 679 | 675 ns/row |
+| partitioning, 1.6M / 160k partitions | 97 | **86** ns/row |
+
+The emit-heavy shapes gained from the row-major buffer (no allocation per output row),
+partitioning from building the tapes as one counted buffer instead of a `Vec` per
+partition.
+
+### What bounds it now
+
+In the order it bites, for a single partition under ALL ROWS — the worst shape:
+
+1. **The match's binds**, 16 bytes per bound row, because `find_all` collects every
+   match of the partition before any row is emitted. Bounding that means a matcher that
+   yields matches one at a time.
+2. **The tape**, 8 bytes per row, plus the sort's key columns (~9 bytes per row of the
+   partition being sorted) and its `u32` permutation.
+3. **The spool**, mapped, which is file-backed and evictable — so it counts in RSS
+   without being memory the process must own.

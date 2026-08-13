@@ -47,6 +47,7 @@ fn sch() -> Sch {
 /// Bind a call, defaulting everything the individual tests do not care about.
 fn bind(pattern: &str, define: &str, measures: Option<&str>) -> mr_core::Result<Plan> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: pattern.into(),
         define_json: define.into(),
         measures_json: measures.map(str::to_string),

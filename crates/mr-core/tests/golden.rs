@@ -53,6 +53,7 @@ fn v_shape_one_row() {
         ],
     );
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "START DOWN+ UP+".into(),
         define_json: r#"{"DOWN":"price < PREV(price)","UP":"price > PREV(price)"}"#.into(),
         subset_json: String::new(),
@@ -108,6 +109,7 @@ fn login_fail_then_success_all_rows() {
         ],
     );
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "FAIL{3,} OK".into(),
         define_json: r#"{"FAIL":"outcome = 'fail'","OK":"outcome = 'success'"}"#.into(),
         subset_json: String::new(),

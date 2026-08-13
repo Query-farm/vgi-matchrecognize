@@ -9,12 +9,13 @@ use std::collections::HashMap;
 
 use crate::engine::labels::{LabelSet, VarId};
 use crate::engine::matcher::{AfterSkip, Matcher};
-use crate::engine::{Frame, RowStore};
+use crate::engine::{AggMemo, BindIndex, Frame, Match, RowStore};
 use crate::error::{MrError, Result};
 use crate::expr::ast::{AggArg, Expr};
 use crate::expr::parser::{parse as parse_expr, parse_type_name};
 use crate::pattern::compile::{compile, Program};
 use crate::pattern::parser::{parse as parse_pattern, Pattern};
+use crate::rows::RowBuf;
 use crate::types::{infer, BindSchema, Ty};
 use crate::value::Value;
 
@@ -49,6 +50,9 @@ pub struct PlanConfig {
     pub define_json: String,
     pub measures_json: Option<String>,
     pub partition_by: Vec<String>,
+    /// Input columns to carry through to the output unchanged, alongside the
+    /// partition keys. Empty means none.
+    pub include: Vec<String>,
     /// Order-by specs, each `"col"`, `"col DESC"`, `"col NULLS FIRST"`, etc.
     pub order_by: Vec<String>,
     /// `true` = ALL ROWS PER MATCH, `false` = ONE ROW PER MATCH.
@@ -97,6 +101,9 @@ pub struct Plan {
     define: Vec<Option<Expr>>,
     measures: Vec<Measure>,
     partition_by: Vec<String>,
+    /// Passthrough columns, in call order, with anything already emitted as a
+    /// partition or order key removed.
+    include: Vec<String>,
     order_by: Vec<OrderKey>,
     rows_all: bool,
     omit_empty_matches: bool,
@@ -171,9 +178,34 @@ impl Plan {
             return Err(MrError::Bind("step_budget must be positive".into()));
         }
 
+        // Passthrough columns. A column already emitted as a partition key (or, under
+        // ALL ROWS, as an order key) is dropped rather than rejected: naming it is
+        // redundant, not wrong, and emitting it twice would give the result two
+        // columns of the same name.
+        let mut include: Vec<String> = Vec::new();
+        for c in &cfg.include {
+            if schema.col_ty(c).is_none() {
+                return Err(MrError::Bind(format!(
+                    "include column '{c}' not found in the input"
+                )));
+            }
+            let already = cfg.partition_by.iter().any(|p| p.eq_ignore_ascii_case(c))
+                || (cfg.rows_all && order_by.iter().any(|k| k.col.eq_ignore_ascii_case(c)))
+                || include.iter().any(|p| p.eq_ignore_ascii_case(c));
+            if !already {
+                include.push(c.clone());
+            }
+        }
+
         // Output column layout.
         let mut output_columns = Vec::new();
         for c in &cfg.partition_by {
+            output_columns.push(OutputColumn {
+                name: c.clone(),
+                ty: schema.col_ty(c).unwrap(),
+            });
+        }
+        for c in &include {
             output_columns.push(OutputColumn {
                 name: c.clone(),
                 ty: schema.col_ty(c).unwrap(),
@@ -217,6 +249,7 @@ impl Plan {
             define,
             measures,
             partition_by: cfg.partition_by.clone(),
+            include,
             order_by,
             rows_all: cfg.rows_all,
             omit_empty_matches: cfg.omit_empty_matches,
@@ -267,6 +300,9 @@ impl Plan {
         for c in &self.partition_by {
             add(c, &mut out);
         }
+        for c in &self.include {
+            add(c, &mut out);
+        }
         for k in &self.order_by {
             add(&k.col, &mut out);
         }
@@ -279,31 +315,34 @@ impl Plan {
         out
     }
 
-    /// Produce-time: group into partitions, sort each, match, and emit output
-    /// rows in `output_columns` order.
+    /// Produce-time: group into partitions, sort each, match, and emit every
+    /// output row.
     ///
-    /// This materializes every output row at once. Callers that stream (the
-    /// worker) should use [`Plan::partition_tapes`] + [`Plan::run_partition`]
-    /// instead, so only one partition's rows are live at a time.
+    /// This materializes the whole result, so it is for tests and for callers that
+    /// were going to hold everything anyway. The worker streams instead —
+    /// [`Plan::partitions`], then [`Plan::match_partition`] and [`Plan::emit_rows`]
+    /// with a row limit — which keeps one output batch live rather than one
+    /// partition's worth of rows.
     pub fn run(&self, store: &dyn RowStore) -> Result<Vec<Vec<Value>>> {
-        let mut out = Vec::new();
-        for (label, mut tape) in self.partition_tapes(store)? {
-            self.run_partition(store, &label, &mut tape, &mut out)?;
+        Ok(self.run_buf(store)?.to_rows())
+    }
+
+    /// [`Plan::run`], but handing back the buffer the emit path fills rather than a
+    /// `Vec` per row — what a caller that is about to build an Arrow batch wants.
+    pub fn run_buf(&self, store: &dyn RowStore) -> Result<RowBuf> {
+        let mut parts = self.partitions(store)?;
+        let mut out = RowBuf::new(self.output_columns.len());
+        for p in 0..parts.len() {
+            let mut run = {
+                let (label, tape) = parts.part_mut(p);
+                self.match_partition(store, label, tape)?
+            };
+            self.emit_rows(store, parts.tape(p), &mut run, usize::MAX, &mut out)?;
         }
         Ok(out)
     }
 
-    /// The partitions of `store` as `(label, tape)` pairs, in output order. The
-    /// tapes are unsorted; [`Plan::run_partition`] sorts the one it is given.
-    ///
-    /// Splitting this out lets a caller process one partition at a time: the
-    /// tapes are just row indices (8 bytes/row), so holding them all costs far
-    /// less than holding every output row.
-    pub fn partition_tapes(&self, store: &dyn RowStore) -> Result<Vec<(String, Vec<usize>)>> {
-        self.partitions(store)
-    }
-
-    /// Sort, match, and emit one partition, appending its rows to `out`.
+    /// Sort, match, and emit one whole partition into `out`.
     ///
     /// Partitions are independent: `MATCH_NUMBER()` counts matches *within* a
     /// partition, so every partition starts again at 1 (SQL:2016).
@@ -312,8 +351,24 @@ impl Plan {
         store: &dyn RowStore,
         label: &str,
         tape: &mut [usize],
-        out: &mut Vec<Vec<Value>>,
+        out: &mut RowBuf,
     ) -> Result<()> {
+        let mut run = self.match_partition(store, label, tape)?;
+        self.emit_rows(store, tape, &mut run, usize::MAX, out)
+    }
+
+    /// Sort `tape` and find every match in it, without emitting any output row.
+    ///
+    /// This is the half of the work that has to happen all at once — a match may
+    /// span the partition — and the returned [`PartitionRun`] owns its result, so a
+    /// caller can hold several matched partitions (matched concurrently, say) while
+    /// emitting their rows on its own schedule.
+    pub fn match_partition(
+        &self,
+        store: &dyn RowStore,
+        label: &str,
+        tape: &mut [usize],
+    ) -> Result<PartitionRun> {
         self.sort_tape(store, tape)?;
         let mut matcher = Matcher::new(
             &self.program,
@@ -328,34 +383,87 @@ impl Plan {
             1,
         );
         let matches = matcher.find_all()?;
-        // One index for the whole partition, refilled per match: the lists keep their
-        // capacity, so a partition of many short matches pays no per-match allocation.
-        let mut index = crate::engine::BindIndex::new(&self.labels);
-        for m in &matches {
+        Ok(PartitionRun {
+            matches,
+            mi: 0,
+            ri: 0,
+            loaded: false,
+            // One index and one memo for the whole partition, refilled per match:
+            // the lists keep their capacity, so a partition of many short matches
+            // pays no per-match allocation.
+            index: BindIndex::new(&self.labels),
+            memo: AggMemo::new(),
+        })
+    }
+
+    /// Emit output rows from `run` until it holds `limit` rows or the partition is
+    /// exhausted; `tape` must be the same (now sorted) tape that was matched.
+    ///
+    /// The cursor is `(match, row within match)`, so a batch boundary can fall
+    /// *inside* a match — which is the point: under ALL ROWS PER MATCH a single
+    /// match can be as long as the partition, and materializing its rows was the
+    /// one term in this engine that no memory budget bounded. Nothing downstream
+    /// depends on a match arriving whole: rows carry their own `match_number`, and
+    /// they are emitted in the same order either way. The RUNNING horizon is `k`,
+    /// which is stored in the cursor, so a resumed match evaluates exactly as an
+    /// uninterrupted one does.
+    pub fn emit_rows(
+        &self,
+        store: &dyn RowStore,
+        tape: &[usize],
+        run: &mut PartitionRun,
+        limit: usize,
+        out: &mut RowBuf,
+    ) -> Result<()> {
+        let PartitionRun {
+            matches,
+            mi,
+            ri,
+            loaded,
+            index,
+            memo,
+        } = run;
+        while *mi < matches.len() && out.len() < limit {
+            let m = &matches[*mi];
             if m.binds.is_empty() {
                 // An empty match produces exactly one output row (SQL:2016 SHOW
                 // EMPTY MATCHES, the default), positioned at the row where it
                 // occurred, with every measure evaluated over an empty match.
                 // ALL ROWS PER MATCH OMIT EMPTY MATCHES drops it; ONE ROW PER
                 // MATCH always reports it.
-                if self.rows_all && self.omit_empty_matches {
-                    continue;
+                if !(self.rows_all && self.omit_empty_matches) {
+                    emit_row(out, |o| self.emit_empty_row(store, tape, m, o))?;
                 }
-                out.push(self.emit_empty_row(store, tape, m)?);
+                *mi += 1;
                 continue;
             }
-            // Both emit paths resolve `LAST(label)` repeatedly, so index this
-            // match's binds by label once instead of scanning it per lookup.
-            index.refill(&m.binds, &self.labels);
+            if !*loaded {
+                // Both emit paths resolve `LAST(label)` repeatedly, so index this
+                // match's binds by label once instead of scanning it per lookup.
+                index.refill(&m.binds, &self.labels);
+                // The accumulators describe one bind sequence, so they cannot carry
+                // over from the previous match.
+                memo.clear();
+                *loaded = true;
+            }
             if self.rows_all {
-                // One memo per match: the accumulators describe this bind sequence.
-                let memo = crate::engine::AggMemo::new();
-                for k in 0..m.binds.len() {
-                    out.push(self.emit_all_row(store, tape, m, k, &index, &memo)?);
+                while *ri < m.binds.len() && out.len() < limit {
+                    let k = *ri;
+                    emit_row(out, |o| {
+                        self.emit_all_row(store, tape, m, k, index, memo, o)
+                    })?;
+                    *ri += 1;
+                }
+                if *ri < m.binds.len() {
+                    // Stopped mid-match: keep the cursor, the index and the memo.
+                    return Ok(());
                 }
             } else {
-                out.push(self.emit_one_row(store, tape, m, &index)?);
+                emit_row(out, |o| self.emit_one_row(store, tape, m, index, o))?;
             }
+            *mi += 1;
+            *ri = 0;
+            *loaded = false;
         }
         Ok(())
     }
@@ -364,9 +472,10 @@ impl Plan {
         &self,
         store: &dyn RowStore,
         tape: &[usize],
-        m: &crate::engine::Match,
-        index: &crate::engine::BindIndex,
-    ) -> Result<Vec<Value>> {
+        m: &Match,
+        index: &BindIndex,
+        out: &mut RowBuf,
+    ) -> Result<()> {
         let frame = Frame {
             store,
             tape,
@@ -378,16 +487,18 @@ impl Plan {
             // A single output row has no later rows to share a fold with.
             agg_memo: None,
         };
-        let mut row = Vec::with_capacity(self.output_columns.len());
         let anchor_tape = m.binds.first().map(|b| b.tape_pos).unwrap_or(m.start);
         for c in &self.partition_by {
-            row.push(self.col_at(store, tape, anchor_tape, c)?);
+            out.push(self.col_at(store, tape, anchor_tape, c)?);
+        }
+        for c in &self.include {
+            out.push(self.col_at(store, tape, anchor_tape, c)?);
         }
         for meas in &self.measures {
             let v = frame.eval_measure(&meas.expr, true)?;
-            row.push(crate::engine::valops::coerce(v, &meas.ty)?);
+            out.push(crate::engine::valops::coerce(v, &meas.ty)?);
         }
-        Ok(row)
+        Ok(())
     }
 
     /// One output row for an **empty match**: the universal columns come from the
@@ -398,8 +509,9 @@ impl Plan {
         &self,
         store: &dyn RowStore,
         tape: &[usize],
-        m: &crate::engine::Match,
-    ) -> Result<Vec<Value>> {
+        m: &Match,
+        out: &mut RowBuf,
+    ) -> Result<()> {
         let frame = Frame {
             store,
             tape,
@@ -411,40 +523,44 @@ impl Plan {
             label_index: None,
             agg_memo: None,
         };
-        let mut row = Vec::with_capacity(self.output_columns.len());
         for c in &self.partition_by {
-            row.push(self.col_at(store, tape, m.start, c)?);
+            out.push(self.col_at(store, tape, m.start, c)?);
+        }
+        for c in &self.include {
+            out.push(self.col_at(store, tape, m.start, c)?);
         }
         if self.rows_all {
             for key in &self.order_by {
-                row.push(self.col_at(store, tape, m.start, &key.col)?);
+                out.push(self.col_at(store, tape, m.start, &key.col)?);
             }
             if self.auto_match_number {
-                row.push(Value::Int(m.match_number));
+                out.push(Value::Int(m.match_number));
             }
             if self.auto_classifier {
                 // No row is bound, so there is no classifier.
-                row.push(Value::Null);
+                out.push(Value::Null);
             }
         }
         for meas in &self.measures {
             // FINAL for ONE ROW PER MATCH, RUNNING for ALL ROWS — the same default
             // the non-empty paths use. Over an empty match the two coincide.
             let v = frame.eval_measure(&meas.expr, !self.rows_all)?;
-            row.push(crate::engine::valops::coerce(v, &meas.ty)?);
+            out.push(crate::engine::valops::coerce(v, &meas.ty)?);
         }
-        Ok(row)
+        Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_all_row(
         &self,
         store: &dyn RowStore,
         tape: &[usize],
-        m: &crate::engine::Match,
+        m: &Match,
         k: usize,
-        index: &crate::engine::BindIndex,
-        memo: &crate::engine::AggMemo,
-    ) -> Result<Vec<Value>> {
+        index: &BindIndex,
+        memo: &AggMemo,
+        out: &mut RowBuf,
+    ) -> Result<()> {
         let frame = Frame {
             store,
             tape,
@@ -458,24 +574,26 @@ impl Plan {
             agg_memo: Some(memo),
         };
         let row_tape = m.binds[k].tape_pos;
-        let mut row = Vec::with_capacity(self.output_columns.len());
         for c in &self.partition_by {
-            row.push(self.col_at(store, tape, row_tape, c)?);
+            out.push(self.col_at(store, tape, row_tape, c)?);
+        }
+        for c in &self.include {
+            out.push(self.col_at(store, tape, row_tape, c)?);
         }
         for key in &self.order_by {
-            row.push(self.col_at(store, tape, row_tape, &key.col)?);
+            out.push(self.col_at(store, tape, row_tape, &key.col)?);
         }
         if self.auto_match_number {
-            row.push(Value::Int(m.match_number));
+            out.push(Value::Int(m.match_number));
         }
         if self.auto_classifier {
-            row.push(Value::Str(self.labels.name(m.binds[k].var).to_string()));
+            out.push(Value::Str(self.labels.name(m.binds[k].var).to_string()));
         }
         for meas in &self.measures {
             let v = frame.eval_measure(&meas.expr, false)?;
-            row.push(crate::engine::valops::coerce(v, &meas.ty)?);
+            out.push(crate::engine::valops::coerce(v, &meas.ty)?);
         }
-        Ok(row)
+        Ok(())
     }
 
     fn col_at(&self, store: &dyn RowStore, tape: &[usize], tp: usize, name: &str) -> Result<Value> {
@@ -486,10 +604,10 @@ impl Plan {
     }
 
     /// Group rows into partitions (first-seen order preserved).
-    fn partitions(&self, store: &dyn RowStore) -> Result<Vec<(String, Vec<usize>)>> {
+    pub fn partitions(&self, store: &dyn RowStore) -> Result<Partitions> {
         let n = store.num_rows();
         if self.partition_by.is_empty() {
-            return Ok(vec![("(all)".to_string(), (0..n).collect())]);
+            return Ok(Partitions::single("(all)".to_string(), n));
         }
         let idxs: Vec<usize> = self
             .partition_by
@@ -502,11 +620,12 @@ impl Plan {
             .collect::<Result<_>>()?;
         // The common shape — one integer-family key, e.g. `partition_by := ['uid']` —
         // groups on the raw integer, so no key string is built at all.
-        if let Some(groups) = self.partitions_by_int(store, &idxs) {
-            return Ok(groups);
+        if let Some((ids, labels)) = self.group_ids_by_int(store, &idxs) {
+            return Ok(Partitions::from_ids(&ids, labels));
         }
-        let mut order: Vec<String> = Vec::new();
-        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut labels: Vec<String> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut ids = GroupIds::with_capacity(n);
         // One reused buffer, one hash lookup, and an allocation only when a new
         // group appears. Building a `Vec<String>` and joining it per row — then
         // cloning the key twice and looking it up twice — cost about four
@@ -520,21 +639,17 @@ impl Plan {
                 }
                 write_key_part(&mut key, &store.cell(r, ci));
             }
-            match groups.get_mut(&key) {
-                Some(rows) => rows.push(r),
+            match seen.get(&key) {
+                Some(&g) => ids.push(g),
                 None => {
-                    order.push(key.clone());
-                    groups.insert(key.clone(), vec![r]);
+                    let g = labels.len();
+                    seen.insert(key.clone(), g);
+                    labels.push(key.clone());
+                    ids.push(g);
                 }
             }
         }
-        Ok(order
-            .into_iter()
-            .map(|k| {
-                let rows = groups.remove(&k).unwrap();
-                (k, rows)
-            })
-            .collect())
+        Ok(Partitions::from_ids(&ids, labels))
     }
 
     /// Group on a single integer-family partition key, without rendering a key
@@ -547,11 +662,11 @@ impl Plan {
     /// row. Returns `None` when the shape does not apply, including a value that
     /// disagrees with the column's declared type, so the generic path stays the
     /// authority on how keys are formed.
-    fn partitions_by_int(
+    fn group_ids_by_int(
         &self,
         store: &dyn RowStore,
         idxs: &[usize],
-    ) -> Option<Vec<(String, Vec<usize>)>> {
+    ) -> Option<(GroupIds, Vec<String>)> {
         let [ci] = *idxs else { return None };
         let ty = store.col_ty(ci);
         if !matches!(
@@ -562,7 +677,8 @@ impl Plan {
         }
         let n = store.num_rows();
         let mut first_seen: HashMap<Option<i64>, usize> = HashMap::new();
-        let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
+        let mut samples: Vec<Value> = Vec::new();
+        let mut ids = GroupIds::with_capacity(n);
         for r in 0..n {
             let cell = store.cell(r, ci);
             let key = match (&cell, &ty) {
@@ -583,25 +699,27 @@ impl Plan {
                 _ => return None,
             };
             match first_seen.get(&key) {
-                Some(&g) => groups[g].1.push(r),
+                Some(&g) => ids.push(g),
                 None => {
-                    first_seen.insert(key, groups.len());
-                    groups.push((cell, vec![r]));
+                    first_seen.insert(key, samples.len());
+                    ids.push(samples.len());
+                    samples.push(cell);
                 }
             }
         }
-        Some(
-            groups
-                .into_iter()
-                .map(|(sample, rows)| {
+        Some((
+            ids,
+            samples
+                .iter()
+                .map(|sample| {
                     // Same rendering the generic path would produce, so a step-budget
                     // error names the partition the same way either way.
                     let mut label = String::new();
-                    write_key_part(&mut label, &sample);
-                    (label, rows)
+                    write_key_part(&mut label, sample);
+                    label
                 })
                 .collect(),
-        )
+        ))
     }
 
     /// Stable-sort a partition's row indices by the order-by keys.
@@ -630,7 +748,10 @@ impl Plan {
         // Reading the keys out costs a few allocations, so it only pays on a
         // partition big enough to amortise them. A ten-row partition sorts in a
         // handful of comparisons either way, and a query can have 160,000 of them.
-        if tape.len() >= MIN_ROWS_FOR_KEY_SORT
+        // The upper bound is not a tuning knob: the permutation is `u32` and its top
+        // bit marks a cycle as applied, so above it the positions would not fit.
+        // `n as u32` used to wrap silently there.
+        if (MIN_ROWS_FOR_KEY_SORT..=MAX_ROWS_FOR_KEY_SORT).contains(&tape.len())
             && keys
                 .iter()
                 .all(|&(ci, _, _)| fixed_width(&store.col_ty(ci)))
@@ -678,9 +799,252 @@ impl Plan {
             }
             std::cmp::Ordering::Equal
         });
-        let original: Vec<usize> = tape.to_vec();
-        for (slot, &p) in tape.iter_mut().zip(&perm) {
-            *slot = original[p as usize];
+        apply_permutation(tape, &mut perm);
+    }
+}
+
+/// The partitions of a relation: every partition's row indices, in one buffer.
+///
+/// Partition `p` owns `rows[bounds[p]..bounds[p + 1]]` and is named `labels[p]`,
+/// with partitions in first-seen order and rows ascending within each.
+///
+/// The previous shape was a `Vec<(String, Vec<usize>)>` — one growable `Vec` per
+/// partition, filled by pushing. That costs a header and a separate allocation per
+/// partition, and, because the sizes are not known in advance, up to twice the row
+/// indices in doubling slack that is never returned. Counting the groups first and
+/// filling exact-size ranges gives one allocation for the whole relation, which on
+/// a large input is the difference between 8 and up to 16 bytes per row of resident
+/// memory, and takes the per-partition allocation out of a query with hundreds of
+/// thousands of tiny partitions.
+///
+/// The indices stay `usize` rather than `u32`. Halving them would cap the relation
+/// at 4.29B rows, and — since the matcher's tape is `usize` — would need every
+/// partition expanded into a scratch buffer before it could be matched, which costs
+/// *more* on the one shape that hurts most: a single partition holding everything.
+pub struct Partitions {
+    rows: Vec<usize>,
+    /// `len() + 1` entries: the start of each partition, then the total.
+    bounds: Vec<usize>,
+    labels: Vec<String>,
+}
+
+impl Partitions {
+    /// The whole relation as one partition (no `partition_by`).
+    fn single(label: String, n: usize) -> Partitions {
+        Partitions {
+            rows: (0..n).collect(),
+            bounds: vec![0, n],
+            labels: vec![label],
+        }
+    }
+
+    /// Group `ids` (one group id per row, in row order) into contiguous ranges.
+    fn from_ids(ids: &GroupIds, labels: Vec<String>) -> Partitions {
+        let n = ids.len();
+        let ngroups = labels.len();
+        // Count, prefix-sum, then place each row at its group's cursor: one pass to
+        // size every range exactly and one to fill them, with rows landing in
+        // ascending order within a partition because `r` ascends.
+        let mut bounds = vec![0usize; ngroups + 1];
+        for r in 0..n {
+            bounds[ids.get(r) + 1] += 1;
+        }
+        for g in 0..ngroups {
+            bounds[g + 1] += bounds[g];
+        }
+        let mut cursor = bounds[..ngroups].to_vec();
+        let mut rows = vec![0usize; n];
+        for r in 0..n {
+            let g = ids.get(r);
+            rows[cursor[g]] = r;
+            cursor[g] += 1;
+        }
+        Partitions {
+            rows,
+            bounds,
+            labels,
+        }
+    }
+
+    /// How many partitions.
+    pub fn len(&self) -> usize {
+        self.labels.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.labels.is_empty()
+    }
+
+    /// Rows across every partition.
+    pub fn total_rows(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Rows in partition `p`.
+    pub fn rows_in(&self, p: usize) -> usize {
+        self.bounds[p + 1] - self.bounds[p]
+    }
+
+    /// Partition `p`'s name (the rendered partition key).
+    pub fn label(&self, p: usize) -> &str {
+        &self.labels[p]
+    }
+
+    /// Partition `p`'s tape — sorted, once it has been through
+    /// [`Plan::match_partition`].
+    pub fn tape(&self, p: usize) -> &[usize] {
+        &self.rows[self.bounds[p]..self.bounds[p + 1]]
+    }
+
+    /// Partition `p`'s name and its tape, mutably (the matcher sorts in place).
+    pub fn part_mut(&mut self, p: usize) -> (&str, &mut [usize]) {
+        let (lo, hi) = (self.bounds[p], self.bounds[p + 1]);
+        (&self.labels[p], &mut self.rows[lo..hi])
+    }
+
+    /// Partitions `from..to`, each with its own mutable tape.
+    ///
+    /// Disjoint slices of one buffer, so a caller can hand each partition to a
+    /// different thread and every tape is still sorted in place.
+    pub fn chunk_mut(&mut self, from: usize, to: usize) -> Vec<(&str, &mut [usize])> {
+        let (lo, hi) = (self.bounds[from], self.bounds[to]);
+        let mut rest = &mut self.rows[lo..hi];
+        let mut out = Vec::with_capacity(to - from);
+        for p in from..to {
+            let (head, tail) = rest.split_at_mut(self.bounds[p + 1] - self.bounds[p]);
+            out.push((self.labels[p].as_str(), head));
+            rest = tail;
+        }
+        out
+    }
+}
+
+/// One group id per row, in row order.
+///
+/// `u32` while the relation fits it, which is the only case that will ever run;
+/// the `usize` arm keeps a relation of more than 4.29B rows correct rather than
+/// silently wrapping into the wrong partition.
+enum GroupIds {
+    Small(Vec<u32>),
+    Large(Vec<usize>),
+}
+
+impl GroupIds {
+    fn with_capacity(n: usize) -> GroupIds {
+        if n <= u32::MAX as usize {
+            GroupIds::Small(Vec::with_capacity(n))
+        } else {
+            GroupIds::Large(Vec::with_capacity(n))
+        }
+    }
+
+    fn push(&mut self, g: usize) {
+        match self {
+            GroupIds::Small(v) => v.push(g as u32),
+            GroupIds::Large(v) => v.push(g),
+        }
+    }
+
+    fn get(&self, r: usize) -> usize {
+        match self {
+            GroupIds::Small(v) => v[r] as usize,
+            GroupIds::Large(v) => v[r],
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            GroupIds::Small(v) => v.len(),
+            GroupIds::Large(v) => v.len(),
+        }
+    }
+}
+
+/// One partition's matches, plus a cursor over the output rows they produce.
+///
+/// Produced by [`Plan::match_partition`] and drained by [`Plan::emit_rows`]. It
+/// owns everything it needs except the tape, so it can be moved out of the thread
+/// that matched it and emitted later, a batch at a time.
+pub struct PartitionRun {
+    matches: Vec<Match>,
+    /// Next match to emit from.
+    mi: usize,
+    /// Next bind within `matches[mi]` (ALL ROWS PER MATCH only).
+    ri: usize,
+    /// Whether `index` and `memo` describe `matches[mi]` yet.
+    loaded: bool,
+    index: BindIndex,
+    memo: AggMemo,
+}
+
+impl PartitionRun {
+    /// Whether every output row has been emitted.
+    pub fn is_done(&self) -> bool {
+        self.mi >= self.matches.len()
+    }
+
+    /// Matches found in this partition.
+    pub fn matches(&self) -> usize {
+        self.matches.len()
+    }
+}
+
+/// Emit one output row, discarding a half-written one if a measure fails.
+///
+/// The buffer is row-major with no per-row structure, so a partial row would
+/// silently shift every column of every row after it. The query is over either
+/// way, but a producer may hold the buffer while it reports the error.
+fn emit_row(out: &mut RowBuf, f: impl FnOnce(&mut RowBuf) -> Result<()>) -> Result<()> {
+    let mark = out.cells();
+    match f(out) {
+        Ok(()) => {
+            out.end_row();
+            Ok(())
+        }
+        Err(e) => {
+            out.truncate_cells(mark);
+            Err(e)
+        }
+    }
+}
+
+/// Marks a permutation slot whose cycle has been applied. The positions
+/// themselves are bounded by [`MAX_ROWS_FOR_KEY_SORT`], so the top bit is free.
+const PERM_DONE: u32 = 1 << 31;
+
+/// Largest partition the key-sort path handles, from the `u32` permutation minus
+/// its [`PERM_DONE`] bit. Anything larger sorts through `cmp_cells` instead.
+const MAX_ROWS_FOR_KEY_SORT: usize = (PERM_DONE - 1) as usize;
+
+/// Rearrange `tape` so that `tape[i]` becomes the element `perm[i]` named, in
+/// place. `perm` is consumed as scratch (its slots are marked as they are applied).
+///
+/// The obvious version copies the tape and scatters through the copy, which costs
+/// another 8 bytes per row of the partition — on the one shape that has no other
+/// relief, a single huge partition, that copy was the largest allocation in the
+/// sort after the keys themselves. Following each cycle instead writes every slot
+/// exactly once with no second buffer.
+fn apply_permutation(tape: &mut [usize], perm: &mut [u32]) {
+    debug_assert_eq!(tape.len(), perm.len());
+    for start in 0..tape.len() {
+        if perm[start] & PERM_DONE != 0 {
+            continue;
+        }
+        // `held` is the element that belongs to whichever slot gathers from
+        // `start`; it is placed when the cycle closes back onto it.
+        let held = tape[start];
+        let mut slot = start;
+        loop {
+            let from = (perm[slot] & !PERM_DONE) as usize;
+            perm[slot] |= PERM_DONE;
+            if from == start {
+                tape[slot] = held;
+                break;
+            }
+            // Sound because `from` is written only on the next turn of this loop,
+            // so it still holds its pre-permutation element.
+            tape[slot] = tape[from];
+            slot = from;
         }
     }
 }
@@ -1265,5 +1629,72 @@ impl Pattern {
     /// Render this pattern for `explain_pattern` (re-exported convenience).
     pub fn explain(&self) -> String {
         crate::pattern::compile::explain(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference the in-place version has to match: `out[i] = tape[perm[i]]`.
+    fn scattered(tape: &[usize], perm: &[u32]) -> Vec<usize> {
+        perm.iter().map(|&p| tape[p as usize]).collect()
+    }
+
+    #[test]
+    fn a_permutation_is_applied_in_place() {
+        // A rotation, a reversal, the identity, a fixed point beside a swap, and one
+        // long cycle — the shapes the cycle walk has to close correctly.
+        let cases: Vec<Vec<u32>> = vec![
+            vec![],
+            vec![0],
+            vec![1, 0],
+            vec![0, 1, 2, 3],
+            vec![3, 2, 1, 0],
+            vec![1, 2, 3, 0],
+            vec![0, 2, 1, 3],
+            vec![4, 0, 3, 1, 2],
+        ];
+        for perm in cases {
+            let tape: Vec<usize> = (0..perm.len()).map(|i| i * 10 + 7).collect();
+            let want = scattered(&tape, &perm);
+            let mut got = tape.clone();
+            let mut scratch = perm.clone();
+            apply_permutation(&mut got, &mut scratch);
+            assert_eq!(got, want, "permutation {perm:?}");
+        }
+    }
+
+    /// Every permutation of eight elements, so no cycle decomposition is missed.
+    #[test]
+    fn every_small_permutation_is_applied_correctly() {
+        let mut perm: Vec<u32> = (0..8).collect();
+        let mut count = 0;
+        loop {
+            let tape: Vec<usize> = (0..perm.len()).map(|i| i * 3 + 1).collect();
+            let want = scattered(&tape, &perm);
+            let mut got = tape.clone();
+            let mut scratch = perm.clone();
+            apply_permutation(&mut got, &mut scratch);
+            assert_eq!(got, want, "permutation {perm:?}");
+            count += 1;
+            if !next_permutation(&mut perm) {
+                break;
+            }
+        }
+        assert_eq!(count, 40_320, "8! permutations");
+    }
+
+    /// Next permutation in lexicographic order; `false` once the last is reached.
+    fn next_permutation(v: &mut [u32]) -> bool {
+        let Some(i) = (0..v.len().saturating_sub(1)).rfind(|&i| v[i] < v[i + 1]) else {
+            return false;
+        };
+        let j = (i + 1..v.len())
+            .rfind(|&j| v[j] > v[i])
+            .expect("a successor");
+        v.swap(i, j);
+        v[i + 1..].reverse();
+        true
     }
 }

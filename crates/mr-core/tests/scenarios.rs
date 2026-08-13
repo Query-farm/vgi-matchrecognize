@@ -60,6 +60,7 @@ fn cfg(
     rows_all: bool,
 ) -> PlanConfig {
     PlanConfig {
+        include: Vec::new(),
         pattern: pattern.into(),
         define_json: define.into(),
         subset_json: String::new(),
@@ -239,6 +240,7 @@ fn one_vs_all_rows_schema() {
         rows: vec![vec![s("X"), i(1)], vec![s("X"), i(2)]],
     };
     let mk = |rows_all| PlanConfig {
+        include: Vec::new(),
         pattern: "A B".into(),
         define_json: "{}".into(),
         subset_json: String::new(),

@@ -1,5 +1,5 @@
-//! Build an Arrow `RecordBatch` from mr-core output rows (`Vec<Vec<Value>>`)
-//! against the bind-time output schema.
+//! Build an Arrow `RecordBatch` from an mr-core [`RowBuf`] against the bind-time
+//! output schema.
 
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ use arrow_array::{
 use arrow_buffer::{IntervalMonthDayNano, OffsetBuffer};
 use arrow_schema::{Field, SchemaRef};
 use mr_core::plan::OutputColumn;
+use mr_core::rows::RowBuf;
 use mr_core::types::{TimeUnit, Ty};
 use mr_core::value::Value;
 use vgi_rpc::{Result, RpcError};
@@ -25,7 +26,7 @@ fn re(e: impl std::fmt::Display) -> RpcError {
 pub fn build_batch(
     schema: SchemaRef,
     columns: &[OutputColumn],
-    rows: &[Vec<Value>],
+    rows: &RowBuf,
 ) -> Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for (j, col) in columns.iter().enumerate() {
@@ -34,7 +35,7 @@ pub fn build_batch(
     RecordBatch::try_new(schema, arrays).map_err(re)
 }
 
-fn build_column(ty: &Ty, rows: &[Vec<Value>], j: usize) -> Result<ArrayRef> {
+fn build_column(ty: &Ty, rows: &RowBuf, j: usize) -> Result<ArrayRef> {
     Ok(match ty {
         Ty::Boolean => Arc::new(
             rows.iter()
@@ -89,18 +90,18 @@ fn build_column(ty: &Ty, rows: &[Vec<Value>], j: usize) -> Result<ArrayRef> {
         // record where each row's slice starts. NULL and the empty list are
         // distinct — an empty match yields an empty list, not NULL.
         Ty::List(elem) => {
-            let mut flat: Vec<Vec<Value>> = Vec::new();
+            let mut flat = RowBuf::new(1);
             let mut offsets: Vec<i32> = Vec::with_capacity(rows.len() + 1);
             let mut nulls: Vec<bool> = Vec::with_capacity(rows.len());
             let mut acc = 0i32;
             offsets.push(acc);
-            for r in rows {
+            for r in rows.iter() {
                 match &r[j] {
                     Value::List(items) => {
                         nulls.push(true);
                         acc += items.len() as i32;
                         for it in items {
-                            flat.push(vec![it.clone()]);
+                            flat.push(it.clone());
                         }
                     }
                     Value::Null => nulls.push(false),
@@ -139,7 +140,7 @@ fn build_column(ty: &Ty, rows: &[Vec<Value>], j: usize) -> Result<ArrayRef> {
     })
 }
 
-fn build_timestamp(rows: &[Vec<Value>], j: usize, u: TimeUnit) -> ArrayRef {
+fn build_timestamp(rows: &RowBuf, j: usize, u: TimeUnit) -> ArrayRef {
     let vals: Vec<Option<i64>> = rows
         .iter()
         .map(|r| match &r[j] {
@@ -155,7 +156,7 @@ fn build_timestamp(rows: &[Vec<Value>], j: usize, u: TimeUnit) -> ArrayRef {
     }
 }
 
-fn build_time(rows: &[Vec<Value>], j: usize, u: TimeUnit) -> ArrayRef {
+fn build_time(rows: &RowBuf, j: usize, u: TimeUnit) -> ArrayRef {
     let vals: Vec<Option<i64>> = rows
         .iter()
         .map(|r| match &r[j] {

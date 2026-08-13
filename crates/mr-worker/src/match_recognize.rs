@@ -20,7 +20,8 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{Schema, SchemaRef};
-use mr_core::plan::{Plan, PlanConfig};
+use mr_core::plan::{PartitionRun, Partitions, Plan, PlanConfig};
+use mr_core::rows::RowBuf;
 use vgi::arguments::Arguments;
 use vgi::buffering::{BufferingParams, TableBufferingFunction};
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata};
@@ -82,6 +83,7 @@ fn plan_config(args: &Arguments) -> Result<PlanConfig> {
     let subset_json = crate::args::structured_arg(args, "subset")?.unwrap_or_default();
     let measures_json = crate::args::structured_arg(args, "measures")?;
     let partition_by = named_str_list(args, "partition_by")?;
+    let include = named_str_list(args, "include")?;
     let order_by = named_str_list(args, "order_by")?;
     let rows = args
         .named_str("rows")
@@ -111,6 +113,7 @@ fn plan_config(args: &Arguments) -> Result<PlanConfig> {
     // Absent -> None, i.e. scale the budget with each partition's row count.
     let step_budget = args.named_i64("step_budget");
     Ok(PlanConfig {
+        include,
         pattern,
         define_json,
         subset_json,
@@ -286,6 +289,17 @@ impl TableBufferingFunction for MatchRecognize {
                 varchar_list.clone(),
                 "Column names to partition by (like SQL `PARTITION BY`). Each partition is matched \
                  independently. Omit for a single global partition.",
+            ),
+            ArgSpec::const_typed(
+                "include",
+                -1,
+                varchar_list.clone(),
+                "Names of input columns to carry through to the output unchanged, emitted next to \
+                 the partition keys under their own names and types. Only the columns the query \
+                 reads are buffered, so naming a column here is what makes it available — the \
+                 result otherwise holds just the partition keys, the automatic columns and the \
+                 measures. A column that is already emitted as a partition key or an order key is \
+                 not repeated. Omit it to carry nothing extra.",
             ),
             ArgSpec::const_typed(
                 "order_by",
@@ -519,13 +533,16 @@ impl TableBufferingFunction for MatchRecognize {
             0 | 1 => crate::spool::discard(&state.scope),
             _ => crate::spool::discard_shard(&state.scope, state.shard as usize),
         }
-        let tapes = plan.partition_tapes(&store).map_err(ve)?;
+        let parts = plan.partitions(&store).map_err(ve)?;
+        let ncols = plan.output_columns().len();
         Ok(Box::new(PartitionStream {
             plan,
             store,
-            tapes: tapes.into_iter(),
+            parts,
+            next_part: 0,
             output_schema: params.output_schema.clone(),
             ready: std::collections::VecDeque::new(),
+            rows: RowBuf::new(ncols),
             threads: match_threads(),
         }))
     }
@@ -571,90 +588,94 @@ fn match_threads() -> usize {
         .unwrap_or(1)
 }
 
-/// Streams the result, running the matcher one partition at a time and emitting
+/// Streams the result, matching a chunk of partitions at a time and emitting
 /// batches of roughly [`TARGET_BATCH_ROWS`] rows.
 ///
-/// Only the rows of the partitions accumulated so far are ever materialized, not
-/// the whole result set. Each partition is numbered independently, so batching
-/// several into one output batch cannot affect MATCH_NUMBER.
+/// What is live is one chunk's *matches* plus one output batch's rows — never a
+/// whole partition's output. That distinction is the memory bound: under ALL ROWS
+/// PER MATCH a partition emits one row per input row, so a relation with one big
+/// partition used to materialize its entire result before the first batch went out,
+/// and no memory budget covered it (sharding splits by partition key, which by
+/// definition cannot split one partition).
+///
+/// Each partition is numbered independently, so batching several into one output
+/// batch cannot affect MATCH_NUMBER, and a batch boundary inside a match is
+/// invisible downstream — the rows are the same rows in the same order.
 struct PartitionStream {
     plan: Plan,
     store: BatchRowStore,
-    tapes: std::vec::IntoIter<(String, Vec<usize>)>,
+    /// Every partition's tape, sorted in place as each is matched.
+    parts: Partitions,
+    /// Next partition to match.
+    next_part: usize,
     output_schema: SchemaRef,
 
-    /// Matched partitions waiting to be emitted, each entry one partition's rows, in
-    /// partition order. Keeping them grouped means a partition's rows stay contiguous
-    /// and a match is never split across output batches.
-    ready: std::collections::VecDeque<Vec<Vec<mr_core::value::Value>>>,
+    /// Matched partitions with rows still to emit, in partition order.
+    ready: std::collections::VecDeque<(usize, PartitionRun)>,
+    /// The batch under construction, reused so a steady stream allocates nothing.
+    rows: RowBuf,
     /// Threads to match on. Read once, so a query cannot change it midway.
     threads: usize,
 }
 
 impl PartitionStream {
-    /// Rows currently queued for emission.
-    fn ready_rows(&self) -> usize {
-        self.ready.iter().map(|g| g.len()).sum()
-    }
-
-    /// Match the next chunk of partitions, appending their rows to `ready`.
+    /// Match the next chunk of partitions, queueing them for emission.
     ///
-    /// Partitions are independent — `run_partition` takes an immutable plan and store,
-    /// its own tape, and MATCH_NUMBER restarts at 1 for each — so a chunk is matched
-    /// concurrently and the results are appended **in partition order**, which keeps
-    /// the output byte-identical to the serial path.
+    /// Partitions are independent — `match_partition` takes an immutable plan and
+    /// store, its own tape, and MATCH_NUMBER restarts at 1 for each — so a chunk is
+    /// matched concurrently and the runs are queued **in partition order**, which
+    /// keeps the output byte-identical to the serial path.
     fn match_chunk(&mut self) -> Result<bool> {
-        let mut chunk: Vec<(String, Vec<usize>)> = Vec::new();
+        let from = self.next_part;
+        let mut to = from;
         let mut input_rows = 0usize;
-        for tape in self.tapes.by_ref() {
-            input_rows += tape.1.len();
-            chunk.push(tape);
-            if input_rows >= LOOKAHEAD_ROWS || chunk.len() >= MAX_CHUNK_PARTITIONS {
+        while to < self.parts.len() {
+            input_rows += self.parts.rows_in(to);
+            to += 1;
+            if input_rows >= LOOKAHEAD_ROWS || to - from >= MAX_CHUNK_PARTITIONS {
                 break;
             }
         }
-        if chunk.is_empty() {
+        if to == from {
             return Ok(false);
         }
+        self.next_part = to;
 
-        let threads = self.threads.min(chunk.len());
-        // One thread, or too little work to be worth spawning any: stay on this one.
-        if threads <= 1 || input_rows < TARGET_BATCH_ROWS {
-            for (label, tape) in &mut chunk {
-                let mut rows = Vec::new();
-                self.plan
-                    .run_partition(&self.store, label, tape, &mut rows)
-                    .map_err(ve)?;
-                self.ready.push_back(rows);
-            }
-            return Ok(true);
-        }
-
-        // Contiguous slices, so each thread owns its tapes outright and the results
-        // land in their original positions with no synchronisation.
-        let per_thread = chunk.len().div_ceil(threads);
-        let mut slots: Vec<mr_core::error::Result<Vec<Vec<mr_core::value::Value>>>> =
-            (0..chunk.len()).map(|_| Ok(Vec::new())).collect();
         let plan = &self.plan;
         let store = &self.store;
-        std::thread::scope(|scope| {
-            for (out_slice, work) in slots
-                .chunks_mut(per_thread)
-                .zip(chunk.chunks_mut(per_thread))
-            {
-                scope.spawn(move || {
-                    for (slot, (label, tape)) in out_slice.iter_mut().zip(work.iter_mut()) {
-                        let mut rows = Vec::new();
-                        *slot = plan
-                            .run_partition(store, label, tape, &mut rows)
-                            .map(|()| rows);
-                    }
-                });
+        let mut chunk = self.parts.chunk_mut(from, to);
+        let threads = self.threads.min(chunk.len());
+        let mut slots: Vec<Option<mr_core::error::Result<PartitionRun>>> =
+            (0..chunk.len()).map(|_| None).collect();
+
+        // One thread, or too little work to be worth spawning any: stay on this one.
+        if threads <= 1 || input_rows < TARGET_BATCH_ROWS {
+            for (slot, (label, tape)) in slots.iter_mut().zip(chunk.iter_mut()) {
+                *slot = Some(plan.match_partition(store, label, tape));
             }
-        });
+        } else {
+            // Contiguous slices, so each thread owns its tapes outright and the
+            // results land in their original positions with no synchronisation.
+            let per_thread = chunk.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                for (out_slice, work) in slots
+                    .chunks_mut(per_thread)
+                    .zip(chunk.chunks_mut(per_thread))
+                {
+                    scope.spawn(move || {
+                        for (slot, (label, tape)) in out_slice.iter_mut().zip(work.iter_mut()) {
+                            *slot = Some(plan.match_partition(store, label, tape));
+                        }
+                    });
+                }
+            });
+        }
         // First failure in partition order wins, so an error is reproducible.
-        for slot in slots {
-            self.ready.push_back(slot.map_err(ve)?);
+        for (i, slot) in slots.into_iter().enumerate() {
+            let run = slot
+                .expect("every partition in the chunk was matched")
+                .map_err(ve)?;
+            self.ready.push_back((from + i, run));
         }
         Ok(true)
     }
@@ -662,29 +683,40 @@ impl PartitionStream {
 
 impl TableProducer for PartitionStream {
     fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
-        // Match ahead until there is a batch's worth queued, or the input is drained.
-        while self.ready_rows() < TARGET_BATCH_ROWS {
-            if !self.match_chunk()? {
+        self.rows.clear();
+        loop {
+            // Drain what has already been matched, stopping the moment the batch is
+            // full — a partition (or a single long match) resumes where it left off
+            // on the next call.
+            let PartitionStream {
+                plan,
+                store,
+                parts,
+                ready,
+                rows,
+                ..
+            } = self;
+            while let Some((p, run)) = ready.front_mut() {
+                plan.emit_rows(store, parts.tape(*p), run, TARGET_BATCH_ROWS, rows)
+                    .map_err(ve)?;
+                if run.is_done() {
+                    ready.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if self.rows.len() >= TARGET_BATCH_ROWS || !self.match_chunk()? {
                 break;
             }
         }
-        // Emit whole partitions: a single one may overshoot the target, which is
-        // deliberate — a match is never split across output batches.
-        let mut rows: Vec<Vec<mr_core::value::Value>> = Vec::new();
-        while let Some(group) = self.ready.pop_front() {
-            rows.extend(group);
-            if rows.len() >= TARGET_BATCH_ROWS {
-                break;
-            }
-        }
-        if rows.is_empty() {
+        if self.rows.is_empty() {
             // Every remaining partition matched nothing: end of stream.
             return Ok(None);
         }
         build_batch(
             self.output_schema.clone(),
             self.plan.output_columns(),
-            &rows,
+            &self.rows,
         )
         .map(Some)
     }

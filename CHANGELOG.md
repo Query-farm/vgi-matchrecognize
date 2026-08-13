@@ -8,6 +8,37 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Output rows stream in fixed-size batches, including through a long match.**
+  The producer used to materialize one whole partition's output before it could
+  emit anything, and `Vec<Vec<Value>>` cost a header plus an allocation per row.
+  Under `rows := 'all'` a partition emits one row per input row, so a relation
+  that is one big partition — exactly the shape sharding cannot split — scaled
+  its peak memory with the result: **8M rows measured 2.70 GB, now 0.63 GB**
+  (2M: 648 → 153 MB; 4M: 1326 → 258 MB), and it got faster too (3.00 → 2.16 s).
+  Emission now runs off a `(match, row-within-match)` cursor that can stop inside
+  a match and resume with the same RUNNING horizon, bind index and aggregate
+  accumulators, into a row-major `RowBuf`.
+- **The finalize memory budget defaults to 128 MB**, down from 256 MB. The split
+  pass is much cheaper than when that number was chosen — on 8M rows x 3 BIGINT
+  it costs ~5% of wall clock and halves peak RSS (362 → 216 MB), and on 40M rows
+  it is within 3% of not splitting at all while holding memory to 634 MB against
+  1774 MB. `VGI_MR_FINALIZE_MEMORY_BYTES` still overrides it; raise it for a
+  query whose spool outgrows the page cache, where the second pass does cost
+  real time.
+- **Spool compression starts at half the finalize budget** (floor 32 MB) instead
+  of a fixed 32 MB per sink. Compression is not free in memory: an uncompressed
+  record is decoded straight out of the mapping and its arrays borrow it, while a
+  compressed one is inflated into the heap and stays there for the producer's
+  life. The fixed threshold meant a query whose spool fit the budget — one that
+  was going to be read back whole — turned most of the relation into anonymous
+  memory to save disk it was not short of. Measured on 8M rows: 432 → 314 MB.
+- **Partition tapes are built as one contiguous buffer** (rows + per-partition
+  bounds + labels) by a counting pass, instead of a growable `Vec` per partition.
+  That removes a header and an allocation per partition and up to 8 bytes per row
+  of doubling slack that was never returned.
+- **The sort applies its permutation in place**, following cycles rather than
+  copying the tape, which saves another 8 bytes per row of the largest partition.
+
 - **DEFINE predicates are type-checked at bind time.** They were only parsed, so
   a predicate that could never be true produced an empty result and no message.
   All three of these now fail at bind, naming the key:
@@ -37,6 +68,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   measure's `type` override.
 
 ### Added
+
+- **`include := ['col', …]`** carries input columns through to the output
+  unchanged, next to the partition keys — the value on each matched row under
+  `rows := 'all'`, on the match's first row under `'one'`. SQL:2016 ALL ROWS PER
+  MATCH passes the whole input row through; this function emits only what the
+  query reads, because buffering a column it never reads is the most expensive
+  thing it can do (one unused 200-byte column measured 2.8x), so passthrough is
+  opt-in per column. A column already emitted as a partition or order key is not
+  repeated, and an unknown one fails at bind.
 
 - **`UBIGINT` is a first-class type.** It used to be folded into `BIGINT` and
   read with `as i64`, so any value above `i64::MAX` arrived negative and stayed

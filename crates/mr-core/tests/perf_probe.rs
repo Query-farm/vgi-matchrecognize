@@ -16,6 +16,12 @@
 //! machine — but they are what to run before and after touching a phase, and
 //! `docs/perf-baseline.md` records the numbers they printed on a known machine.
 //!
+//! They drive `Plan::run_buf`, which is what the worker's producer builds its output
+//! batches from. `Plan::run` wraps it in a copy into a `Vec` per row for callers that
+//! want that shape, and measuring *that* charges every phase for an allocation per
+//! output row: on `A — one match per row` (a million output rows) the copy alone is
+//! ~30% of the total.
+//!
 //! Three probes, because the costs have different shapes:
 //!
 //! - [`perf_sort_and_partition`] — per-row costs that scale with the *input*
@@ -93,6 +99,7 @@ fn build(n: usize, partitions: usize, varchar_key: bool) -> VecRowStore {
 
 fn plan_for(order_col: &str, partitioned: bool) -> Plan {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A".into(),
         define_json: r#"{"A":"k < 0"}"#.into(), // never matches: isolates partition+sort
         subset_json: String::new(),
@@ -114,6 +121,7 @@ fn plan_for(order_col: &str, partitioned: bool) -> Plan {
 /// A plan over `pattern`/`define`/`measures`, ordered by `k`, one partition.
 fn plan_of(pattern: &str, define: &str, measures: &str, rows_all: bool) -> Plan {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: pattern.into(),
         define_json: define.into(),
         subset_json: String::new(),
@@ -155,7 +163,7 @@ fn perf_sort_and_partition() {
         let store = build(n, 1, false);
         let plan = plan_for("k", false);
         let ms = time(&format!("  {n:>9} rows, order_by k"), || {
-            plan.run(&store).unwrap();
+            plan.run_buf(&store).unwrap();
         });
         eprintln!("{:>62.0} ns/row", ms * 1e6 / n as f64);
     }
@@ -165,7 +173,7 @@ fn perf_sort_and_partition() {
         let store = build(n, 1, true);
         let plan = plan_for("s", false);
         let ms = time(&format!("  {n:>9} rows, order_by s"), || {
-            plan.run(&store).unwrap();
+            plan.run_buf(&store).unwrap();
         });
         eprintln!("{:>62.0} ns/row", ms * 1e6 / n as f64);
     }
@@ -175,7 +183,7 @@ fn perf_sort_and_partition() {
         let store = build(n, n / 10, false);
         let plan = plan_for("k", true);
         let ms = time(&format!("  {n:>9} rows, {} partitions", n / 10), || {
-            plan.run(&store).unwrap();
+            plan.run_buf(&store).unwrap();
         });
         eprintln!("{:>62.0} ns/row", ms * 1e6 / n as f64);
     }
@@ -193,7 +201,7 @@ fn perf_sort_and_partition() {
         );
         let plan = plan_for("k", false);
         time(&format!("  {label}"), || {
-            plan.run(&store).unwrap();
+            plan.run_buf(&store).unwrap();
         });
     }
 }
@@ -242,7 +250,7 @@ fn perf_matcher() {
         ),
     ] {
         let ms = time(&format!("  {label:<44}"), || {
-            plan.run(&store).unwrap();
+            plan.run_buf(&store).unwrap();
         });
         eprintln!("{:>62.0} ns/row", ms * 1e6 / N as f64);
     }
@@ -331,7 +339,7 @@ fn perf_match_length() {
             let store = ordered_store(l);
             let plan = plan_of("A B*", define, measures, rows_all);
             let ms = time(&format!("    L = {l:>6}"), || {
-                plan.run(&store).unwrap();
+                plan.run_buf(&store).unwrap();
             });
             let ns_per_row = ms * 1e6 / l as f64;
             eprintln!(

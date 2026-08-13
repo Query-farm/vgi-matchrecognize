@@ -1,4 +1,5 @@
-//! Spool compression: on past 32 MB, off below it, and correct across the boundary.
+//! Spool compression: on past the switch point, off below it, and correct across the
+//! boundary.
 //!
 //! The threshold means a short query is never compressed and a large one mostly is, so
 //! one file routinely holds records of both codecs — which is the case worth testing.
@@ -21,6 +22,42 @@ static ENV: Mutex<()> = Mutex::new(());
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The switch point these tests are written against.
+///
+/// It is half the finalize memory budget, floored at 32 MB, so the tests pin the
+/// budget rather than inheriting whatever the default happens to be — the point of
+/// the test is the threshold's behaviour, not its current value.
+const SWITCH_BYTES: u64 = 32 * 1024 * 1024;
+
+fn pin_budget() {
+    std::env::set_var(
+        "VGI_MR_FINALIZE_MEMORY_BYTES",
+        (SWITCH_BYTES * 2).to_string(),
+    );
+}
+
+/// Removes a test's spool directory even if the test panics.
+///
+/// A failed or interrupted run used to leave its whole spool behind until the 24-hour
+/// sweep, which on these tests is tens of megabytes each.
+struct ScopeGuard(Vec<u8>);
+
+impl ScopeGuard {
+    fn new(scope: Vec<u8>) -> ScopeGuard {
+        ScopeGuard(scope)
+    }
+
+    fn scope(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        spool::discard(&self.0);
+    }
 }
 
 /// What the spool actually occupies, as opposed to what it accounts for.
@@ -71,16 +108,18 @@ fn lz4_compresses_past_the_threshold_and_round_trips() {
     // The default would do this anyway at this size; unset it so the *default* is what is
     // under test rather than the override.
     std::env::remove_var("VGI_MR_SPOOL_COMPRESSION");
+    pin_budget();
     let schema = wide_schema(COLS);
-    let scope = format!("lz4-mixed-{}", std::process::id()).into_bytes();
+    let guard = ScopeGuard::new(format!("lz4-mixed-{}", std::process::id()).into_bytes());
+    let scope = guard.scope();
     for b in 0..BATCHES {
         assert!(
-            spool::append(&scope, &wide_batch(&schema, COLS, ROWS), Some(b)).unwrap(),
+            spool::append(scope, &wide_batch(&schema, COLS, ROWS), Some(b)).unwrap(),
             "the spool must be available for this test"
         );
     }
 
-    let mut back = spool::read_all(&scope).unwrap();
+    let mut back = spool::read_all(scope).unwrap();
     back.sort_by_key(|(i, _)| *i);
     assert_eq!(back.len(), BATCHES as usize, "every batch must read back");
     assert_eq!(
@@ -102,15 +141,16 @@ fn lz4_compresses_past_the_threshold_and_round_trips() {
 
     // The accounting is uncompressed by construction; the files are not. One being
     // smaller than the other is exactly the evidence that the codec engaged.
-    let accounted = spool::sink_uncompressed_bytes(&scope);
-    let stored = on_disk(&scope);
+    let accounted = spool::sink_uncompressed_bytes(scope);
+    let stored = on_disk(scope);
     assert!(
         stored < accounted,
         "the tail should be compressed: {stored} bytes stored against {accounted} accounted"
     );
     assert!(
-        stored > 32 * 1024 * 1024,
-        "the first 32 MB should be uncompressed, but only {stored} bytes were stored"
+        stored > SWITCH_BYTES,
+        "everything up to the switch point should be uncompressed, but only {stored} \
+         bytes were stored"
     );
     // And the accounting must still describe the real data, since the memory budget is
     // derived from it: 8 columns x 8 bytes x rows, plus framing.
@@ -119,7 +159,6 @@ fn lz4_compresses_past_the_threshold_and_round_trips() {
         accounted >= values && accounted < values * 2,
         "accounted {accounted} should be the uncompressed size of {values} bytes of values"
     );
-    spool::discard(&scope);
 }
 
 /// Below the threshold nothing is compressed, so a short query pays no CPU for it.
@@ -127,6 +166,7 @@ fn lz4_compresses_past_the_threshold_and_round_trips() {
 fn small_spools_are_left_plain() {
     let _guard = env_lock();
     std::env::remove_var("VGI_MR_SPOOL_COMPRESSION");
+    pin_budget();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("v", DataType::Int64, true),
@@ -147,15 +187,16 @@ fn small_spools_are_left_plain() {
     )
     .unwrap();
 
-    let scope = format!("plain-{}", std::process::id()).into_bytes();
+    let guard = ScopeGuard::new(format!("plain-{}", std::process::id()).into_bytes());
+    let scope = guard.scope();
     for b in 0..8i64 {
-        assert!(spool::append(&scope, &batch, Some(b)).unwrap());
+        assert!(spool::append(scope, &batch, Some(b)).unwrap());
     }
     // Highly compressible data, left alone. With nothing compressed each record occupies
     // its payload plus a 64-byte header plus at most 63 bytes of padding to the next
     // 64-byte boundary — and nothing *less*, which is what rules out a codec having
     // quietly engaged.
-    let (stored, accounted) = (on_disk(&scope), spool::sink_uncompressed_bytes(&scope));
+    let (stored, accounted) = (on_disk(scope), spool::sink_uncompressed_bytes(scope));
     const RECORDS: u64 = 8;
     assert!(
         stored >= accounted + RECORDS * 64 && stored < accounted + RECORDS * 128,
@@ -163,7 +204,7 @@ fn small_spools_are_left_plain() {
          {stored} stored"
     );
 
-    let back = spool::read_all(&scope).unwrap();
+    let back = spool::read_all(scope).unwrap();
     assert_eq!(back.len(), 8);
     let (_, first) = &back[0];
     let s = first
@@ -172,5 +213,4 @@ fn small_spools_are_left_plain() {
         .downcast_ref::<StringArray>()
         .expect("utf8");
     assert_eq!(s.value(0), "the same string every row");
-    spool::discard(&scope);
 }

@@ -27,11 +27,13 @@ pub mod error;
 pub mod expr;
 pub mod pattern;
 pub mod plan;
+pub mod rows;
 pub mod types;
 pub mod value;
 
 pub use error::{MrError, Result};
 pub use plan::{Plan, PlanConfig};
+pub use rows::RowBuf;
 
 /// The crate (worker) build version string, published as the catalog's
 /// `implementation_version`.

@@ -34,6 +34,7 @@ fn store_of(vals: impl IntoIterator<Item = i64>) -> VecRowStore {
 
 fn cfg(pattern: &str, define: &str, measures: &str, budget: Option<i64>) -> PlanConfig {
     PlanConfig {
+        include: Vec::new(),
         pattern: pattern.into(),
         define_json: define.into(),
         subset_json: String::new(),

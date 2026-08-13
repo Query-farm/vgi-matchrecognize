@@ -60,6 +60,7 @@ fn measure(
     vs: &[Option<i64>],
 ) -> Vec<Value> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: pattern.into(),
         define_json: define.into(),
         subset_json: subset.into(),
@@ -293,6 +294,7 @@ fn long_match_running_aggregate_is_linear() {
 #[test]
 fn define_aggregate_is_refolded_after_backtracking() {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A+ B".into(),
         define_json: r#"{"A":"v > 0","B":"SUM(A.v) = 10"}"#.into(),
         subset_json: String::new(),

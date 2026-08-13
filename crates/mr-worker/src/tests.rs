@@ -36,6 +36,7 @@ fn ticks_batch() -> RecordBatch {
 
 fn build_plan(batch: &RecordBatch, measures: &str, rows_all: bool) -> Plan {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "START DOWN+ UP+".into(),
         define_json: r#"{"DOWN":"price < PREV(price)","UP":"price > PREV(price)"}"#.into(),
         subset_json: String::new(),
@@ -78,7 +79,7 @@ fn arrow_round_trip_one_row() {
     assert_eq!(out_schema.field(3).data_type(), &DataType::Int64);
 
     let store = BatchRowStore::single(batch);
-    let rows = plan.run(&store).unwrap();
+    let rows = plan.run_buf(&store).unwrap();
     let out = build_batch(out_schema, plan.output_columns(), &rows).unwrap();
 
     assert_eq!(out.num_rows(), 1);
@@ -113,7 +114,7 @@ fn arrow_all_rows_has_auto_columns() {
     );
 
     let store = BatchRowStore::single(batch);
-    let rows = plan.run(&store).unwrap();
+    let rows = plan.run_buf(&store).unwrap();
     let fields: Vec<Field> = cols.iter().map(|c| output_field(&c.name, &c.ty)).collect();
     let out = build_batch(Arc::new(Schema::new(fields)), cols, &rows).unwrap();
     // The V is START(10) DOWN(8) DOWN(6) UP(9) UP(11) -> 5 matched rows.
@@ -248,6 +249,7 @@ fn ubigint_round_trips_through_arrow() {
     .unwrap();
 
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A+".into(),
         define_json: "{}".into(),
         subset_json: String::new(),
@@ -275,7 +277,7 @@ fn ubigint_round_trips_through_arrow() {
     assert_eq!(fields[1].data_type(), &DataType::UInt64, "measure");
 
     let store = BatchRowStore::single(batch);
-    let rows = plan.run(&store).unwrap();
+    let rows = plan.run_buf(&store).unwrap();
     let out = build_batch(Arc::new(Schema::new(fields)), plan.output_columns(), &rows).unwrap();
 
     assert_eq!(out.num_rows(), 1);
@@ -327,6 +329,7 @@ fn sum_over_ubigint_emits_an_exact_decimal128() {
     .unwrap();
 
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A+".into(),
         define_json: "{}".into(),
         subset_json: String::new(),
@@ -350,7 +353,7 @@ fn sum_over_ubigint_emits_an_exact_decimal128() {
         .collect();
     assert_eq!(fields[0].data_type(), &DataType::Decimal128(38, 0));
 
-    let rows = plan.run(&BatchRowStore::single(batch)).unwrap();
+    let rows = plan.run_buf(&BatchRowStore::single(batch)).unwrap();
     let out = build_batch(Arc::new(Schema::new(fields)), plan.output_columns(), &rows).unwrap();
     assert_eq!(
         out.column(0)

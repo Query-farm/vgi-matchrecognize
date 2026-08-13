@@ -60,6 +60,7 @@ fn store(rows: &[(i64, i64, Option<bool>)]) -> VecRowStore {
 /// `AFTER MATCH SKIP TO NEXT ROW` reports one match per matching row.
 fn ids_matching(define: &str, rows: &[(i64, i64, Option<bool>)]) -> Vec<i64> {
     let cfg = PlanConfig {
+        include: Vec::new(),
         pattern: "A".into(),
         define_json: define.into(),
         subset_json: String::new(),
