@@ -30,9 +30,9 @@ a different SQL surface that this worker does not implement.)
 
 ```
 174 assertions extracted
-150 translated to our surface   (2 assert Trino's own error text; the rest are
+151 translated to our surface   (2 assert Trino's own error text; the rest are
                                  constructs we do not implement -- see below)
-132 PASS      <- checked in as test/sql/trino_conformance.test
+133 PASS      <- checked in as test/sql/trino_conformance.test
   0 FAIL      <- no wrong answers: everything unsupported errors cleanly
  18 ERROR     <- unsupported features, see below
 ```
@@ -73,10 +73,15 @@ with a real list type; a scalar function library (`abs`, `lower`, `upper`,
 `round`, `coalesce`, `greatest`, `least`, …); case-sensitive double-quoted labels;
 and `VARCHAR(n)` cast targets.
 
-### Not implemented (the 18 errors + 24 untranslatable)
+`PERMUTE` came later, from the Flink port, and the translator refused its one
+Trino case until long after the pattern parser had learned it — the translator's
+`Unsupported` list is not automatically kept honest by anything, so a feature can
+land without the suite noticing. That case is now ported and passes.
 
-Untranslatable (24): pattern exclusion `{- … -}` (10), omitted `ORDER BY` (4, we
-require it), `WITH UNMATCHED ROWS` (2), `PERMUTE` (1), 2 that assert Trino's own
+### Not implemented (the 18 errors + 23 untranslatable)
+
+Untranslatable (23): pattern exclusion `{- … -}` (10), omitted `ORDER BY` (4, we
+require it), `WITH UNMATCHED ROWS` (2), 2 that assert Trino's own
 error text, plus 5 whose shape the translator does not handle (two
 `MATCH_RECOGNIZE` in one query, a non-`SELECT` head, `DEFINE` without `AS`).
 

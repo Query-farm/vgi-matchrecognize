@@ -4,6 +4,19 @@ All notable changes to `vgi-matchrecognize` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **The Trino conformance port covers `PERMUTE`.** The translator refused those
+  cases with `Unsupported("PERMUTE not implemented")`, which stopped being true
+  when the pattern parser learned `PERMUTE` — so the one Trino case using it was
+  silently skipped from then on. Nothing keeps the translator's refusal list
+  honest as features land, which is worth remembering the next time one does.
+  The port is now **133 of 151** runnable assertions, still with zero wrong
+  answers, and the regenerated suite differs from the previous one by exactly
+  that case (plus renumbering).
+
 ## [0.2.1] - 2026-08-13
 
 ### Added

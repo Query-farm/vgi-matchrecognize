@@ -246,8 +246,6 @@ def translate(query):
         raise Unsupported(f"trailing tokens after PATTERN: {leftover}")
     if "{-" in pattern:
         raise Unsupported("exclusion syntax {- -} not implemented")
-    if re.search(r"\bPERMUTE\b", pattern, re.I):
-        raise Unsupported("PERMUTE not implemented")
 
     rows_all = "ALL ROWS PER MATCH" in cl
     empty_mode = None

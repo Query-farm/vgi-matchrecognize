@@ -516,8 +516,8 @@ session is bounded by the budget, not by the OS stack. Deeply nested
 
 Checked against three other implementations, all inside the end-to-end suite:
 
-- **Trino** — 132 assertions ported from its `MATCH_RECOGNIZE` test suite
-  (`test/sql/trino_conformance.test`). Of the 150 cases expressible on this surface,
+- **Trino** — 133 assertions ported from its `MATCH_RECOGNIZE` test suite
+  (`test/sql/trino_conformance.test`). Of the 151 cases expressible on this surface,
   **none produces a wrong answer**; the remaining 18 error cleanly on features we do
   not implement (subqueries in `DEFINE`/`MEASURES`, two-argument aggregates such as
   `max_by`, a few scalar functions, and the `ALL ROWS` column layout above).
