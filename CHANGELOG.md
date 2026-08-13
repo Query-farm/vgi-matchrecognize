@@ -4,7 +4,7 @@ All notable changes to `vgi-matchrecognize` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] - 2026-08-13
 
 ### Changed
 
