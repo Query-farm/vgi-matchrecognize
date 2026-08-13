@@ -4,6 +4,14 @@
 
 # vgi-matchrecognize
 
+<p align="center">
+  <a href="https://github.com/Query-farm/vgi-matchrecognize/actions/workflows/ci.yml"><img src="https://github.com/Query-farm/vgi-matchrecognize/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/Query-farm/vgi-matchrecognize/releases/latest"><img src="https://img.shields.io/github/v/release/Query-farm/vgi-matchrecognize?sort=semver&amp;display_name=tag&amp;label=release&amp;color=blue" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Query-farm/vgi-matchrecognize?color=green" alt="MIT licence"></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/MSRV-1.97-informational" alt="Minimum supported Rust version 1.97"></a>
+  <img src="https://img.shields.io/badge/platforms-linux%20%7C%20macOS%20%7C%20windows%20%7C%20wasm-lightgrey" alt="Supported platforms">
+</p>
+
 **SQL:2016 `MATCH_RECOGNIZE` row pattern matching for DuckDB.**
 
 Oracle, Trino, Snowflake, Redshift, BigQuery and Flink all ship `MATCH_RECOGNIZE`.
