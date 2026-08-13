@@ -4,6 +4,37 @@ All notable changes to `vgi-matchrecognize` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-08-13
+
+### Added
+
+- **A container image**, `ghcr.io/query-farm/vgi-matchrecognize`, multi-arch and
+  cosign-signed, built by the shared `vgi-actions/docker-publish.yml` workflow —
+  the server/Fly.io path alongside the release archives that DuckDB spawns
+  on-host. It serves HTTP (`/health` on `$PORT`, the default entrypoint), raw
+  Arrow-IPC over TCP (`$PORT_TCP`), and stdio.
+
+  Two operational notes are specific to this worker being a *buffering* function
+  rather than a stateless one, and both are verified in CI against the signed
+  `vgi` extension:
+
+  - It spools its input to `$TMPDIR`, so a container needs temp space of roughly
+    24 bytes per row of the columns the pattern reads (about 1.5x that while a
+    sharded run splits). No volume is declared, so by default that lands in the
+    container's writable layer.
+  - Every phase of a query must reach the same spool. Over HTTP or TCP one
+    container serves all of them; over **stdio the extension spawns a pool of
+    workers, so each spawn is a separate container** and they must share a volume
+    on `/tmp` (`docker run -i --rm -v mr-spool:/tmp IMG stdio`). Without it the
+    sink-count guard raises rather than returning a short result — which is what
+    it is for.
+
+### Changed
+
+- The README carries status shields, a links section (downloads, image, changelog,
+  performance baseline, and the `MATCH_RECOGNIZE` documentation of the engines the
+  conformance suites are ported from), and a section on running the container.
+
 ## [0.2.0] - 2026-08-13
 
 ### Changed

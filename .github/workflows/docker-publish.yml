@@ -1,0 +1,137 @@
+# Copyright 2026 Query Farm LLC - https://query.farm
+#
+# Build and publish the multi-arch vgi-matchrecognize image to ghcr.io. The heavy
+# lifting (multi-arch build -> per-arch /health boot smoke -> image SQL suite ->
+# push -> manifest -> cosign-sign) lives in the shared reusable workflow
+# Query-farm/vgi-actions; this file gates on the repo's own CI suite and supplies
+# the worker-specific inputs.
+#
+# This is the server/Fly.io distribution path. The on-host path — the archives a
+# DuckDB `ATTACH … (TYPE vgi, LOCATION …)` runs directly — is release.yml, which
+# calls a different reusable workflow (rust-release.yml) on the same tag.
+#
+# Tag-driven: vX.Y.Z -> :X.Y.Z/:X.Y/:latest, push to main -> :edge. Publishing a
+# GitHub Release creates the tag, which fires this too.
+name: Publish image to ghcr.io
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Gate every image on the full CI suite (fmt · clippy · doc · unit+proptest ·
+  # SQLLogic e2e · vgi-lint · audit · MSRV), so a broken worker is never imaged.
+  # ci.yml declares `on: workflow_call:` so it can be used here.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [ci]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: Query-farm/vgi-actions/.github/workflows/docker-publish.yml@v1
+    secrets: inherit
+    with:
+      image_name: vgi-matchrecognize
+      # Rust binary — nothing to `import`, so the language-import smoke is skipped.
+      # The reusable workflow still runs its dual-arch HTTP /health boot smoke.
+      smoke_import: ""
+      health_port: "8000"
+      version_check_cmd: "ci/check-version.sh"
+      # Prove the IMAGE's entrypoints speak the VGI protocol against the signed vgi
+      # extension. The worker *logic* is already exercised by the gating `ci` job,
+      # so this verifies the image itself:
+      #   - stdio: the WHOLE suite through `docker run … stdio` (the on-host mode).
+      #            Every test here is pure compute — the input is a subquery, never
+      #            a file — so a fixture-less container can run all of it. The
+      #            shared /tmp volume is REQUIRED, not incidental: the extension
+      #            spawns a pool of workers, so each spawn is a separate container,
+      #            and a buffering function's sink and source phases must find the
+      #            same spool. Without the volume every test fails on the
+      #            sink-count guard, which is exactly what it exists to catch.
+      #   - HTTP : one test against a SINGLE warm container via the default `http`
+      #            entrypoint + /health, proving the HTTP transport too. Worth its
+      #            own leg because match_recognize is a *buffering* function: its
+      #            sink and source phases must find the same spool, and over HTTP
+      #            they are separate requests rather than one process's stdio.
+      # $CITEST_IMAGE is the loaded <image>:citest-amd64 ref; GH_TOKEN is provided
+      # for the release download.
+      image_test: |
+        set -euo pipefail
+
+        echo "::group::download haybarn-unittest"
+        REL=$(gh release view --repo Query-farm-haybarn/haybarn --json tagName --jq .tagName)
+        gh release download "$REL" --repo Query-farm-haybarn/haybarn \
+          --pattern 'haybarn_unittest-linux-amd64.zip' --output hb.zip --clobber
+        mkdir -p hb && unzip -o -q hb.zip -d hb
+        HAYBARN_UNITTEST="$PWD/$(find hb -name 'haybarn-unittest' -type f | head -1)"
+        chmod +x "$HAYBARN_UNITTEST"
+        echo "::endgroup::"
+
+        # Warm the vgi community extension once (the .test files ATTACH TYPE vgi).
+        echo "::group::warm vgi community extension"
+        WARM="$(mktemp -d)/test"
+        mkdir -p "$WARM"
+        cat > "$WARM/_warm.test" <<'EOF'
+        # name: test/_warm.test
+        # group: [warm]
+        statement ok
+        INSTALL vgi FROM community;
+        EOF
+        (cd "$(dirname "$WARM")" && "$HAYBARN_UNITTEST" "test/_warm.test") \
+          >/dev/null 2>&1 || echo "::warning::vgi warm step did not fully succeed"
+        echo "::endgroup::"
+
+        run_suite() {  # $1=stage dir, $2=worker LOCATION, $3=label
+          local stage="$1" worker="$2" label="$3"
+          local report="$stage/.report.txt"
+          echo "Running $label suite (worker: $worker) ..."
+          set +e
+          ( cd "$stage" && VGI_MATCHRECOGNIZE_WORKER="$worker" VGI_WORKER_CATALOG_NAME="mr" \
+              "$HAYBARN_UNITTEST" --test-dir "$stage" "test/sql/*" ) 2>&1 | tee "$report"
+          local status="${PIPESTATUS[0]}"
+          set -e
+          # A skip is NOT a pass: DuckDB's runner silently auto-skips tests whose
+          # error message contains "HTTP", so a broken transport could look green.
+          if grep -qiE "All tests were skipped|total skipped [1-9]" "$report"; then
+            echo "ERROR: $label tests were SKIPPED — an ATTACH/transport error was masked." >&2
+            exit 1
+          fi
+          [ "$status" -eq 0 ] || { echo "ERROR: $label suite failed (exit $status)." >&2; exit "$status"; }
+        }
+
+        echo "::group::stdio entrypoint smoke (full suite, cold container per ATTACH)"
+        S1="$(mktemp -d)"; mkdir -p "$S1/test"
+        cp -r test/sql "$S1/test/"
+        SPOOL_VOL="mr-citest-spool-$$"
+        docker volume create "$SPOOL_VOL" >/dev/null
+        trap 'docker volume rm -f "$SPOOL_VOL" >/dev/null 2>&1 || true' EXIT
+        run_suite "$S1" "docker run -i --rm -v $SPOOL_VOL:/tmp $CITEST_IMAGE stdio" "stdio"
+        docker volume rm -f "$SPOOL_VOL" >/dev/null 2>&1 || true
+        echo "::endgroup::"
+
+        echo "::group::HTTP entrypoint smoke (one test, one warm container)"
+        CID=$(docker run -d -p 18000:8000 "$CITEST_IMAGE")
+        trap 'docker rm -f "$CID" >/dev/null 2>&1 || true; docker volume rm -f "$SPOOL_VOL" >/dev/null 2>&1 || true' EXIT
+        for _ in $(seq 1 30); do curl -fsS -o /dev/null http://localhost:18000/health && break; sleep 1; done
+        # The vgi extension's HTTP client is built on DuckDB's httpfs, so inject an
+        # INSTALL/LOAD httpfs after the require-env line (before the ATTACH) for the
+        # http leg — a skip here means the ATTACH errored ("HTTP" auto-skip trap).
+        S2="$(mktemp -d)"; mkdir -p "$S2/test/sql"
+        awk '/^require-env VGI_MATCHRECOGNIZE_WORKER/ {print; print ""; print "statement ok";
+             print "INSTALL httpfs;"; print ""; print "statement ok"; print "LOAD httpfs;"; next}
+             {print}' test/sql/vshape.test > "$S2/test/sql/vshape.test"
+        run_suite "$S2" "http://localhost:18000" "HTTP"
+        echo "::endgroup::"

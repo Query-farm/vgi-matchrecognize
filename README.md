@@ -395,6 +395,46 @@ FROM mr.match_recognize(
 
 ## Operating notes
 
+### Running it as a container
+
+The image serves the same worker over a network transport, for when DuckDB should
+not (or cannot) spawn a local binary — a shared worker, or a Fly.io-style deploy:
+
+```sh
+docker run --rm -p 8000:8000 ghcr.io/query-farm/vgi-matchrecognize      # HTTP, /health
+docker run --rm -p 8001:8001 ghcr.io/query-farm/vgi-matchrecognize tcp  # raw Arrow-IPC
+```
+
+```sql
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION 'http://localhost:8000');
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION 'tcp://localhost:8001');
+```
+
+Two things follow from this being a *buffering* function, and neither applies to
+the stateless workers in this family:
+
+- **It needs temp space.** The spool is roughly 24 bytes per row of the columns
+  the pattern reads, and a sharded run peaks at about 1.5x that. The image
+  declares no volume, so it lands in the container's writable layer — mount one at
+  `/tmp` for inputs that will not fit there.
+- **Every phase of a query must reach the same spool.** The buffering phase and
+  the producing phase are separate worker processes, and the spool belongs to
+  whichever container wrote it. Over HTTP or TCP one container serves both, so
+  this is only a question of sticky routing (or a single replica) behind a load
+  balancer. Over **stdio it bites immediately**: the extension spawns a *pool* of
+  workers, so each spawn is its own container, and they share nothing unless you
+  give them one volume to share —
+
+  ```sh
+  docker volume create mr-spool
+  # LOCATION for the ATTACH below:
+  docker run -i --rm -v mr-spool:/tmp ghcr.io/query-farm/vgi-matchrecognize stdio
+  ```
+
+  Getting it wrong fails loudly rather than quietly: the sink-count guard raises
+  an error instead of returning a short result. (For on-host use, the release
+  binary is simpler than a container in stdio mode, and has none of this.)
+
 ### Buffering and memory
 
 Row pattern matching is intrinsically a whole-partition operation, so the function
@@ -507,6 +547,45 @@ cargo build --release      # the worker binary
 ./run_tests.sh             # haybarn SQLLogic end-to-end suite
 ./test/trino/port.sh       # re-port Trino's suite (needs a Trino checkout)
 ```
+
+## Links
+
+**Get it**
+
+- [Latest release](https://github.com/Query-farm/vgi-matchrecognize/releases/latest) —
+  one `.tar.gz` per platform (`linux_amd64`, `linux_arm64`, `osx_amd64`,
+  `osx_arm64`, `windows_amd64`, plus wasm), each with a SHA256 and a keyless
+  [cosign](https://docs.sigstore.dev/cosign/signing/overview/) bundle next to it.
+- [Container image](https://github.com/Query-farm/vgi-matchrecognize/pkgs/container/vgi-matchrecognize)
+  — `ghcr.io/query-farm/vgi-matchrecognize`, multi-arch, for the HTTP/TCP
+  transports (from v0.2.1).
+- [The `vgi` extension](https://duckdb.org/community_extensions/list_of_extensions)
+  — the DuckDB community extension that `ATTACH … (TYPE vgi, …)` comes from.
+
+**This project**
+
+- [CHANGELOG.md](CHANGELOG.md) — what changed, and why.
+- [docs/perf-baseline.md](docs/perf-baseline.md) — measured cost of every phase,
+  peak memory by query shape, and what the tuning knobs are actually worth.
+- [Issues](https://github.com/Query-farm/vgi-matchrecognize/issues) — bugs and
+  feature requests.
+- [Query Farm](https://query.farm) — who builds this, and the rest of VGI.
+- [vgi-actions](https://github.com/Query-farm/vgi-actions) — the shared release
+  and image-publishing workflows this repo calls.
+- [haybarn](https://github.com/Query-farm-haybarn/haybarn) — the DuckDB
+  distribution the end-to-end suite runs on
+  ([haybarn-unittest](https://pypi.org/project/haybarn-unittest/),
+  [haybarn-cli](https://pypi.org/project/haybarn-cli/)).
+
+**`MATCH_RECOGNIZE` in other engines**
+
+Useful when porting a query in or out — and the sources the conformance suites in
+[`test/sql`](test/sql) are ported from:
+
+- [Trino](https://trino.io/docs/current/sql/match-recognize.html)
+- [Snowflake](https://docs.snowflake.com/en/sql-reference/constructs/match_recognize)
+- [Apache Flink](https://nightlies.apache.org/flink/flink-docs-release-1.20/docs/dev/table/sql/queries/match_recognize/)
+- [Oracle](https://docs.oracle.com/en/database/oracle/oracle-database/23/dwhsg/sql-pattern-matching-data-warehouses.html)
 
 ## License
 
