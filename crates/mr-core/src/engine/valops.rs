@@ -37,7 +37,7 @@ fn unit_nanos(unit: TimeUnit) -> i64 {
 ///   Nanosecond epochs and snowflake ids live in exactly that range. Worse, the
 ///   *sort* comparator had already been fixed to compare integers exactly, so
 ///   `ORDER BY` and a DEFINE predicate disagreed about whether two rows were
-///   equal. [`cmp_ints`] is now shared by both, and `tests/compare.rs`
+///   equal. `cmp_ints` is now shared by both, and `tests/compare.rs`
 ///   (`comparators_agree_exactly`) pins them together.
 /// - **NaN.** `partial_cmp(...).or(Some(Equal))` reported NaN as *equal to
 ///   everything*, so `NaN = 1.0` was TRUE and `NaN <> 1.0` was FALSE.
