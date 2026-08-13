@@ -135,7 +135,7 @@ pub fn lex_spanned(src: &str) -> Result<(Vec<Tok>, Vec<usize>)> {
             }
             '-' if i + 1 < chars.len() && chars[i + 1] == '}' => {
                 return Err(MrError::Pattern(format!(
-                    "exclusion syntax `{{- ... -}}` is not supported in v1 (v1.1 non-goal){}",
+                    "exclusion syntax `{{- ... -}}` is not supported{}",
                     point_at(src, at)
                 )));
             }

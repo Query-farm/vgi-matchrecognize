@@ -39,6 +39,14 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The execution architecture, which every entry above assumes.** Input is
+  spooled to a local Arrow-IPC file per sink thread under `$TMPDIR` rather than
+  through the SDK store (which measured 93.5 ns/row against 4.3 to serialise);
+  partitions are matched concurrently (`VGI_MR_MATCH_THREADS`), since they are
+  independent and the results are emitted in partition order; and a relation that
+  outgrows `VGI_MR_FINALIZE_MEMORY_BYTES` is split by partition key into shards
+  matched one at a time. `VGI_MR_SPOOL_COMPRESSION` controls the spool codec.
+  Together these took 8M rows x 1000 partitions from 3.7 s to about 1 s.
 - **Output rows stream in fixed-size batches, including through a long match.**
   The producer used to materialize one whole partition's output before it could
   emit anything, and `Vec<Vec<Value>>` cost a header plus an allocation per row.
@@ -69,7 +77,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   of doubling slack that was never returned.
 - **The sort applies its permutation in place**, following cycles rather than
   copying the tape, which saves another 8 bytes per row of the largest partition.
-
 - **DEFINE predicates are type-checked at bind time.** They were only parsed, so
   a predicate that could never be true produced an empty result and no message.
   All three of these now fail at bind, naming the key:
@@ -100,6 +107,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **SQL:2016 `SUBSET`** — `subset := {"U": ["A", "B"]}` declares union variables
+  usable anywhere a pattern variable is: as a qualifier, in an aggregate, or as
+  the target of `AFTER MATCH SKIP TO`.
+- **`PERMUTE(a, b, …)`** — desugared in the parser into the alternation of every
+  permutation, in SQL:2016's lexicographic order of the argument positions (so
+  `PERMUTE(A, B)` prefers `A B`). Capped at 6 arguments, i.e. 720 branches.
+- **`empty_matches := 'show' | 'omit'`** — SQL:2016 SHOW / OMIT EMPTY MATCHES.
+  An empty match is a real match: it reports one row and consumes a match number,
+  with every measure evaluated over an empty frame.
+- **More expression language** — `array_agg` / `LIST`, `ARBITRARY` / `ANY_VALUE`,
+  scalar functions, and double-quoted case-sensitive pattern labels.
+- **Cross-dialect spellings, where they mean the same thing** — `LAG` / `LEAD`
+  for `PREV` / `NEXT` and `MATCH_SEQUENCE_NUMBER()` for a RUNNING `COUNT(*)`
+  (both Snowflake), `LIST` for `ARRAY_AGG`, `ANY_VALUE` for `ARBITRARY`.
+- **`define` / `subset` / `measures` accept a DuckDB `MAP` or `STRUCT`** as well
+  as a JSON string, so DuckDB checks the syntax and a `MAP`'s entry order fixes
+  the output column order. All three forms normalise to one parser and one set of
+  error messages.
+- **Conformance suites for Trino, Flink and Snowflake** (`test/sql/*_conformance.test`),
+  ported case by case. Against Trino's — the most thorough public suite — 132 of
+  150 runnable assertions pass with **zero wrong answers**; the rest error cleanly
+  on features not implemented. The one deliberate disagreement with Flink is
+  documented inline with its reasoning.
+- **A wasm32 browser build** (`wasm/build.sh`, `vgi::wasm_worker!`), serving the
+  identical worker from one module instance.
 - **`include := ['col', …]`** carries input columns through to the output
   unchanged, next to the partition keys — the value on each matched row under
   `rows := 'all'`, on the match's first row under `'one'`. SQL:2016 ALL ROWS PER
@@ -108,7 +140,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   thing it can do (one unused 200-byte column measured 2.8x), so passthrough is
   opt-in per column. A column already emitted as a partition or order key is not
   repeated, and an unknown one fails at bind.
-
 - **`UBIGINT` is a first-class type.** It used to be folded into `BIGINT` and
   read with `as i64`, so any value above `i64::MAX` arrived negative and stayed
   that way through comparison, sorting, partitioning and output —
@@ -121,6 +152,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A long match aborted the worker.** The matcher recursed through the host
+  stack, so a single match over roughly 6-8k rows overflowed it and the process
+  died (`SIGABRT`); the guard that was supposed to catch it never fired. It now
+  backtracks on an explicit heap stack and is verified to 200k rows, leaving the
+  step budget as the only bound. Deeply nested `pattern` / `define` / `measures`
+  strings could abort it the same way, and both parsers now cap nesting at 128.
+- **A bare `A.col` read the current row.** Outside a navigation or aggregate call
+  it means `LAST(A.col)` under the prevailing RUNNING/FINAL semantics, so a
+  match-dependent predicate like `"B": "price > A.price"` silently degraded to
+  `price > price` — zero matches, no error. Qualified `PREV`/`NEXT` now anchor on
+  the variable's last row, and nested navigation keeps its outer offset, so
+  `PREV(LAST(x), n)` steps back `n` rows from the row `LAST(x)` designates
+  instead of being a no-op.
+- **Empty matches were dropped, and `MATCH_NUMBER()` did not reset per
+  partition.** The first was the single largest source of wrong answers against
+  Trino's suite; the second contradicts SQL:2016, which counts matches *within* a
+  partition.
+- **Two silent `ORDER BY` bugs.** Timestamp comparison rescaled i64 ticks, so
+  microsecond values past ~2262 wrapped and `TIMESTAMP '9999-12-31'` sorted
+  *before* 2020; and `DESC` reversed NULL placement along with the values, so
+  `ORDER BY k DESC NULLS FIRST` put them last. Both matter more here than in an
+  ordinary operator: the matcher walks the tape in order, so a mis-sorted
+  partition does not skew the output, it produces *different matches*, and
+  nothing about the result looks wrong. The sort also now uses an explicit total
+  order, since an unordered pair treated as equal is intransitive — one NaN in a
+  key column left every row's position unspecified.
+- **The first buffered batch could vanish.** `FunctionStorage::scan` returns ids
+  `> after_id` and the contract only says ids are monotonic, not where they
+  start: SQLite's begin at 1, the filesystem store's at 0. Paging from 0 skipped
+  the first record on a 0-based backend — 547 missing matches in 1,333,333,
+  exactly one 2048-row batch — so the default was correct only by accident. The
+  cursor convention now lives in one place, each batch carries an independent
+  row-count record cross-checked at finalize, and `VGI_WORKER_SHARED_STORAGE=memory`
+  is refused at bind because the phases may run in different processes.
 - **`NOT` bound tighter than comparison.** `NOT x IS NULL` parsed as
   `(NOT x) IS NULL`, and since `NOT NULL` is NULL that is true exactly when `x`
   IS NULL — the inverse of what was written, with no error anywhere. Now that
@@ -164,7 +229,20 @@ adheres to [Semantic Versioning](https://semver.org/).
   anyone reading it through `vgi_catalogs()` may be doing a data-residency
   review.
 
+### Removed
+
+- **`mr.main.mr_version()`.** The worker build version is published as the
+  catalog's `implementation_version` instead (per VGI328), readable with
+  `SELECT catalog, implementation_version FROM vgi_catalogs('<worker path>')`.
+  Dropping the scalar was part of taking the metadata gate to 100/100; it was
+  never announced, so it is recorded here.
+
 ## [0.1.0] - 2026-06-30
+
+> **Never distributed.** No `v0.1.0` tag or binaries were ever published — the
+> first release with artifacts is 0.2.0. Everything below therefore reached users
+> *as part of* 0.2.0, which is why that section is so much larger than one day's
+> work: it covers six weeks of it.
 
 Initial release: SQL:2016 `MATCH_RECOGNIZE` row pattern matching for DuckDB.
 
@@ -198,3 +276,10 @@ Initial release: SQL:2016 `MATCH_RECOGNIZE` row pattern matching for DuckDB.
 - `WITH UNMATCHED ROWS` / `SHOW EMPTY MATCHES`.
 - Exotic temporal / `INTERVAL` type-lattice corners (route through the explicit
   `type` override).
+
+> **Since superseded — kept as the record of what 0.1.0 planned.** `PERMUTE`,
+> `SUBSET` and `SHOW`/`OMIT EMPTY MATCHES` all landed in 0.2.0, as did most of
+> the temporal corners (i128 temporal arithmetic, `DATE - DATE`, `TIME - TIME`).
+> Still unimplemented as of 0.2.1: pattern exclusion `{- … -}`, which raises a
+> clear parse error naming itself, and `WITH UNMATCHED ROWS`, which the argument
+> surface simply does not express.

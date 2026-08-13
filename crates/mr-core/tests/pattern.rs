@@ -168,7 +168,7 @@ fn malformed_patterns_error() {
     assert!(parse("A)").is_err()); // trailing
     assert!(parse("A{5,2}").is_err()); // hi < lo
     assert!(parse("*A").is_err()); // quantifier with no primary
-    assert!(parse("{- A -}").is_err()); // exclusion (v1.1)
+    assert!(parse("{- A -}").is_err()); // exclusion, unimplemented
 }
 
 #[test]

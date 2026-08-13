@@ -5,7 +5,7 @@
 //! The evaluator computes "best effort" values (pure-integer arithmetic stays
 //! integral; anything involving floats/decimals widens to `Double`), then the
 //! output builder coerces each measure value to its inferred column `Ty`. Exact
-//! DECIMAL arithmetic is a documented v1.1 / `type`-override corner.
+//! DECIMAL arithmetic is a documented `type`-override corner.
 
 use crate::error::{MrError, Result};
 use crate::expr::ast::BinOp;
