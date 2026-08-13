@@ -10,3 +10,9 @@
 # Claude Code session/worktree scratch
 /.claude
 duckdb_unittest_tempdir/
+# Trino port intermediates: run_conformance.py writes these into its own
+# directory as it goes. The only checked-in output of the pipeline is the
+# generated test/sql/trino_conformance.test.
+test/trino/conformance.sql
+test/trino/conformance.out
+__pycache__/
