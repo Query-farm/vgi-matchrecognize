@@ -16,14 +16,14 @@ authors = ["Query Farm LLC <hello@query.farm>"]
 repository = "https://github.com/Query-farm/vgi-matchrecognize"
 
 [workspace.dependencies]
-# VGI Rust SDK (worker side), published on crates.io. 0.24+ provides the wasm
+# VGI Rust SDK (worker side), published on crates.io. 0.31 provides the wasm
 # `vgi::wasm_worker!` macro used by mr-wasm; requires rustc 1.97 (see
 # rust-version above). Base (feature-less) so each target can opt in: the native
 # build takes the SDK's real defaults (`sqlite` + `transport-http`), while the
 # wasm build must NOT — tokio/mio/axum and bundled SQLite do not compile for
 # wasm32, and the browser transport serves over a byte channel rather than HTTP.
-vgi = { version = "0.29", default-features = false }
-vgi-rpc = { version = "0.21", default-features = false, features = ["macros"] }
+vgi = { version = "0.31", default-features = false }
+vgi-rpc = { version = "0.23.3", default-features = false, features = ["macros"] }
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 # LZ4 for the buffered-batch spool, applied to a whole record rather than through arrow's
 # IPC buffer compression — see `spool::compression`.
@@ -56,4 +56,3 @@ mr-core = { path = "crates/mr-core" }
 opt-level = 3
 lto = "thin"
 strip = true
-

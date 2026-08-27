@@ -520,19 +520,10 @@ impl TableBufferingFunction for MatchRecognize {
                 .map_err(|e| RpcError::runtime_error(e.to_string()))?,
         );
         let store = BatchRowStore::new(projected_schema, batches);
-        // The buffered relation is now entirely in `store`, and nothing reads the spool
-        // again — so this is the point to delete it. Waiting for end-of-stream or Drop
-        // is not reliable: a consumer that stops asking (or the SDK holding the producer
-        // until its *best-effort* destructor RPC) leaves the files behind, which is
-        // exactly what the e2e suite was doing, one directory per query.
-        //
-        // If a finalize stream were ever re-initialised for the same state id it would
-        // now read nothing — and be told so: the sink-count and per-shard row-count
-        // guards turn that into an error, never a short answer.
-        match state.shards {
-            0 | 1 => crate::spool::discard(&state.scope),
-            _ => crate::spool::discard_shard(&state.scope, state.shard as usize),
-        }
+        // Keep the spool until the producer reaches EOF. HTTP is lock-step and
+        // rebuilds this producer for every continuation, so deleting here makes
+        // the second output batch impossible to reconstruct. An abandoned scan
+        // is still reclaimed by the spool TTL sweeper.
         let parts = plan.partitions(&store).map_err(ve)?;
         let ncols = plan.output_columns().len();
         Ok(Box::new(PartitionStream {
@@ -544,6 +535,10 @@ impl TableBufferingFunction for MatchRecognize {
             ready: std::collections::VecDeque::new(),
             rows: RowBuf::new(ncols),
             threads: match_threads(),
+            emitted_rows: 0,
+            resume_skip: 0,
+            finalize_state: state,
+            cleaned: false,
         }))
     }
 }
@@ -616,6 +611,13 @@ struct PartitionStream {
     rows: RowBuf,
     /// Threads to match on. Read once, so a query cannot change it midway.
     threads: usize,
+    /// Output rows returned before the current HTTP continuation.
+    emitted_rows: u64,
+    /// Rows to deterministically replay and discard after rebuilding.
+    resume_skip: u64,
+    /// Names the spool retained for continuation rebuilds.
+    finalize_state: crate::buffer::FinalizeState,
+    cleaned: bool,
 }
 
 impl PartitionStream {
@@ -679,15 +681,11 @@ impl PartitionStream {
         }
         Ok(true)
     }
-}
 
-impl TableProducer for PartitionStream {
-    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+    /// Fill `rows` with at most `limit` output rows, advancing the matcher.
+    fn fill_rows(&mut self, limit: usize) -> Result<bool> {
         self.rows.clear();
         loop {
-            // Drain what has already been matched, stopping the moment the batch is
-            // full — a partition (or a single long match) resumes where it left off
-            // on the next call.
             let PartitionStream {
                 plan,
                 store,
@@ -697,7 +695,7 @@ impl TableProducer for PartitionStream {
                 ..
             } = self;
             while let Some((p, run)) = ready.front_mut() {
-                plan.emit_rows(store, parts.tape(*p), run, TARGET_BATCH_ROWS, rows)
+                plan.emit_rows(store, parts.tape(*p), run, limit, rows)
                     .map_err(ve)?;
                 if run.is_done() {
                     ready.pop_front();
@@ -705,19 +703,73 @@ impl TableProducer for PartitionStream {
                     break;
                 }
             }
-            if self.rows.len() >= TARGET_BATCH_ROWS || !self.match_chunk()? {
+            if self.rows.len() >= limit || !self.match_chunk()? {
                 break;
             }
         }
-        if self.rows.is_empty() {
+        Ok(!self.rows.is_empty())
+    }
+
+    fn cleanup_spool(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        match self.finalize_state.shards {
+            0 | 1 => crate::spool::discard(&self.finalize_state.scope),
+            _ => crate::spool::discard_shard(
+                &self.finalize_state.scope,
+                self.finalize_state.shard as usize,
+            ),
+        }
+        self.cleaned = true;
+    }
+}
+
+impl TableProducer for PartitionStream {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        // A continuation rebuilds the deterministic plan from the retained
+        // input spool. Replay only as far as the last emitted row, discarding
+        // bounded chunks so the checkpoint stays a compact counter.
+        while self.resume_skip > 0 {
+            let limit = self.resume_skip.min(TARGET_BATCH_ROWS as u64) as usize;
+            if !self.fill_rows(limit)? {
+                return Err(ve(format!(
+                    "match_recognize: resume position {} is beyond the output",
+                    self.emitted_rows
+                )));
+            }
+            self.resume_skip -= self.rows.len() as u64;
+        }
+
+        if !self.fill_rows(TARGET_BATCH_ROWS)? {
             // Every remaining partition matched nothing: end of stream.
+            self.cleanup_spool();
             return Ok(None);
         }
+        self.emitted_rows = self
+            .emitted_rows
+            .checked_add(self.rows.len() as u64)
+            .ok_or_else(|| ve("match_recognize: emitted row count overflow"))?;
         build_batch(
             self.output_schema.clone(),
             self.plan.output_columns(),
             &self.rows,
         )
         .map(Some)
+    }
+
+    fn resume_supported(&self) -> bool {
+        true
+    }
+
+    fn encode_resume(&self) -> Vec<u8> {
+        vgi::table_function::encode_resume_state(&(self.emitted_rows,))
+    }
+
+    fn restore_resume(&mut self, bytes: &[u8]) {
+        if let Some((emitted_rows,)) = vgi::table_function::decode_resume_state::<(u64,)>(bytes) {
+            self.emitted_rows = emitted_rows;
+            self.resume_skip = emitted_rows;
+        }
     }
 }

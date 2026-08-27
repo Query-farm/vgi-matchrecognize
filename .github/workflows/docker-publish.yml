@@ -61,11 +61,12 @@ jobs:
       #            and a buffering function's sink and source phases must find the
       #            same spool. Without the volume every test fails on the
       #            sink-count guard, which is exactly what it exists to catch.
-      #   - HTTP : one test against a SINGLE warm container via the default `http`
-      #            entrypoint + /health, proving the HTTP transport too. Worth its
-      #            own leg because match_recognize is a *buffering* function: its
-      #            sink and source phases must find the same spool, and over HTTP
-      #            they are separate requests rather than one process's stdio.
+      #   - HTTP : one multi-batch test against a SINGLE warm container via the
+      #            default `http` entrypoint + /health, proving continuation too.
+      #            Worth its own leg because match_recognize is a *buffering*
+      #            function: its sink and source phases must find the same spool,
+      #            and over HTTP they are separate requests rather than one
+      #            process's stdio.
       # $CITEST_IMAGE is the loaded <image>:citest-amd64 ref; GH_TOKEN is provided
       # for the release download.
       image_test: |
@@ -122,7 +123,7 @@ jobs:
         docker volume rm -f "$SPOOL_VOL" >/dev/null 2>&1 || true
         echo "::endgroup::"
 
-        echo "::group::HTTP entrypoint smoke (one test, one warm container)"
+        echo "::group::HTTP entrypoint smoke (multi-batch continuation, one warm container)"
         CID=$(docker run -d -p 18000:8000 "$CITEST_IMAGE")
         trap 'docker rm -f "$CID" >/dev/null 2>&1 || true; docker volume rm -f "$SPOOL_VOL" >/dev/null 2>&1 || true' EXIT
         for _ in $(seq 1 30); do curl -fsS -o /dev/null http://localhost:18000/health && break; sleep 1; done
@@ -132,6 +133,6 @@ jobs:
         S2="$(mktemp -d)"; mkdir -p "$S2/test/sql"
         awk '/^require-env VGI_MATCHRECOGNIZE_WORKER/ {print; print ""; print "statement ok";
              print "INSTALL httpfs;"; print ""; print "statement ok"; print "LOAD httpfs;"; next}
-             {print}' test/sql/vshape.test > "$S2/test/sql/vshape.test"
+             {print}' test/sql/http_continuation.test > "$S2/test/sql/http_continuation.test"
         run_suite "$S2" "http://localhost:18000" "HTTP"
         echo "::endgroup::"

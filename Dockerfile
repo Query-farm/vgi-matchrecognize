@@ -29,9 +29,9 @@
 #     Getting it wrong fails loudly — the sink-count guard raises — rather than
 #     returning a short answer.
 #
-# There is no attach-scoped state beyond that spool: it is deleted when finalize
-# has read it, and orphans age out on a TTL sweep. So still no /data volume and
-# no `farm.query.vgi.volumes` mount-discovery label.
+# There is no attach-scoped state beyond that spool: it is deleted when the
+# finalize output reaches EOF, and orphans age out on a TTL sweep. So still no
+# /data volume and no `farm.query.vgi.volumes` mount-discovery label.
 # syntax=docker/dockerfile:1
 
 # ---- build stage -----------------------------------------------------------

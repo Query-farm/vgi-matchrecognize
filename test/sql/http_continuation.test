@@ -1,0 +1,21 @@
+# name: test/sql/http_continuation.test
+# description: A result larger than one transport page resumes without gaps or duplicates.
+# group: [sql]
+
+require-env VGI_MATCHRECOGNIZE_WORKER
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '${VGI_MATCHRECOGNIZE_WORKER}');
+
+# ALL ROWS emits 10,000 rows, crossing the 8,192-row HTTP response boundary.
+# The aggregate verifies that continuation neither loses nor repeats rows.
+query III
+SELECT count(*), min(rn), max(rn) FROM mr.main.match_recognize(
+       (SELECT i AS ts FROM range(10000) t(i)),
+       order_by     := ['ts'],
+       pattern      := 'A+',
+       define       := '{"A":"ts >= 0"}',
+       measures     := '{"rn":"RUNNING COUNT(*)"}',
+       rows         := 'all');
+----
+10000	1	10000

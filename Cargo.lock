@@ -2205,9 +2205,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vgi"
-version = "0.29.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa4398bf82264c7ebab474932b5ccbf3969f0379c545a954511fdeb6dbe6aef"
+checksum = "dc59ddc9b7f2e4d587cd83437fafd973ee95934f9466e43ce1458a071ff0981c"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -2226,15 +2226,29 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "vgi-protocol",
+ "vgi-rpc",
+]
+
+[[package]]
+name = "vgi-protocol"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7147196877547feefb66969adad7f69fb230cdcf4a42e176a1041a0eee4634c"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
  "vgi-rpc",
 ]
 
 [[package]]
 name = "vgi-rpc"
-version = "0.21.0"
+version = "0.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4832475bde2c889a9c721bdda99a67754e51b24e660334cebdb4e4f6321220d1"
+checksum = "c20a5073e891d5f6eca27feb167b568575dcf3a4deab517a9282800c97199263"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2258,6 +2272,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "thiserror",
  "tokio",
  "tower-http",
@@ -2270,9 +2285,9 @@ dependencies = [
 
 [[package]]
 name = "vgi-rpc-macros"
-version = "0.21.0"
+version = "0.23.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9da4ba10281d80104aef693a2ecb5ccb71d8eaac965a445cb6b2e7c81caab516"
+checksum = "ca045fa5899e4ec106ec2fd127eac15558cb5523d9458819b9bf8b150463cd87"
 dependencies = [
  "proc-macro2",
  "quote",
