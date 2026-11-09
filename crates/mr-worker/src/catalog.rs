@@ -420,9 +420,11 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                             .to_string(),
                     ),
                 ],
+                ..Default::default()
             }],
             macros: Vec::new(),
             tables: Vec::new(),
+            ..Default::default()
         }],
         ..Default::default()
     }
