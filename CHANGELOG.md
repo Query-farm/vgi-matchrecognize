@@ -4,9 +4,16 @@ All notable changes to `vgi-matchrecognize` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/), and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-11-09
 
 ### Changed
+
+- **Speaks VGI protocol 3.2.** Built on the `vgi` 0.50.0 SDK (from 0.31.0,
+  with `vgi-rpc` 0.32.3). The published `vgi` extension matches the protocol
+  major and minor exactly, so 0.2.x workers are rejected by the current
+  (haybarn 2.0) extension; this release is required to keep attaching. The
+  opt-in filtered scan planning that 3.2 adds is not used, and the catalog
+  metadata is unchanged.
 
 - **The Trino conformance port covers `PERMUTE`.** The translator refused those
   cases with `Unsupported("PERMUTE not implemented")`, which stopped being true
@@ -16,6 +23,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   The port is now **133 of 151** runnable assertions, still with zero wrong
   answers, and the regenerated suite differs from the previous one by exactly
   that case (plus renumbering).
+
+### Fixed
+
+- Multi-batch results resume correctly across continuation requests (covered
+  by `test/sql/http_continuation.test`).
 
 ## [0.2.1] - 2026-08-13
 
