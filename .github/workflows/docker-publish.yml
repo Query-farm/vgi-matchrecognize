@@ -73,7 +73,7 @@ jobs:
         set -euo pipefail
 
         echo "::group::download haybarn-unittest"
-        REL=$(gh release view --repo Query-farm-haybarn/haybarn --json tagName --jq .tagName)
+        REL=$(gh release list --repo Query-farm-haybarn/haybarn --limit 30 --json tagName --jq '[.[].tagName | select(startswith("haybarn-v2.0"))][0]')  # 2.0 is RC-only; plain release view returns 1.5 (vgi.v2)
         gh release download "$REL" --repo Query-farm-haybarn/haybarn \
           --pattern 'haybarn_unittest-linux-amd64.zip' --output hb.zip --clobber
         mkdir -p hb && unzip -o -q hb.zip -d hb
