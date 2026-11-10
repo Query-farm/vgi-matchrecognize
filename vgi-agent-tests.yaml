@@ -1,0 +1,20 @@
+# Private grader fields for the agent test tasks the worker publishes in
+# `vgi.agent_test_tasks` (crates/mr-worker/src/catalog.rs). The catalog tag carries
+# only each task's name and prompt (VGI416); vgi-lint-check finds this file by its
+# conventional name next to vgi-lint.toml and merges these fields in by task name.
+# Every reference_sql runs over inline VALUES, so it needs no external data.
+tasks:
+  - name: detect_v_shape
+    reference_sql: "SELECT match_no, bottom FROM mr.main.match_recognize((SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)), partition_by := ['symbol'], order_by := ['ts'], pattern := 'START DOWN+ UP+', define := '{\"DOWN\":\"price < PREV(price)\",\"UP\":\"price > PREV(price)\"}', measures := '{\"match_no\":\"MATCH_NUMBER()\",\"bottom\":\"LAST(DOWN.price)\"}')"
+  - name: brute_force_then_success
+    reference_sql: "SELECT classifier, n_fails FROM mr.main.match_recognize((SELECT * FROM (VALUES ('u',1,'fail'),('u',2,'fail'),('u',3,'fail'),('u',4,'success')) AS t(uid,ts,outcome)), partition_by := ['uid'], order_by := ['ts'], pattern := 'FAIL{3,} OK', define := '{\"FAIL\":\"outcome = ''fail''\",\"OK\":\"outcome = ''success''\"}', measures := '{\"n_fails\":\"FINAL COUNT(FAIL.*)\"}', rows := 'all')"
+  - name: explain_pattern_structure
+    reference_sql: "SELECT mr.main.explain_pattern('START DOWN+ UP+') AS compiled"
+    ignore_column_names: true
+  - name: match_number_one_row
+    reference_sql: "SELECT symbol, n FROM mr.main.match_recognize((SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)), partition_by := ['symbol'], order_by := ['ts'], pattern := 'START DOWN+ UP+', define := '{\"DOWN\":\"price < PREV(price)\",\"UP\":\"price > PREV(price)\"}', measures := '{\"n\":\"MATCH_NUMBER()\"}')"
+  - name: explain_alternation
+    reference_sql: "SELECT mr.main.explain_pattern('A+? (B | C) D') AS compiled"
+    ignore_column_names: true
+  - name: list_variable_skip_modes
+    reference_sql: "SELECT mode FROM mr.main.after_match_skip_modes WHERE needs_variable ORDER BY mode"

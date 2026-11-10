@@ -37,4 +37,4 @@ echo "    tests:    $TEST_GLOB"
 
 VGI_MATCHRECOGNIZE_WORKER="$WORKER" \
 VGI_WORKER_CATALOG_NAME="mr" \
-    "$UNITTEST" --test-dir "$REPO_ROOT" "$TEST_GLOB"
+    "$UNITTEST" --keep-home --test-dir "$REPO_ROOT" "$TEST_GLOB"

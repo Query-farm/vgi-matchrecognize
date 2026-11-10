@@ -64,40 +64,34 @@ const SCHEMA_EXAMPLES: &str = r#"[
 ]"#;
 
 /// Analyst tasks the `vgi-lint simulate` agent-check pass runs against the
-/// worker (VGI152/VGI920). Each `reference_sql` is a known-good query over
-/// inline `VALUES`, so it executes cleanly in the sandbox with no external data.
+/// worker (VGI152/VGI920). Only the public half (name + prompt) is published
+/// here (VGI416); the graders — a known-good `reference_sql` over inline
+/// `VALUES` per task — live in `vgi-agent-tests.yaml` at the repo root, which
+/// vgi-lint-check merges in by task name.
 const AGENT_TEST_TASKS: &str = r#"[
   {
     "name": "detect_v_shape",
-    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)). Partition by symbol, order by ts, and match the pattern 'START DOWN+ UP+' where variable DOWN means price < PREV(price) and UP means price > PREV(price) (START is unconstrained). Use ONE ROW PER MATCH and project two measures: match_no as MATCH_NUMBER() and bottom as LAST(DOWN.price). Select just match_no and bottom.",
-    "reference_sql": "SELECT match_no, bottom FROM mr.main.match_recognize((SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)), partition_by := ['symbol'], order_by := ['ts'], pattern := 'START DOWN+ UP+', define := '{\"DOWN\":\"price < PREV(price)\",\"UP\":\"price > PREV(price)\"}', measures := '{\"match_no\":\"MATCH_NUMBER()\",\"bottom\":\"LAST(DOWN.price)\"}')"
+    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)). Partition by symbol, order by ts, and match the pattern 'START DOWN+ UP+' where variable DOWN means price < PREV(price) and UP means price > PREV(price) (START is unconstrained). Use ONE ROW PER MATCH and project two measures: match_no as MATCH_NUMBER() and bottom as LAST(DOWN.price). Select just match_no and bottom."
   },
   {
     "name": "brute_force_then_success",
-    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('u',1,'fail'),('u',2,'fail'),('u',3,'fail'),('u',4,'success')) AS t(uid,ts,outcome)). Partition by uid, order by ts, and match the pattern 'FAIL{3,} OK' where variable FAIL means outcome = 'fail' and OK means outcome = 'success'. Use ALL ROWS PER MATCH (rows := 'all') and project one measure n_fails as FINAL COUNT(FAIL.*). Select just classifier and n_fails.",
-    "reference_sql": "SELECT classifier, n_fails FROM mr.main.match_recognize((SELECT * FROM (VALUES ('u',1,'fail'),('u',2,'fail'),('u',3,'fail'),('u',4,'success')) AS t(uid,ts,outcome)), partition_by := ['uid'], order_by := ['ts'], pattern := 'FAIL{3,} OK', define := '{\"FAIL\":\"outcome = ''fail''\",\"OK\":\"outcome = ''success''\"}', measures := '{\"n_fails\":\"FINAL COUNT(FAIL.*)\"}', rows := 'all')"
+    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('u',1,'fail'),('u',2,'fail'),('u',3,'fail'),('u',4,'success')) AS t(uid,ts,outcome)). Partition by uid, order by ts, and match the pattern 'FAIL{3,} OK' where variable FAIL means outcome = 'fail' and OK means outcome = 'success'. Use ALL ROWS PER MATCH (rows := 'all') and project one measure n_fails as FINAL COUNT(FAIL.*). Select just classifier and n_fails."
   },
   {
     "name": "explain_pattern_structure",
-    "prompt": "Call the mr.main.explain_pattern scalar function on the row pattern string 'START DOWN+ UP+' to render its compiled structure and return that single string value. Do not query any table.",
-    "reference_sql": "SELECT mr.main.explain_pattern('START DOWN+ UP+') AS compiled",
-    "ignore_column_names": true
+    "prompt": "Call the mr.main.explain_pattern scalar function on the row pattern string 'START DOWN+ UP+' to render its compiled structure and return that single string value. Do not query any table."
   },
   {
     "name": "match_number_one_row",
-    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)). Partition by symbol, order by ts, and match the pattern 'START DOWN+ UP+' where DOWN means price < PREV(price) and UP means price > PREV(price). Use ONE ROW PER MATCH (rows := 'one', the default). Project a single measure n as MATCH_NUMBER(). Select symbol and n.",
-    "reference_sql": "SELECT symbol, n FROM mr.main.match_recognize((SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)), partition_by := ['symbol'], order_by := ['ts'], pattern := 'START DOWN+ UP+', define := '{\"DOWN\":\"price < PREV(price)\",\"UP\":\"price > PREV(price)\"}', measures := '{\"n\":\"MATCH_NUMBER()\"}')"
+    "prompt": "This worker has no source tables; build the input relation inline. Call the mr.main.match_recognize table function over this exact relation: (SELECT * FROM (VALUES ('ACME',1,10),('ACME',2,8),('ACME',3,6),('ACME',4,9),('ACME',5,11)) AS t(symbol,ts,price)). Partition by symbol, order by ts, and match the pattern 'START DOWN+ UP+' where DOWN means price < PREV(price) and UP means price > PREV(price). Use ONE ROW PER MATCH (rows := 'one', the default). Project a single measure n as MATCH_NUMBER(). Select symbol and n."
   },
   {
     "name": "explain_alternation",
-    "prompt": "Call the mr.main.explain_pattern scalar function on the row pattern string 'A+? (B | C) D' (a reluctant one-or-more quantifier followed by an alternation group) to render its compiled structure and return that single string value. Do not query any table.",
-    "reference_sql": "SELECT mr.main.explain_pattern('A+? (B | C) D') AS compiled",
-    "ignore_column_names": true
+    "prompt": "Call the mr.main.explain_pattern scalar function on the row pattern string 'A+? (B | C) D' (a reluctant one-or-more quantifier followed by an alternation group) to render its compiled structure and return that single string value. Do not query any table."
   },
   {
     "name": "list_variable_skip_modes",
-    "prompt": "The mr.main.after_match_skip_modes reference view documents every AFTER MATCH SKIP mode accepted by match_recognize's `after` argument. Using that view, list only the modes that require naming a pattern variable. Return just the mode column, ordered alphabetically.",
-    "reference_sql": "SELECT mode FROM mr.main.after_match_skip_modes WHERE needs_variable ORDER BY mode"
+    "prompt": "The mr.main.after_match_skip_modes reference view documents every AFTER MATCH SKIP mode accepted by match_recognize's `after` argument. Using that view, list only the modes that require naming a pattern variable. Return just the mode column, ordered alphabetically."
   }
 ]"#;
 
@@ -207,9 +201,12 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                 .to_string(),
         ),
         tags: vec![
+            ("vgi.title".to_string(), "MATCH_RECOGNIZE".to_string()),
             (
-                "vgi.title".to_string(),
-                "MATCH_RECOGNIZE — Row Pattern Matching".to_string(),
+                "vgi.subtitle".to_string(),
+                "Standard SQL row pattern matching over ordered rows, for funnels, sessions and \
+                 sequence or anomaly detection."
+                    .to_string(),
             ),
             (
                 "vgi.keywords".to_string(),
@@ -298,7 +295,7 @@ pub fn catalog_metadata(name: &str) -> CatalogModel {
                     .to_string(),
             ),
             tags: vec![
-                ("vgi.title".to_string(), "MATCH_RECOGNIZE — main".to_string()),
+                ("vgi.title".to_string(), "Pattern matching".to_string()),
                 (
                     "vgi.keywords".to_string(),
                     crate::meta::keywords_json(

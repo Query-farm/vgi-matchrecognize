@@ -12,8 +12,15 @@ adheres to [Semantic Versioning](https://semver.org/).
   with `vgi-rpc` 0.32.3). The published `vgi` extension matches the protocol
   major and minor exactly, so 0.2.x workers are rejected by the current
   (haybarn 2.0) extension; this release is required to keep attaching. The
-  opt-in filtered scan planning that 3.2 adds is not used, and the catalog
-  metadata is unchanged.
+  opt-in filtered scan planning that 3.2 adds is not used.
+
+- **Catalog listing metadata meets vgi-lint-check 2.2.** The catalog title is
+  now the name `MATCH_RECOGNIZE` (was the headline "MATCH_RECOGNIZE — Row
+  Pattern Matching"), the `main` schema title is `Pattern matching`, and the
+  catalog gains a one-sentence `vgi.subtitle` for directory listings. The
+  published `vgi.agent_test_tasks` now carries only each task's name and
+  prompt; the grader queries moved to `vgi-agent-tests.yaml`, which
+  vgi-lint-check reads from the repository.
 
 - **The Trino conformance port covers `PERMUTE`.** The translator refused those
   cases with `Unsupported("PERMUTE not implemented")`, which stopped being true
@@ -28,6 +35,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 - Multi-batch results resume correctly across continuation requests (covered
   by `test/sql/http_continuation.test`).
+- `run_tests.sh` passes `--keep-home` to `haybarn-unittest`. The 2.0 runner
+  gives each test a fresh, empty home by default, so `LOAD vgi` could not find
+  the installed extension and every SQLLogic test failed.
+- Lockfile: `zstd` 0.13.4 / `zstd-safe` 7.4.0 / `zstd-sys` 2.1.2, clearing
+  RUSTSEC-2026-0391, -0398, -0403 and -0410.
 
 ## [0.2.1] - 2026-08-13
 
