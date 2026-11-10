@@ -22,6 +22,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   prompt; the grader queries moved to `vgi-agent-tests.yaml`, which
   vgi-lint-check reads from the repository.
 
+- **No bundled SQLite.** The native worker no longer enables the SDK's
+  `sqlite` feature, which linked libsqlite3-sys 0.37 (RUSTSEC-2026-0459). The
+  SDK store, which here holds only the small control records the finalize
+  phase replays, now defaults to the SDK's `fs` backend.
+
 - **The Trino conformance port covers `PERMUTE`.** The translator refused those
   cases with `Unsupported("PERMUTE not implemented")`, which stopped being true
   when the pattern parser learned `PERMUTE` — so the one Trino case using it was

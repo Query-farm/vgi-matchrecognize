@@ -476,7 +476,7 @@ of every phase.
 **Leave `VGI_WORKER_SHARED_STORAGE` alone.** The spool holds the buffered rows, but the
 SDK store still holds the small control records the finalize phase replays, and the two
 phases may run in *different worker processes* — so `memory` is refused at bind, while
-`sqlite` (the default) and `fs` are both fine. Whatever goes wrong there — a truncated
+the default `fs` store is fine. Whatever goes wrong there — a truncated
 spool file, two phases not sharing state — is an error that names what went missing,
 never a short answer.
 

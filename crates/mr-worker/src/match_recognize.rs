@@ -4,7 +4,7 @@
 //!
 //! A `TableBufferingFunction` (Sink + Source): every input batch is buffered
 //! into cross-process storage (`process`) — on disk, as Arrow IPC, under the
-//! default SQLite backend; once the whole relation is present,
+//! default fs backend; once the whole relation is present,
 //! `finalize_producer` reads it back, builds the mr-core [`Plan`], and returns a
 //! producer that runs the matcher **one partition at a time**, emitting a batch
 //! per partition on the bind-time output schema. Pattern matching is intrinsically
@@ -217,8 +217,8 @@ fn projected_schema(plan: &Plan, input_schema: &SchemaRef) -> Result<SchemaRef> 
 /// The subprocess transport pools workers, so `process` and `finalize_producer`
 /// are not guaranteed to share an address space. With an in-process store the
 /// buffered relation is simply *absent* at finalize and the function would return
-/// zero rows — silently. Durable backends (the default SQLite store, or the
-/// filesystem store) are all fine.
+/// zero rows — silently. Durable backends (the default filesystem store, or
+/// SQLite when built with the SDK sqlite feature) are all fine.
 ///
 /// `multi_process` is what makes `memory` unsound, so it is a parameter rather than
 /// an assumption: the wasm build serves every phase from **one** module instance

@@ -334,9 +334,9 @@ by itself, since the relation still has to be read back to match it.
   `id > after_id` and the contract only says ids are *monotonic*, not where they
   start: SQLite's log is AUTOINCREMENT (first id 1), the fs store's is `max_id + 1`
   on an empty dir (first id 0). Paging from `0` silently dropped the first batch on
-  fs. `tests/storage_probe.rs` round-trips the two durable local backends
-  (`sqlite`, `fs`) through the real helper; `memory` is refused and `http` is not
-  compiled in.
+  fs. `tests/storage_probe.rs` round-trips the durable local backend
+  (`fs`) through the real helper; `memory` is refused, and neither `sqlite`
+  (dropped for RUSTSEC-2026-0459) nor `http` is compiled in.
 - `append` reports failure by returning a negative id (SQLite returns -1 without
   storing), so `buffer::append_batch` checks it rather than discarding it.
 - `combine` encodes the sink count into the finalize state id (`FinalizeState`,

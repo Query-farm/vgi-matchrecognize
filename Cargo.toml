@@ -19,7 +19,7 @@ repository = "https://github.com/Query-farm/vgi-matchrecognize"
 # VGI Rust SDK (worker side), published on crates.io. 0.31+ provides the wasm
 # `vgi::wasm_worker!` macro used by mr-wasm; requires rustc 1.97 (see
 # rust-version above). Base (feature-less) so each target can opt in: the native
-# build takes the SDK's real defaults (`sqlite` + `transport-http`), while the
+# build takes `transport-http` (no `sqlite`, see mr-worker), while the
 # wasm build must NOT — tokio/mio/axum and bundled SQLite do not compile for
 # wasm32, and the browser transport serves over a byte channel rather than HTTP.
 vgi = { version = "0.50", default-features = false }

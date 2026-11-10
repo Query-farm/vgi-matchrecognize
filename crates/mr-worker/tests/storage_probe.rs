@@ -54,46 +54,6 @@ fn check(store: &SharedStorage, scope: &[u8], expect: usize, label: &str) {
     store.clear(scope);
 }
 
-/// Sequential appends, paged back — exercises the paging loop across page borders.
-#[test]
-fn sqlite_log_round_trips_sequential() {
-    let path = std::env::temp_dir().join(format!("mr-probe-{}.db", std::process::id()));
-    let store: SharedStorage = Arc::new(vgi::storage::SqliteStorage::open(path.clone()));
-    for n in [1usize, 255, 256, 257, 1000] {
-        let scope = format!("sq-seq-{n}").into_bytes();
-        for i in 0..n {
-            store.append(&scope, NS, b"", payload(i as u64));
-        }
-        check(&store, &scope, n, &format!("sqlite sequential n={n}"));
-    }
-    let _ = std::fs::remove_file(&path);
-}
-
-/// Concurrent appends from several threads, as pooled workers would do.
-#[test]
-fn sqlite_log_round_trips_concurrent() {
-    let path = std::env::temp_dir().join(format!("mr-probe-conc-{}.db", std::process::id()));
-    let store: SharedStorage = Arc::new(vgi::storage::SqliteStorage::open(path.clone()));
-    const THREADS: usize = 8;
-    const PER: usize = 200;
-    let scope: Vec<u8> = b"sq-conc".to_vec();
-    let mut handles = Vec::new();
-    for t in 0..THREADS {
-        let store: SharedStorage = Arc::clone(&store);
-        let scope = scope.clone();
-        handles.push(std::thread::spawn(move || {
-            for i in 0..PER {
-                store.append(&scope, NS, b"", payload((t * PER + i) as u64));
-            }
-        }));
-    }
-    for h in handles {
-        h.join().unwrap();
-    }
-    check(&store, &scope, THREADS * PER, "sqlite concurrent");
-    let _ = std::fs::remove_file(&path);
-}
-
 #[test]
 fn fs_log_round_trips_sequential() {
     let store: SharedStorage = Arc::new(vgi::storage::FsStorage::new());
@@ -138,8 +98,7 @@ fn finalize_errors_when_sinks_ran_but_nothing_was_buffered() {
     use arrow_schema::{DataType, Field, Schema};
     use mr_worker::buffer::{append_batch, read_batches, FinalizeState};
 
-    let path = std::env::temp_dir().join(format!("mr-probe-guard-{}.db", std::process::id()));
-    let store: SharedStorage = Arc::new(vgi::storage::SqliteStorage::open(path.clone()));
+    let store: SharedStorage = Arc::new(vgi::storage::FsStorage::new());
 
     // Three sinks reported buffering, but the store hands back nothing.
     let scope = format!("guard-empty-{}", std::process::id()).into_bytes();
@@ -198,7 +157,6 @@ fn finalize_errors_when_sinks_ran_but_nothing_was_buffered() {
     store.clear(&scope);
     // `append_batch` prefers the local spool, and only a producer's Drop deletes it.
     mr_worker::spool::discard(&scope);
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The local spool round-trips what it is given, including from several threads at
