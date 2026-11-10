@@ -91,7 +91,7 @@ jobs:
         statement ok
         INSTALL vgi FROM community;
         EOF
-        (cd "$(dirname "$WARM")" && "$HAYBARN_UNITTEST" "test/_warm.test") \
+        (cd "$(dirname "$WARM")" && "$HAYBARN_UNITTEST" --keep-home "test/_warm.test") \
           >/dev/null 2>&1 || echo "::warning::vgi warm step did not fully succeed"
         echo "::endgroup::"
 
@@ -101,7 +101,7 @@ jobs:
           echo "Running $label suite (worker: $worker) ..."
           set +e
           ( cd "$stage" && VGI_MATCHRECOGNIZE_WORKER="$worker" VGI_WORKER_CATALOG_NAME="mr" \
-              "$HAYBARN_UNITTEST" --test-dir "$stage" "test/sql/*" ) 2>&1 | tee "$report"
+              "$HAYBARN_UNITTEST" --keep-home --test-dir "$stage" "test/sql/*" ) 2>&1 | tee "$report"
           local status="${PIPESTATUS[0]}"
           set -e
           # A skip is NOT a pass: DuckDB's runner silently auto-skips tests whose
