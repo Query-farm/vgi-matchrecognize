@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "mr-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proptest",
  "serde",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "mr-wasm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "mr-worker",
  "vgi",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "mr-worker"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arrow",
  "arrow-array",
